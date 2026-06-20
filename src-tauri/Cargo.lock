@@ -331,6 +331,7 @@ dependencies = [
 name = "codex-config-manager"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

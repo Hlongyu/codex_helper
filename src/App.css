@@ -217,6 +217,13 @@ p {
   color: #334155;
 }
 
+.settings-button.primary-nav {
+  border-color: #bfd0f7;
+  background: #eaf1ff;
+  color: #2563eb;
+  font-weight: 800;
+}
+
 .workspace {
   display: flex;
   min-width: 0;
@@ -1179,6 +1186,358 @@ h3 {
   color: #60a5fa;
 }
 
+.usage-shell {
+  width: 100vw;
+  height: 100vh;
+  overflow: auto;
+  background: #f4f7fa;
+}
+
+.usage-topbar {
+  position: sticky;
+  z-index: 5;
+  top: 0;
+  display: flex;
+  height: 86px;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #d8e0e8;
+  background: rgba(255, 255, 255, 0.94);
+  padding: 0 28px;
+  backdrop-filter: blur(12px);
+}
+
+.usage-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.usage-brand strong,
+.usage-brand span {
+  display: block;
+}
+
+.usage-brand strong {
+  font-size: 15px;
+}
+
+.usage-brand span {
+  margin-top: 3px;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.usage-workspace {
+  display: grid;
+  gap: 18px;
+  padding: 34px 40px 44px;
+}
+
+.usage-title-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.usage-title-row > div:first-child > p:last-child {
+  margin-top: 8px;
+  color: #64748b;
+  font-size: 14px;
+}
+
+.usage-meta {
+  display: grid;
+  gap: 6px;
+  justify-items: end;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.usage-filter-panel,
+.usage-panel,
+.usage-kpi-card {
+  border: 1px solid #d8e0e8;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.usage-filter-panel {
+  display: grid;
+  grid-template-columns: minmax(520px, 1.2fr) minmax(300px, 0.8fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 18px;
+}
+
+.usage-filter-group {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.usage-filter-panel span,
+.usage-kpi-card span {
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.usage-filter-panel input,
+.usage-filter-panel select {
+  height: 34px;
+  min-width: 0;
+  border: 1px solid #d8e0e8;
+  border-radius: 8px;
+  background: #fff;
+  color: #18212b;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.usage-filter-panel input {
+  width: 136px;
+}
+
+.usage-filter-panel select {
+  width: 100%;
+}
+
+.usage-filter-selects {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.usage-range-buttons {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid #d8e0e8;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.usage-range-buttons button {
+  height: 34px;
+  border: 0;
+  border-right: 1px solid #d8e0e8;
+  background: transparent;
+  color: #475569;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.usage-range-buttons button:last-child {
+  border-right: 0;
+}
+
+.usage-range-buttons button.selected {
+  background: #eaf1ff;
+  color: #2563eb;
+}
+
+.usage-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: end;
+}
+
+.usage-note strong {
+  color: #b45309;
+  font-size: 20px;
+}
+
+.usage-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  transition: opacity 0.16s ease;
+}
+
+.usage-kpi-grid.is-loading,
+.usage-bottom-grid.is-loading {
+  opacity: 0.62;
+}
+
+.usage-kpi-card {
+  min-height: 112px;
+  padding: 16px;
+}
+
+.usage-kpi-card.accent {
+  border-color: #bdd0ff;
+  background: #f4f7ff;
+}
+
+.usage-kpi-card.warning {
+  border-color: #f1c887;
+  background: #fff8e8;
+}
+
+.usage-kpi-card strong {
+  display: block;
+  margin-top: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 30px;
+  line-height: 1.1;
+}
+
+.usage-kpi-card p {
+  margin-top: 8px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.usage-bottom-grid.single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.usage-panel {
+  min-width: 0;
+  padding: 18px;
+}
+
+.usage-bottom-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  transition: opacity 0.16s ease;
+}
+
+.detail-count {
+  border: 1px solid #d8e0e8;
+  border-radius: 999px;
+  background: #f8fafc;
+  color: #475569;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.usage-detail-wrap {
+  max-height: 470px;
+  overflow: auto;
+  border: 1px solid #e5ebf2;
+  border-radius: 8px;
+  margin-top: 16px;
+  background: #fff;
+}
+
+.usage-detail-table {
+  display: grid;
+  min-width: 1060px;
+  grid-template-columns:
+    150px minmax(160px, 1.1fr) minmax(140px, 0.9fr)
+    minmax(118px, 0.75fr) minmax(118px, 0.75fr)
+    minmax(86px, 0.55fr) minmax(92px, 0.55fr) 104px;
+  gap: 0;
+}
+
+.usage-detail-table > span {
+  position: sticky;
+  z-index: 2;
+  top: 0;
+  background: #f8fafc;
+  color: #64748b;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.usage-detail-row {
+  display: contents;
+}
+
+.usage-detail-row > * {
+  min-width: 0;
+  overflow: hidden;
+  border-top: 1px solid #e5ebf2;
+  background: #fff;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-style: normal;
+}
+
+.usage-detail-row span,
+.usage-detail-row em {
+  color: #475569;
+}
+
+.usage-detail-row strong {
+  color: #18212b;
+}
+
+.usage-detail-row b,
+.usage-detail-row i {
+  justify-self: end;
+  font-weight: 800;
+}
+
+.usage-detail-row .cost-cell {
+  color: #0f766e;
+  cursor: help;
+}
+
+.usage-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.usage-pagination button,
+.usage-pagination select {
+  height: 32px;
+  border: 1px solid #d8e0e8;
+  border-radius: 8px;
+  background: #fff;
+  color: #475569;
+  padding: 0 11px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.pagination-page {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pagination-page em {
+  color: #94a3b8;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.usage-pagination button.selected {
+  border-color: #bfd0ff;
+  background: #eaf1ff;
+  color: #2563eb;
+}
+
+.usage-pagination button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.usage-empty {
+  display: grid;
+  min-height: 120px;
+  place-items: center;
+  color: #64748b;
+  font-size: 14px;
+}
+
 @media (max-width: 1120px) {
   body {
     min-width: 960px;
@@ -1194,5 +1553,13 @@ h3 {
 
   .provider-editor {
     min-width: 0;
+  }
+
+  .usage-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .usage-bottom-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

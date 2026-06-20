@@ -1,8 +1,12 @@
+use chrono::{DateTime, Datelike, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{Array, DocumentMut, Item, Value as TomlValue};
@@ -113,6 +117,171 @@ struct ManagerState {
     base: Value,
     providers: Vec<ProviderConfig>,
     last_applied: Option<Value>,
+    #[serde(default)]
+    applied_history: Vec<AppliedProviderSnapshot>,
+    #[serde(default)]
+    pricing: Vec<PricingRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppliedProviderSnapshot {
+    provider_id: String,
+    provider_name: String,
+    model_provider: String,
+    base_url_hash: Option<String>,
+    applied_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PricingRule {
+    id: String,
+    provider_match: String,
+    model_match: String,
+    input_per_million: f64,
+    cached_input_per_million: f64,
+    output_per_million: f64,
+    reasoning_output_per_million: f64,
+    currency: String,
+    #[serde(default)]
+    source: String,
+}
+
+impl Default for PricingRule {
+    fn default() -> Self {
+        Self {
+            id: "default".to_string(),
+            provider_match: "*".to_string(),
+            model_match: "*".to_string(),
+            input_per_million: 0.0,
+            cached_input_per_million: 0.0,
+            output_per_million: 0.0,
+            reasoning_output_per_million: 0.0,
+            currency: "USD".to_string(),
+            source: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TokenUsage {
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    cached_input_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
+    #[serde(default)]
+    reasoning_output_tokens: i64,
+    #[serde(default)]
+    total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageSummary {
+    request_count: usize,
+    input_tokens: i64,
+    uncached_input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+    total_tokens: i64,
+    estimated_cost: f64,
+    currency: String,
+}
+
+impl Default for UsageSummary {
+    fn default() -> Self {
+        Self {
+            request_count: 0,
+            input_tokens: 0,
+            uncached_input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            estimated_cost: 0.0,
+            currency: "USD".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageDailyPoint {
+    day: String,
+    request_count: usize,
+    total_tokens: i64,
+    estimated_cost: f64,
+    providers: Vec<UsageProviderPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageProviderPoint {
+    provider_key: String,
+    provider_name: String,
+    request_count: usize,
+    input_tokens: i64,
+    uncached_input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+    total_tokens: i64,
+    estimated_cost: f64,
+    known: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageMonthlyPoint {
+    month: String,
+    request_count: usize,
+    total_tokens: i64,
+    estimated_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageDetailRow {
+    timestamp: String,
+    day: String,
+    session_id: String,
+    provider_key: String,
+    provider_name: String,
+    model: String,
+    input_tokens: i64,
+    uncached_input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+    total_tokens: i64,
+    estimated_cost: f64,
+    cost_breakdown: String,
+    pricing_model_match: String,
+    pricing_source: String,
+    currency: String,
+    source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageStats {
+    generated_at_ms: i64,
+    source_dir: String,
+    filters: UsageStatsFilter,
+    summary: UsageSummary,
+    today: UsageSummary,
+    this_month: UsageSummary,
+    daily: Vec<UsageDailyPoint>,
+    monthly: Vec<UsageMonthlyPoint>,
+    providers: Vec<UsageProviderPoint>,
+    details: Vec<UsageDetailRow>,
+    pricing: Vec<PricingRule>,
+    available_providers: Vec<UsageFilterOption>,
+    available_models: Vec<String>,
+    available_days: Vec<String>,
+    unknown_provider_count: usize,
+    parsed_files: usize,
+    parsed_events: usize,
+    filtered_events: usize,
+    detail_page: usize,
+    detail_page_size: usize,
+    detail_total_pages: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,6 +348,81 @@ struct QueryBalancePayload {
     provider_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct UsageEvent {
+    timestamp: DateTime<Utc>,
+    day: String,
+    month: String,
+    session_id: String,
+    provider_key: String,
+    provider_name: String,
+    provider_known: bool,
+    model: String,
+    usage: TokenUsage,
+    estimated_cost: f64,
+    cost_breakdown: String,
+    pricing_model_match: String,
+    pricing_source: String,
+    currency: String,
+    source: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UsageCache {
+    events: Vec<UsageEvent>,
+    source_dir: String,
+    parsed_files: usize,
+    loaded_at_ms: i64,
+}
+
+#[derive(Default)]
+struct UsageCacheState {
+    cache: Mutex<Option<UsageCache>>,
+}
+
+#[derive(Debug, Clone)]
+struct CostEstimate {
+    amount: f64,
+    currency: String,
+    breakdown: String,
+    pricing_model_match: String,
+    pricing_source: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct UsageStatsFilter {
+    #[serde(default)]
+    start_day: Option<String>,
+    #[serde(default)]
+    end_day: Option<String>,
+    #[serde(default)]
+    provider_key: Option<String>,
+    #[serde(default)]
+    provider_name: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    page: Option<usize>,
+    #[serde(default)]
+    page_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LoadUsageStatsPayload {
+    #[serde(default)]
+    filter: Option<UsageStatsFilter>,
+    #[serde(default)]
+    force_refresh: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageFilterOption {
+    provider_key: String,
+    provider_name: String,
+    request_count: usize,
+    known: bool,
+}
+
 fn default_balance_path() -> String {
     "/api/usage/token/".to_string()
 }
@@ -235,6 +479,10 @@ fn codex_config_path() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("config.toml"))
 }
 
+fn sessions_dir() -> Result<PathBuf, String> {
+    Ok(codex_home()?.join("sessions"))
+}
+
 fn default_state() -> ManagerState {
     ManagerState {
         active_provider_id: String::new(),
@@ -243,7 +491,66 @@ fn default_state() -> ManagerState {
         base: json!({}),
         providers: vec![],
         last_applied: None,
+        applied_history: vec![],
+        pricing: default_pricing_rules(),
     }
+}
+
+fn default_pricing_rules() -> Vec<PricingRule> {
+    const SOURCE: &str = "OpenAI API pricing, standard GPT models, USD per 1M tokens";
+
+    fn rule(id: &str, model: &str, input: f64, cached_input: f64, output: f64) -> PricingRule {
+        PricingRule {
+            id: id.to_string(),
+            provider_match: "*".to_string(),
+            model_match: model.to_string(),
+            input_per_million: input,
+            cached_input_per_million: cached_input,
+            output_per_million: output,
+            reasoning_output_per_million: 0.0,
+            currency: "USD".to_string(),
+            source: SOURCE.to_string(),
+        }
+    }
+
+    vec![
+        rule("gpt-5-5-pro", "gpt-5.5-pro*", 30.0, 0.0, 180.0),
+        rule("gpt-5-5", "gpt-5.5*", 5.0, 0.5, 30.0),
+        rule("gpt-5-4-pro", "gpt-5.4-pro*", 30.0, 0.0, 180.0),
+        rule("gpt-5-4-mini", "gpt-5.4-mini*", 0.75, 0.075, 4.5),
+        rule("gpt-5-4-nano", "gpt-5.4-nano*", 0.2, 0.02, 1.25),
+        rule("gpt-5-4", "gpt-5.4*", 2.5, 0.25, 15.0),
+        rule("gpt-5-3-codex", "gpt-5.3-codex*", 1.75, 0.175, 14.0),
+        rule("gpt-5-3-chat", "gpt-5.3-chat-latest", 1.75, 0.175, 14.0),
+        rule("gpt-5-2-pro", "gpt-5.2-pro*", 21.0, 0.0, 168.0),
+        rule("gpt-5-2-codex", "gpt-5.2-codex*", 1.75, 0.175, 14.0),
+        rule("gpt-5-2-chat", "gpt-5.2-chat-latest", 1.75, 0.175, 14.0),
+        rule("gpt-5-2", "gpt-5.2*", 1.75, 0.175, 14.0),
+        rule(
+            "gpt-5-1-codex-mini",
+            "gpt-5.1-codex-mini*",
+            0.25,
+            0.025,
+            2.0,
+        ),
+        rule("gpt-5-1-codex", "gpt-5.1-codex*", 1.25, 0.125, 10.0),
+        rule("gpt-5-1-chat", "gpt-5.1-chat-latest", 1.25, 0.125, 10.0),
+        rule("gpt-5-1", "gpt-5.1*", 1.25, 0.125, 10.0),
+        rule("gpt-5-codex", "gpt-5-codex*", 1.25, 0.125, 10.0),
+        rule("gpt-5-pro", "gpt-5-pro*", 15.0, 0.0, 120.0),
+        rule("gpt-5-mini", "gpt-5-mini*", 0.25, 0.025, 2.0),
+        rule("gpt-5-nano", "gpt-5-nano*", 0.05, 0.005, 0.4),
+        rule("gpt-5-chat", "gpt-5-chat-latest", 1.25, 0.125, 10.0),
+        rule("gpt-5", "gpt-5*", 1.25, 0.125, 10.0),
+        rule("codex-mini-latest", "codex-mini-latest", 1.5, 0.375, 6.0),
+        rule("chat-latest", "chat-latest", 5.0, 0.5, 30.0),
+        rule("gpt-4-1-mini", "gpt-4.1-mini*", 0.4, 0.1, 1.6),
+        rule("gpt-4-1-nano", "gpt-4.1-nano*", 0.1, 0.025, 0.4),
+        rule("gpt-4-1", "gpt-4.1*", 2.0, 0.5, 8.0),
+        rule("gpt-4o-2024-05-13", "gpt-4o-2024-05-13", 5.0, 0.0, 15.0),
+        rule("gpt-4o-mini", "gpt-4o-mini*", 0.15, 0.075, 0.6),
+        rule("gpt-4o", "gpt-4o*", 2.5, 1.25, 10.0),
+    ]
 }
 
 fn ensure_state_file() -> Result<(), String> {
@@ -270,7 +577,61 @@ fn load_state_file() -> Result<ManagerState, String> {
         return Ok(state);
     }
 
-    Ok(state)
+    let normalized = normalize_state(state.clone());
+    let state_value =
+        serde_json::to_value(&state).map_err(|err| format!("无法检查状态文件: {err}"))?;
+    let normalized_value =
+        serde_json::to_value(&normalized).map_err(|err| format!("无法检查状态文件: {err}"))?;
+    if state_value != normalized_value {
+        save_state(&normalized)?;
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_state(mut state: ManagerState) -> ManagerState {
+    state.pricing = default_pricing_rules();
+    let provider_exists = |provider_id: &str| {
+        state
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+    };
+    let applied_provider_id = state
+        .applied_provider_id
+        .clone()
+        .filter(|provider_id| provider_exists(provider_id))
+        .or_else(|| {
+            state
+                .providers
+                .iter()
+                .find(|provider| provider.enabled)
+                .map(|provider| provider.id.clone())
+        })
+        .or_else(|| {
+            state.last_applied.as_ref().and_then(|last_applied| {
+                state
+                    .providers
+                    .iter()
+                    .find(|provider| desired_config(&state, Some(provider)) == *last_applied)
+                    .map(|provider| provider.id.clone())
+            })
+        });
+    if let Some(applied_provider_id) = applied_provider_id {
+        state.applied_provider_id = Some(applied_provider_id.clone());
+        if state.active_provider_id.trim().is_empty()
+            || !state
+                .providers
+                .iter()
+                .any(|provider| provider.id == state.active_provider_id)
+        {
+            state.active_provider_id = applied_provider_id.clone();
+        }
+        for provider in &mut state.providers {
+            provider.enabled = provider.id == applied_provider_id;
+        }
+    }
+    state
 }
 
 fn is_legacy_seed_state(state: &ManagerState) -> bool {
@@ -367,6 +728,28 @@ fn custom_provider_token(provider: &ProviderConfig) -> Option<String> {
         .pointer("/model_providers/custom/experimental_bearer_token")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn model_provider_name(provider: &ProviderConfig) -> String {
+    provider
+        .config
+        .pointer("/model_provider")
+        .and_then(Value::as_str)
+        .unwrap_or("custom")
+        .to_string()
+}
+
+fn hash_text(text: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn current_epoch_ms() -> Result<i64, String> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("系统时间异常: {err}"))?
+        .as_millis() as i64)
 }
 
 fn normalize_balance_config(
@@ -974,6 +1357,746 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
     }
 }
 
+fn collect_jsonl_files(dir: PathBuf, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in
+        fs::read_dir(&dir).map_err(|err| format!("无法读取目录 {}: {err}", dir.display()))?
+    {
+        let entry = entry.map_err(|err| format!("无法读取目录项: {err}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl_files(path, out)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn timestamp_to_local_parts(timestamp: DateTime<Utc>) -> (String, String) {
+    let local = timestamp.with_timezone(&Local);
+    (
+        format!(
+            "{:04}-{:02}-{:02}",
+            local.year(),
+            local.month(),
+            local.day()
+        ),
+        format!("{:04}-{:02}", local.year(), local.month()),
+    )
+}
+
+fn parse_event_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn usage_from_value(value: &Value) -> TokenUsage {
+    TokenUsage {
+        input_tokens: number_at_path(value, &["input_tokens"]).unwrap_or_default() as i64,
+        cached_input_tokens: number_at_path(value, &["cached_input_tokens"]).unwrap_or_default()
+            as i64,
+        output_tokens: number_at_path(value, &["output_tokens"]).unwrap_or_default() as i64,
+        reasoning_output_tokens: number_at_path(value, &["reasoning_output_tokens"])
+            .unwrap_or_default() as i64,
+        total_tokens: number_at_path(value, &["total_tokens"]).unwrap_or_default() as i64,
+    }
+}
+
+fn usage_is_zero(usage: &TokenUsage) -> bool {
+    usage.input_tokens == 0
+        && usage.cached_input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.reasoning_output_tokens == 0
+        && usage.total_tokens == 0
+}
+
+fn usage_delta(current: &TokenUsage, previous: Option<&TokenUsage>) -> TokenUsage {
+    if let Some(previous) = previous {
+        TokenUsage {
+            input_tokens: current.input_tokens.saturating_sub(previous.input_tokens),
+            cached_input_tokens: current
+                .cached_input_tokens
+                .saturating_sub(previous.cached_input_tokens),
+            output_tokens: current.output_tokens.saturating_sub(previous.output_tokens),
+            reasoning_output_tokens: current
+                .reasoning_output_tokens
+                .saturating_sub(previous.reasoning_output_tokens),
+            total_tokens: current.total_tokens.saturating_sub(previous.total_tokens),
+        }
+    } else {
+        current.clone()
+    }
+}
+
+fn add_usage(summary: &mut UsageSummary, usage: &TokenUsage, cost: f64) {
+    summary.request_count += 1;
+    summary.input_tokens += usage.input_tokens;
+    summary.uncached_input_tokens += usage
+        .input_tokens
+        .saturating_sub(usage.cached_input_tokens)
+        .max(0);
+    summary.cached_input_tokens += usage.cached_input_tokens;
+    summary.output_tokens += usage.output_tokens;
+    summary.reasoning_output_tokens += usage.reasoning_output_tokens;
+    summary.total_tokens += usage.total_tokens;
+    summary.estimated_cost += cost;
+}
+
+fn add_event_usage(summary: &mut UsageSummary, event: &UsageEvent) {
+    if summary.request_count == 0 {
+        summary.currency = event.currency.clone();
+    }
+    add_usage(summary, &event.usage, event.estimated_cost);
+}
+
+fn matches_pricing_pattern(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.trim().to_lowercase();
+    let value = value.trim().to_lowercase();
+
+    if pattern.is_empty() || pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return value.starts_with(prefix);
+    }
+    pattern == value
+}
+
+fn pricing_specificity(pattern: &str) -> i32 {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern == "*" {
+        0
+    } else if pattern.ends_with('*') {
+        100 + pattern.trim_end_matches('*').len() as i32
+    } else {
+        10_000 + pattern.len() as i32
+    }
+}
+
+fn select_pricing_rule<'a>(
+    pricing: &'a [PricingRule],
+    provider_key: &str,
+    provider_name: &str,
+    model: &str,
+) -> Option<&'a PricingRule> {
+    pricing
+        .iter()
+        .filter(|rule| {
+            let provider_matches = matches_pricing_pattern(&rule.provider_match, provider_key)
+                || matches_pricing_pattern(&rule.provider_match, provider_name);
+            provider_matches && matches_pricing_pattern(&rule.model_match, model)
+        })
+        .max_by_key(|rule| {
+            pricing_specificity(&rule.provider_match) + pricing_specificity(&rule.model_match) * 2
+        })
+}
+
+fn estimate_cost(
+    pricing: &[PricingRule],
+    provider_key: &str,
+    provider_name: &str,
+    model: &str,
+    usage: &TokenUsage,
+) -> CostEstimate {
+    let rule = select_pricing_rule(pricing, provider_key, provider_name, model).cloned();
+    let rule = rule.unwrap_or_else(|| PricingRule {
+        id: "unpriced".to_string(),
+        provider_match: "*".to_string(),
+        model_match: "未匹配官方 GPT 价格".to_string(),
+        input_per_million: 0.0,
+        cached_input_per_million: 0.0,
+        output_per_million: 0.0,
+        reasoning_output_per_million: 0.0,
+        currency: "USD".to_string(),
+        source: "未匹配到 OpenAI GPT 官方价格，按 0 估算".to_string(),
+    });
+
+    let million = 1_000_000.0;
+    let billable_input_tokens = usage
+        .input_tokens
+        .saturating_sub(usage.cached_input_tokens)
+        .max(0);
+    let input_cost = billable_input_tokens as f64 / million * rule.input_per_million;
+    let cached_input_cost =
+        usage.cached_input_tokens as f64 / million * rule.cached_input_per_million;
+    let output_cost = usage.output_tokens as f64 / million * rule.output_per_million;
+    let reasoning_cost =
+        usage.reasoning_output_tokens as f64 / million * rule.reasoning_output_per_million;
+    let cost = input_cost + cached_input_cost + output_cost + reasoning_cost;
+    let source = if rule.source.trim().is_empty() {
+        "OpenAI API pricing, USD per 1M tokens".to_string()
+    } else {
+        rule.source.clone()
+    };
+    let mut breakdown = vec![
+        format!(
+            "模型匹配: {}",
+            if rule.model_match.trim().is_empty() {
+                "未匹配"
+            } else {
+                rule.model_match.as_str()
+            }
+        ),
+        format!(
+            "输入: {} tokens × ${:.4}/1M = ${:.6}",
+            billable_input_tokens, rule.input_per_million, input_cost
+        ),
+        format!(
+            "缓存输入: {} tokens × ${:.4}/1M = ${:.6}",
+            usage.cached_input_tokens, rule.cached_input_per_million, cached_input_cost
+        ),
+        format!(
+            "输出: {} tokens × ${:.4}/1M = ${:.6}",
+            usage.output_tokens, rule.output_per_million, output_cost
+        ),
+    ];
+    if usage.reasoning_output_tokens > 0 {
+        if rule.reasoning_output_per_million > 0.0 {
+            breakdown.push(format!(
+                "推理输出: {} tokens × ${:.4}/1M = ${:.6}",
+                usage.reasoning_output_tokens, rule.reasoning_output_per_million, reasoning_cost
+            ));
+        } else {
+            breakdown.push(format!(
+                "推理输出: {} tokens，作为输出细分展示，不重复计费",
+                usage.reasoning_output_tokens
+            ));
+        }
+    }
+    breakdown.push(format!("合计: ${cost:.6} {}", rule.currency));
+    breakdown.push(format!("来源: {source}"));
+
+    CostEstimate {
+        amount: cost,
+        currency: rule.currency,
+        breakdown: breakdown.join("\n"),
+        pricing_model_match: rule.model_match,
+        pricing_source: source,
+    }
+}
+
+fn provider_snapshot_at<'a>(
+    state: &'a ManagerState,
+    provider_key: &str,
+    timestamp_ms: i64,
+) -> Option<&'a AppliedProviderSnapshot> {
+    state
+        .applied_history
+        .iter()
+        .filter(|snapshot| {
+            snapshot.model_provider.eq_ignore_ascii_case(provider_key)
+                && snapshot.applied_at_ms <= timestamp_ms
+        })
+        .max_by_key(|snapshot| snapshot.applied_at_ms)
+}
+
+fn inferred_generic_provider(state: &ManagerState, provider_key: &str) -> Option<String> {
+    if let Some(applied_provider_id) = state.applied_provider_id.as_deref() {
+        if let Some(provider) = state.providers.iter().find(|provider| {
+            provider.id == applied_provider_id
+                && model_provider_name(provider).eq_ignore_ascii_case(provider_key)
+        }) {
+            return Some(provider.name.clone());
+        }
+    }
+
+    let matching_providers = state
+        .providers
+        .iter()
+        .filter(|provider| model_provider_name(provider).eq_ignore_ascii_case(provider_key))
+        .collect::<Vec<_>>();
+    if matching_providers.len() == 1 {
+        return Some(matching_providers[0].name.clone());
+    }
+
+    let matching_history = state
+        .applied_history
+        .iter()
+        .filter(|snapshot| snapshot.model_provider.eq_ignore_ascii_case(provider_key))
+        .collect::<Vec<_>>();
+    let mut names = matching_history
+        .iter()
+        .map(|snapshot| snapshot.provider_name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    if names.len() == 1 {
+        return names.pop();
+    }
+
+    None
+}
+
+fn resolve_provider(
+    state: &ManagerState,
+    provider_key: &str,
+    timestamp: DateTime<Utc>,
+) -> (String, bool) {
+    let provider_key = provider_key.trim();
+    if provider_key.is_empty() {
+        return ("未知供应商".to_string(), false);
+    }
+
+    if let Some(provider) = state.providers.iter().find(|provider| {
+        provider.id.eq_ignore_ascii_case(provider_key)
+            || provider.name.eq_ignore_ascii_case(provider_key)
+    }) {
+        return (provider.name.clone(), true);
+    }
+
+    let timestamp_ms = timestamp.timestamp_millis();
+    if let Some(snapshot) = provider_snapshot_at(state, provider_key, timestamp_ms) {
+        return (snapshot.provider_name.clone(), true);
+    }
+
+    let generic_provider_key = ["custom", "3rd", "unknown"]
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(provider_key));
+    if generic_provider_key {
+        if let Some(provider_name) = inferred_generic_provider(state, provider_key) {
+            return (provider_name, true);
+        }
+        return (format!("未知供应商 · {provider_key}"), false);
+    }
+
+    let matching_providers = state
+        .providers
+        .iter()
+        .filter(|provider| model_provider_name(provider).eq_ignore_ascii_case(provider_key))
+        .collect::<Vec<_>>();
+    if matching_providers.len() == 1 {
+        return (matching_providers[0].name.clone(), true);
+    }
+
+    (format!("未知供应商 · {provider_key}"), false)
+}
+
+fn parse_session_usage_file(
+    path: &PathBuf,
+    state: &ManagerState,
+) -> Result<Vec<UsageEvent>, String> {
+    let file = fs::File::open(path)
+        .map_err(|err| format!("无法打开会话文件 {}: {err}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut session_id = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut provider_key = "unknown".to_string();
+    let mut current_model = "unknown".to_string();
+    let mut previous_total: Option<TokenUsage> = None;
+    let mut events = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|err| format!("无法读取会话文件 {}: {err}", path.display()))?;
+        let value = match serde_json::from_str::<Value>(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let payload = match value.get("payload").and_then(Value::as_object) {
+            Some(payload) => payload,
+            None => continue,
+        };
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if event_type == "session_meta" {
+            if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                session_id = id.to_string();
+            }
+            if let Some(found) = payload.get("model_provider").and_then(Value::as_str) {
+                provider_key = found.to_string();
+            }
+            continue;
+        }
+
+        if event_type == "turn_context" {
+            if let Some(found) = payload.get("model").and_then(Value::as_str) {
+                current_model = found.to_string();
+            }
+            continue;
+        }
+
+        if event_type != "event_msg"
+            || payload.get("type").and_then(Value::as_str) != Some("token_count")
+        {
+            continue;
+        }
+
+        let timestamp = match parse_event_timestamp(&value) {
+            Some(timestamp) => timestamp,
+            None => continue,
+        };
+        let info = match payload.get("info").and_then(Value::as_object) {
+            Some(info) => info,
+            None => continue,
+        };
+        let last_usage = info
+            .get("last_token_usage")
+            .map(usage_from_value)
+            .unwrap_or_default();
+        let total_usage = info.get("total_token_usage").map(usage_from_value);
+        let usage = if let Some(total_usage) = total_usage {
+            let delta = usage_delta(&total_usage, previous_total.as_ref());
+            previous_total = Some(total_usage);
+            if usage_is_zero(&delta) {
+                continue;
+            }
+            delta
+        } else {
+            if usage_is_zero(&last_usage) {
+                continue;
+            }
+            last_usage
+        };
+
+        let (day, month) = timestamp_to_local_parts(timestamp);
+        let (provider_name, provider_known) = resolve_provider(state, &provider_key, timestamp);
+        let cost = estimate_cost(
+            &state.pricing,
+            &provider_key,
+            &provider_name,
+            &current_model,
+            &usage,
+        );
+
+        events.push(UsageEvent {
+            timestamp,
+            day,
+            month,
+            session_id: session_id.clone(),
+            provider_key: provider_key.clone(),
+            provider_name,
+            provider_known,
+            model: current_model.clone(),
+            usage,
+            estimated_cost: cost.amount,
+            cost_breakdown: cost.breakdown,
+            pricing_model_match: cost.pricing_model_match,
+            pricing_source: cost.pricing_source,
+            currency: cost.currency,
+            source: path.display().to_string(),
+        });
+    }
+
+    Ok(events)
+}
+
+fn group_provider_points(events: &[&UsageEvent]) -> Vec<UsageProviderPoint> {
+    let mut map = BTreeMap::<String, UsageProviderPoint>::new();
+    for event in events {
+        let entry = map
+            .entry(format!("{}::{}", event.provider_key, event.provider_name))
+            .or_insert_with(|| UsageProviderPoint {
+                provider_key: event.provider_key.clone(),
+                provider_name: event.provider_name.clone(),
+                request_count: 0,
+                input_tokens: 0,
+                uncached_input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 0,
+                estimated_cost: 0.0,
+                known: event.provider_known,
+            });
+        entry.request_count += 1;
+        entry.input_tokens += event.usage.input_tokens;
+        entry.uncached_input_tokens += event
+            .usage
+            .input_tokens
+            .saturating_sub(event.usage.cached_input_tokens)
+            .max(0);
+        entry.cached_input_tokens += event.usage.cached_input_tokens;
+        entry.output_tokens += event.usage.output_tokens;
+        entry.reasoning_output_tokens += event.usage.reasoning_output_tokens;
+        entry.total_tokens += event.usage.total_tokens;
+        entry.estimated_cost += event.estimated_cost;
+        entry.known = entry.known || event.provider_known;
+    }
+
+    let mut points = map.into_values().collect::<Vec<_>>();
+    points.sort_by(|left, right| {
+        right
+            .request_count
+            .cmp(&left.request_count)
+            .then_with(|| right.total_tokens.cmp(&left.total_tokens))
+    });
+    points
+}
+
+fn normalize_filter_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != "*")
+}
+
+fn usage_event_matches_filter(event: &UsageEvent, filter: &UsageStatsFilter) -> bool {
+    if let Some(start_day) = normalize_filter_text(filter.start_day.clone()) {
+        if event.day.as_str() < start_day.as_str() {
+            return false;
+        }
+    }
+    if let Some(end_day) = normalize_filter_text(filter.end_day.clone()) {
+        if event.day.as_str() > end_day.as_str() {
+            return false;
+        }
+    }
+    if let Some(provider_key) = normalize_filter_text(filter.provider_key.clone()) {
+        if !event.provider_key.eq_ignore_ascii_case(&provider_key) {
+            return false;
+        }
+    }
+    if let Some(provider_name) = normalize_filter_text(filter.provider_name.clone()) {
+        if !event.provider_name.eq_ignore_ascii_case(&provider_name) {
+            return false;
+        }
+    }
+    if let Some(model) = normalize_filter_text(filter.model.clone()) {
+        if !event.model.eq_ignore_ascii_case(&model) {
+            return false;
+        }
+    }
+    true
+}
+
+fn collect_available_providers(events: &[UsageEvent]) -> Vec<UsageFilterOption> {
+    let mut map = BTreeMap::<String, UsageFilterOption>::new();
+    for event in events {
+        let entry = map
+            .entry(format!("{}::{}", event.provider_key, event.provider_name))
+            .or_insert_with(|| UsageFilterOption {
+                provider_key: event.provider_key.clone(),
+                provider_name: event.provider_name.clone(),
+                request_count: 0,
+                known: event.provider_known,
+            });
+        entry.request_count += 1;
+        entry.known = entry.known || event.provider_known;
+    }
+
+    let mut providers = map.into_values().collect::<Vec<_>>();
+    providers.sort_by(|left, right| {
+        right
+            .request_count
+            .cmp(&left.request_count)
+            .then_with(|| left.provider_name.cmp(&right.provider_name))
+    });
+    providers
+}
+
+fn collect_available_models(events: &[UsageEvent]) -> Vec<String> {
+    let mut models = events
+        .iter()
+        .map(|event| event.model.clone())
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn collect_available_days(events: &[UsageEvent]) -> Vec<String> {
+    let mut days = events
+        .iter()
+        .map(|event| event.day.clone())
+        .collect::<Vec<_>>();
+    days.sort();
+    days.dedup();
+    days
+}
+
+fn usage_detail_row(event: &UsageEvent) -> UsageDetailRow {
+    UsageDetailRow {
+        timestamp: event
+            .timestamp
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+        day: event.day.clone(),
+        session_id: event.session_id.clone(),
+        provider_key: event.provider_key.clone(),
+        provider_name: event.provider_name.clone(),
+        model: event.model.clone(),
+        input_tokens: event.usage.input_tokens,
+        uncached_input_tokens: event
+            .usage
+            .input_tokens
+            .saturating_sub(event.usage.cached_input_tokens)
+            .max(0),
+        cached_input_tokens: event.usage.cached_input_tokens,
+        output_tokens: event.usage.output_tokens,
+        reasoning_output_tokens: event.usage.reasoning_output_tokens,
+        total_tokens: event.usage.total_tokens,
+        estimated_cost: event.estimated_cost,
+        cost_breakdown: event.cost_breakdown.clone(),
+        pricing_model_match: event.pricing_model_match.clone(),
+        pricing_source: event.pricing_source.clone(),
+        currency: event.currency.clone(),
+        source: event.source.clone(),
+    }
+}
+
+fn normalized_page_size(page_size: Option<usize>) -> usize {
+    match page_size.unwrap_or(50) {
+        0..=20 => 20,
+        21..=50 => 50,
+        51..=100 => 100,
+        _ => 100,
+    }
+}
+
+fn load_usage_cache(state: &ManagerState) -> Result<UsageCache, String> {
+    let sessions_dir = sessions_dir()?;
+    let mut files = Vec::new();
+    collect_jsonl_files(sessions_dir.clone(), &mut files)?;
+    files.sort();
+
+    let mut events = Vec::new();
+    let mut parsed_files = 0;
+    for file in files {
+        let file_events = parse_session_usage_file(&file, state)?;
+        if !file_events.is_empty() {
+            parsed_files += 1;
+        }
+        events.extend(file_events);
+    }
+    events.sort_by_key(|event| event.timestamp);
+
+    Ok(UsageCache {
+        events,
+        source_dir: sessions_dir.display().to_string(),
+        parsed_files,
+        loaded_at_ms: current_epoch_ms()?,
+    })
+}
+
+fn build_usage_stats_from_cache(
+    cache: &UsageCache,
+    filter: UsageStatsFilter,
+) -> Result<UsageStats, String> {
+    let events = &cache.events;
+    let available_providers = collect_available_providers(events);
+    let available_models = collect_available_models(events);
+    let available_days = collect_available_days(events);
+
+    let now = Local::now();
+    let today_key = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
+    let this_month_key = format!("{:04}-{:02}", now.year(), now.month());
+
+    let mut today = UsageSummary::default();
+    let mut this_month = UsageSummary::default();
+    for event in events {
+        if event.day == today_key {
+            add_event_usage(&mut today, event);
+        }
+        if event.month == this_month_key {
+            add_event_usage(&mut this_month, event);
+        }
+    }
+
+    let filtered_events = events
+        .iter()
+        .filter(|event| usage_event_matches_filter(event, &filter))
+        .collect::<Vec<_>>();
+
+    let mut summary = UsageSummary::default();
+    let mut daily_map = BTreeMap::<String, Vec<&UsageEvent>>::new();
+    let mut monthly_map = BTreeMap::<String, Vec<&UsageEvent>>::new();
+
+    for event in &filtered_events {
+        add_event_usage(&mut summary, event);
+        daily_map.entry(event.day.clone()).or_default().push(event);
+        monthly_map
+            .entry(event.month.clone())
+            .or_default()
+            .push(event);
+    }
+
+    let mut daily = daily_map
+        .into_iter()
+        .map(|(day, day_events)| {
+            let mut total = UsageSummary::default();
+            for event in &day_events {
+                add_event_usage(&mut total, event);
+            }
+            UsageDailyPoint {
+                day,
+                request_count: total.request_count,
+                total_tokens: total.total_tokens,
+                estimated_cost: total.estimated_cost,
+                providers: group_provider_points(&day_events),
+            }
+        })
+        .collect::<Vec<_>>();
+    daily.sort_by(|left, right| left.day.cmp(&right.day));
+
+    let monthly = monthly_map
+        .into_iter()
+        .map(|(month, month_events)| {
+            let mut total = UsageSummary::default();
+            for event in month_events {
+                add_event_usage(&mut total, event);
+            }
+            UsageMonthlyPoint {
+                month,
+                request_count: total.request_count,
+                total_tokens: total.total_tokens,
+                estimated_cost: total.estimated_cost,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let providers = group_provider_points(&filtered_events);
+    let unknown_provider_count = providers.iter().filter(|provider| !provider.known).count();
+    let page_size = normalized_page_size(filter.page_size);
+    let detail_total_pages = filtered_events.len().div_ceil(page_size).max(1);
+    let detail_page = filter.page.unwrap_or(1).clamp(1, detail_total_pages);
+    let start = (detail_page - 1) * page_size;
+
+    let details = filtered_events
+        .iter()
+        .rev()
+        .skip(start)
+        .take(page_size)
+        .map(|event| usage_detail_row(event))
+        .collect::<Vec<_>>();
+
+    Ok(UsageStats {
+        generated_at_ms: cache.loaded_at_ms,
+        source_dir: cache.source_dir.clone(),
+        filters: filter,
+        summary,
+        today,
+        this_month,
+        daily,
+        monthly,
+        providers,
+        details,
+        pricing: default_pricing_rules(),
+        available_providers,
+        available_models,
+        available_days,
+        unknown_provider_count,
+        parsed_files: cache.parsed_files,
+        parsed_events: events.len(),
+        filtered_events: filtered_events.len(),
+        detail_page,
+        detail_page_size: page_size,
+        detail_total_pages,
+    })
+}
+
 fn build_app_state(state: ManagerState) -> Result<AppState, String> {
     let provider = active_provider(&state);
     let applied_provider_id = resolved_applied_provider_id(&state);
@@ -1195,6 +2318,21 @@ fn apply_config() -> Result<AppState, String> {
     if let Some(applied_provider_id) = applied_provider_id {
         state.applied_provider_id = Some(applied_provider_id.clone());
         state.active_provider_id = applied_provider_id.clone();
+        if let Some(provider) = provider.as_ref() {
+            state.applied_history.push(AppliedProviderSnapshot {
+                provider_id: provider.id.clone(),
+                provider_name: provider.name.clone(),
+                model_provider: model_provider_name(provider),
+                base_url_hash: custom_provider_base_url(provider)
+                    .map(|base_url| hash_text(&base_url)),
+                applied_at_ms: current_epoch_ms()?,
+            });
+            if state.applied_history.len() > 300 {
+                state
+                    .applied_history
+                    .drain(0..state.applied_history.len() - 300);
+            }
+        }
         for provider in &mut state.providers {
             provider.enabled = provider.id == applied_provider_id;
         }
@@ -1206,6 +2344,35 @@ fn apply_config() -> Result<AppState, String> {
     }
     save_state(&state)?;
     build_app_state(state)
+}
+
+#[tauri::command]
+fn load_usage_stats(
+    payload: Option<LoadUsageStatsPayload>,
+    usage_cache: tauri::State<UsageCacheState>,
+) -> Result<UsageStats, String> {
+    let state = load_state_file()?;
+    let payload = payload.unwrap_or_default();
+    let filter = payload.filter.unwrap_or_default();
+
+    if !payload.force_refresh {
+        if let Some(cache) = usage_cache
+            .cache
+            .lock()
+            .map_err(|_| "统计缓存锁定失败".to_string())?
+            .clone()
+        {
+            return build_usage_stats_from_cache(&cache, filter);
+        }
+    }
+
+    let cache = load_usage_cache(&state)?;
+    let stats = build_usage_stats_from_cache(&cache, filter)?;
+    *usage_cache
+        .cache
+        .lock()
+        .map_err(|_| "统计缓存锁定失败".to_string())? = Some(cache);
+    Ok(stats)
 }
 
 #[tauri::command]
@@ -1234,6 +2401,7 @@ async fn query_provider_balance(payload: QueryBalancePayload) -> Result<AppState
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(UsageCacheState::default())
         .invoke_handler(tauri::generate_handler![
             load_app_state,
             select_provider,
@@ -1242,6 +2410,7 @@ pub fn run() {
             add_provider,
             save_base_template,
             apply_config,
+            load_usage_stats,
             query_provider_balance
         ])
         .run(tauri::generate_context!())

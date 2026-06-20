@@ -82,7 +82,122 @@ type AppState = {
   marker_present: boolean;
 };
 
-type Screen = "main" | "create" | "edit" | "current" | "settings";
+type UsageSummary = {
+  request_count: number;
+  input_tokens: number;
+  uncached_input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+  estimated_cost: number;
+  currency: string;
+};
+
+type UsageProviderPoint = {
+  provider_key: string;
+  provider_name: string;
+  request_count: number;
+  input_tokens: number;
+  uncached_input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+  estimated_cost: number;
+  known: boolean;
+};
+
+type UsageDailyPoint = {
+  day: string;
+  request_count: number;
+  total_tokens: number;
+  estimated_cost: number;
+  providers: UsageProviderPoint[];
+};
+
+type UsageMonthlyPoint = {
+  month: string;
+  request_count: number;
+  total_tokens: number;
+  estimated_cost: number;
+};
+
+type UsageDetailRow = {
+  timestamp: string;
+  day: string;
+  session_id: string;
+  provider_key: string;
+  provider_name: string;
+  model: string;
+  input_tokens: number;
+  uncached_input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+  estimated_cost: number;
+  cost_breakdown: string;
+  pricing_model_match: string;
+  pricing_source: string;
+  currency: string;
+  source: string;
+};
+
+type PricingRule = {
+  id: string;
+  provider_match: string;
+  model_match: string;
+  input_per_million: number;
+  cached_input_per_million: number;
+  output_per_million: number;
+  reasoning_output_per_million: number;
+  currency: string;
+  source: string;
+};
+
+type UsageStatsFilter = {
+  start_day?: string | null;
+  end_day?: string | null;
+  provider_key?: string | null;
+  provider_name?: string | null;
+  model?: string | null;
+  page?: number | null;
+  page_size?: number | null;
+};
+
+type UsageFilterOption = {
+  provider_key: string;
+  provider_name: string;
+  request_count: number;
+  known: boolean;
+};
+
+type UsageStats = {
+  generated_at_ms: number;
+  source_dir: string;
+  filters: UsageStatsFilter;
+  summary: UsageSummary;
+  today: UsageSummary;
+  this_month: UsageSummary;
+  daily: UsageDailyPoint[];
+  monthly: UsageMonthlyPoint[];
+  providers: UsageProviderPoint[];
+  details: UsageDetailRow[];
+  pricing: PricingRule[];
+  available_providers: UsageFilterOption[];
+  available_models: string[];
+  available_days: string[];
+  unknown_provider_count: number;
+  parsed_files: number;
+  parsed_events: number;
+  filtered_events: number;
+  detail_page: number;
+  detail_page_size: number;
+  detail_total_pages: number;
+};
+
+type Screen = "main" | "create" | "edit" | "current" | "settings" | "usage";
 type PreviewMode = "provider" | "current";
 
 function valueToTomlScalar(value: JsonValue): string {
@@ -277,6 +392,144 @@ function balanceChipActionLabel(provider: ProviderConfig | null | undefined) {
   return "刷新";
 }
 
+function defaultPricingRules(): PricingRule[] {
+  return [
+    {
+      id: "gpt-5-5",
+      provider_match: "*",
+      model_match: "gpt-5.5*",
+      input_per_million: 5,
+      cached_input_per_million: 0.5,
+      output_per_million: 30,
+      reasoning_output_per_million: 0,
+      currency: "USD",
+      source: "OpenAI API pricing, standard GPT models, USD per 1M tokens",
+    },
+    {
+      id: "gpt-5-4",
+      provider_match: "*",
+      model_match: "gpt-5.4*",
+      input_per_million: 2.5,
+      cached_input_per_million: 0.25,
+      output_per_million: 15,
+      reasoning_output_per_million: 0,
+      currency: "USD",
+      source: "OpenAI API pricing, standard GPT models, USD per 1M tokens",
+    },
+    {
+      id: "gpt-5",
+      provider_match: "*",
+      model_match: "gpt-5*",
+      input_per_million: 1.25,
+      cached_input_per_million: 0.125,
+      output_per_million: 10,
+      reasoning_output_per_million: 0,
+      currency: "USD",
+      source: "OpenAI API pricing, standard GPT models, USD per 1M tokens",
+    },
+  ];
+}
+
+function formatInteger(value: number) {
+  return Math.round(value || 0).toLocaleString("zh-CN");
+}
+
+function formatCompactNumber(value: number) {
+  const abs = Math.abs(value || 0);
+  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(abs >= 10_000_000 ? 1 : 2)}M`;
+  if (abs >= 1_000) return `${(value / 1_000).toFixed(abs >= 100_000 ? 0 : 1)}K`;
+  return formatInteger(value);
+}
+
+function formatMoney(value: number, currency = "USD") {
+  const prefix = currency.toUpperCase() === "USD" ? "$" : `${currency} `;
+  if (Math.abs(value) < 0.0001) return `${prefix}0.0000`;
+  if (Math.abs(value) < 0.01) return `${prefix}${value.toFixed(4)}`;
+  return `${prefix}${value.toFixed(2)}`;
+}
+
+function formatDateInput(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function usageRangeFilter(range: "today" | "7d" | "30d" | "month" | "all"): UsageStatsFilter {
+  const now = new Date();
+  if (range === "all") return {};
+  if (range === "today") {
+    const today = formatDateInput(now);
+    return { start_day: today, end_day: today };
+  }
+  if (range === "month") {
+    const start = new Date(now.getFullYear(), now.getMonth(), 1);
+    return { start_day: formatDateInput(start), end_day: formatDateInput(now) };
+  }
+
+  const days = range === "7d" ? 6 : 29;
+  const start = new Date(now);
+  start.setDate(now.getDate() - days);
+  return { start_day: formatDateInput(start), end_day: formatDateInput(now) };
+}
+
+function usageFilterPayload(filter: UsageStatsFilter): UsageStatsFilter {
+  const payload: UsageStatsFilter = {};
+  if (filter.start_day) payload.start_day = filter.start_day;
+  if (filter.end_day) payload.end_day = filter.end_day;
+  if (filter.provider_key) payload.provider_key = filter.provider_key;
+  if (filter.provider_name) payload.provider_name = filter.provider_name;
+  if (filter.model) payload.model = filter.model;
+  if (filter.page) payload.page = filter.page;
+  if (filter.page_size) payload.page_size = filter.page_size;
+  return payload;
+}
+
+function usageRangeLabel(filter: UsageStatsFilter) {
+  if (filter.start_day && filter.end_day) {
+    return filter.start_day === filter.end_day
+      ? filter.start_day
+      : `${filter.start_day} 至 ${filter.end_day}`;
+  }
+  if (filter.start_day) return `${filter.start_day} 之后`;
+  if (filter.end_day) return `${filter.end_day} 之前`;
+  return "全部时间";
+}
+
+function providerFilterValue(filter: UsageStatsFilter) {
+  if (!filter.provider_key) return "";
+  return `${filter.provider_key}\u0000${filter.provider_name ?? ""}`;
+}
+
+function parseProviderFilterValue(value: string): Pick<UsageStatsFilter, "provider_key" | "provider_name"> {
+  if (!value) {
+    return { provider_key: null, provider_name: null };
+  }
+  const [providerKey, providerName = ""] = value.split("\u0000");
+  return {
+    provider_key: providerKey || null,
+    provider_name: providerName || null,
+  };
+}
+
+function usagePageNumbers(page: number, totalPages: number) {
+  const pages = new Set<number>([1, totalPages, page - 1, page, page + 1]);
+  return Array.from(pages)
+    .filter((value) => value >= 1 && value <= totalPages)
+    .sort((left, right) => left - right);
+}
+
+function costTooltipForSummary(summary: UsageSummary | null | undefined, label: string) {
+  if (!summary) return "";
+  return `${label}\n输入（未缓存）: ${formatInteger(
+    summary.uncached_input_tokens,
+  )}\n输入（已缓存）: ${formatInteger(
+    summary.cached_input_tokens,
+  )}\n输出: ${formatInteger(summary.output_tokens)}\n推理输出: ${formatInteger(
+    summary.reasoning_output_tokens,
+  )}\n金额: ${formatMoney(summary.estimated_cost, summary.currency)}`;
+}
+
 function syncCustomProviderToml(tomlText: string, baseUrl: string, token: string) {
   let next = tomlText;
   next = upsertTomlScalar(next, "model_provider", "custom");
@@ -348,6 +601,170 @@ const isTauriRuntime = "__TAURI_INTERNALS__" in window;
 const mockBase: JsonValue = {};
 
 let mockProviderStore: ProviderConfig[] = [];
+const mockDetails = Array.from({ length: 26 }, (_, index): UsageDetailRow => {
+  const inputTokens = 180_000 + index * 9_300;
+  const cachedInputTokens = Math.round(inputTokens * 0.32);
+  const outputTokens = 18_000 + index * 1_120;
+  const reasoningOutputTokens = Math.round(outputTokens * 0.42);
+  const totalTokens = inputTokens + outputTokens;
+  const estimatedCost =
+    ((inputTokens - cachedInputTokens) / 1_000_000) * 1.25 +
+    (cachedInputTokens / 1_000_000) * 0.125 +
+    (outputTokens / 1_000_000) * 10;
+  return {
+    timestamp: `2026-06-${String(10 + Math.floor(index / 3)).padStart(2, "0")} ${String(
+      9 + (index % 9),
+    ).padStart(2, "0")}:24:16`,
+    day: `2026-06-${String(10 + Math.floor(index / 3)).padStart(2, "0")}`,
+    session_id: `mock-session-${index + 1}`,
+    provider_key: index % 3 === 0 ? "openai" : "custom",
+    provider_name: index % 3 === 0 ? "OpenAI" : "Hlongyu API",
+    model: index % 4 === 0 ? "gpt-5.3-codex" : "gpt-5",
+    input_tokens: inputTokens,
+    uncached_input_tokens: inputTokens - cachedInputTokens,
+    cached_input_tokens: cachedInputTokens,
+    output_tokens: outputTokens,
+    reasoning_output_tokens: reasoningOutputTokens,
+    total_tokens: totalTokens,
+    estimated_cost: estimatedCost,
+    cost_breakdown: `模型匹配: gpt-5*\n输入: ${
+      inputTokens - cachedInputTokens
+    } tokens × $1.2500/1M\n缓存输入: ${cachedInputTokens} tokens × $0.1250/1M\n输出: ${outputTokens} tokens × $10.0000/1M\n推理输出: ${reasoningOutputTokens} tokens，作为输出细分展示，不重复计费\n合计: ${formatMoney(
+      estimatedCost,
+      "USD",
+    )}`,
+    pricing_model_match: "gpt-5*",
+    pricing_source: "OpenAI API pricing, standard GPT models, USD per 1M tokens",
+    currency: "USD",
+    source: "~/.codex/sessions/mock.jsonl",
+  };
+});
+
+let mockUsageStats: UsageStats = {
+  generated_at_ms: Date.now(),
+  source_dir: "~/.codex/sessions",
+  filters: {},
+  summary: {
+    request_count: 654,
+    input_tokens: 183_420_000,
+    uncached_input_tokens: 121_320_000,
+    cached_input_tokens: 62_100_000,
+    output_tokens: 14_560_000,
+    reasoning_output_tokens: 7_880_000,
+    total_tokens: 197_980_000,
+    estimated_cost: 0,
+    currency: "USD",
+  },
+  today: {
+    request_count: 179,
+    input_tokens: 48_200_000,
+    uncached_input_tokens: 29_780_000,
+    cached_input_tokens: 18_420_000,
+    output_tokens: 3_900_000,
+    reasoning_output_tokens: 1_900_000,
+    total_tokens: 52_100_000,
+    estimated_cost: 0,
+    currency: "USD",
+  },
+  this_month: {
+    request_count: 654,
+    input_tokens: 183_420_000,
+    uncached_input_tokens: 121_320_000,
+    cached_input_tokens: 62_100_000,
+    output_tokens: 14_560_000,
+    reasoning_output_tokens: 7_880_000,
+    total_tokens: 197_980_000,
+    estimated_cost: 0,
+    currency: "USD",
+  },
+  daily: Array.from({ length: 10 }, (_, index) => {
+    const day = `2026-06-${String(index + 12).padStart(2, "0")}`;
+    const requestCount = [42, 58, 51, 83, 76, 92, 69, 110, 88, 179][index];
+    const totalTokens = requestCount * 290_000;
+    return {
+      day,
+      request_count: requestCount,
+      total_tokens: totalTokens,
+      estimated_cost: 0,
+      providers: [
+        {
+          provider_key: "custom",
+          provider_name: "Hlongyu API",
+          request_count: Math.round(requestCount * 0.72),
+          input_tokens: Math.round(totalTokens * 0.66),
+          uncached_input_tokens: Math.round(totalTokens * 0.48),
+          cached_input_tokens: Math.round(totalTokens * 0.18),
+          output_tokens: Math.round(totalTokens * 0.06),
+          reasoning_output_tokens: Math.round(totalTokens * 0.03),
+          total_tokens: Math.round(totalTokens * 0.72),
+          estimated_cost: 0,
+          known: false,
+        },
+        {
+          provider_key: "openai",
+          provider_name: "OpenAI",
+          request_count: Math.round(requestCount * 0.28),
+          input_tokens: Math.round(totalTokens * 0.25),
+          uncached_input_tokens: Math.round(totalTokens * 0.19),
+          cached_input_tokens: Math.round(totalTokens * 0.06),
+          output_tokens: Math.round(totalTokens * 0.03),
+          reasoning_output_tokens: Math.round(totalTokens * 0.012),
+          total_tokens: Math.round(totalTokens * 0.28),
+          estimated_cost: 0,
+          known: true,
+        },
+      ],
+    };
+  }),
+  monthly: [
+    { month: "2026-04", request_count: 1721, total_tokens: 42_000_000, estimated_cost: 0 },
+    { month: "2026-05", request_count: 2680, total_tokens: 91_000_000, estimated_cost: 0 },
+    { month: "2026-06", request_count: 654, total_tokens: 197_980_000, estimated_cost: 0 },
+  ],
+  providers: [
+    {
+      provider_key: "custom",
+      provider_name: "Hlongyu API",
+      request_count: 471,
+      input_tokens: 122_000_000,
+      uncached_input_tokens: 79_000_000,
+      cached_input_tokens: 43_000_000,
+      output_tokens: 20_000_000,
+      reasoning_output_tokens: 8_600_000,
+      total_tokens: 142_000_000,
+      estimated_cost: 0,
+      known: false,
+    },
+    {
+      provider_key: "openai",
+      provider_name: "OpenAI",
+      request_count: 183,
+      input_tokens: 48_000_000,
+      uncached_input_tokens: 34_000_000,
+      cached_input_tokens: 14_000_000,
+      output_tokens: 7_980_000,
+      reasoning_output_tokens: 3_200_000,
+      total_tokens: 55_980_000,
+      estimated_cost: 0,
+      known: true,
+    },
+  ],
+  details: mockDetails,
+  pricing: defaultPricingRules(),
+  available_providers: [
+    { provider_key: "custom", provider_name: "Hlongyu API", request_count: 471, known: true },
+    { provider_key: "openai", provider_name: "OpenAI", request_count: 183, known: true },
+  ],
+  available_models: ["gpt-5", "gpt-5.3-codex"],
+  available_days: ["2026-06-10", "2026-06-11", "2026-06-12", "2026-06-13", "2026-06-14"],
+  unknown_provider_count: 1,
+  parsed_files: 12,
+  parsed_events: 654,
+  filtered_events: 654,
+  detail_page: 1,
+  detail_page_size: 20,
+  detail_total_pages: 2,
+};
 
 let mockState = buildMockState({
   activeProviderId: "",
@@ -619,6 +1036,61 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>) {
     return mockState as T;
   }
 
+  if (command === "load_usage_stats") {
+    const payload = (args?.payload as
+      | { filter?: UsageStatsFilter; force_refresh?: boolean }
+      | undefined) ?? {};
+    const filter = (payload.filter ?? {}) as UsageStatsFilter;
+    const filteredDetails = mockDetails.filter((row) => {
+      if (filter.start_day && row.day < filter.start_day) return false;
+      if (filter.end_day && row.day > filter.end_day) return false;
+      if (filter.provider_key && row.provider_key !== filter.provider_key) return false;
+      if (filter.provider_name && row.provider_name !== filter.provider_name) return false;
+      if (filter.model && row.model !== filter.model) return false;
+      return true;
+    });
+    const summary = filteredDetails.reduce<UsageSummary>(
+      (total, row) => ({
+        ...total,
+        request_count: total.request_count + 1,
+        input_tokens: total.input_tokens + row.input_tokens,
+        uncached_input_tokens: total.uncached_input_tokens + row.uncached_input_tokens,
+        cached_input_tokens: total.cached_input_tokens + row.cached_input_tokens,
+        output_tokens: total.output_tokens + row.output_tokens,
+        reasoning_output_tokens: total.reasoning_output_tokens + row.reasoning_output_tokens,
+        total_tokens: total.total_tokens + row.total_tokens,
+        estimated_cost: total.estimated_cost + row.estimated_cost,
+      }),
+      {
+        request_count: 0,
+        input_tokens: 0,
+        uncached_input_tokens: 0,
+        cached_input_tokens: 0,
+        output_tokens: 0,
+        reasoning_output_tokens: 0,
+        total_tokens: 0,
+        estimated_cost: 0,
+        currency: "USD",
+      },
+    );
+    const pageSize = Number(filter.page_size) || 20;
+    const totalPages = Math.max(1, Math.ceil(filteredDetails.length / pageSize));
+    const page = Math.min(Math.max(Number(filter.page) || 1, 1), totalPages);
+    const start = (page - 1) * pageSize;
+    const details = filteredDetails.slice(start, start + pageSize);
+    return {
+      ...mockUsageStats,
+      filters: { ...filter, page, page_size: pageSize },
+      summary,
+      details,
+      filtered_events: filteredDetails.length,
+      detail_page: page,
+      detail_page_size: pageSize,
+      detail_total_pages: totalPages,
+      generated_at_ms: Date.now(),
+    } as T;
+  }
+
   throw new Error(`未实现的模拟命令: ${command}`);
 }
 
@@ -652,6 +1124,15 @@ function App() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [balanceBusy, setBalanceBusy] = useState(false);
+  const [usageStats, setUsageStats] = useState<UsageStats | null>(null);
+  const [usageBusy, setUsageBusy] = useState(false);
+  const [usageRefreshing, setUsageRefreshing] = useState(false);
+  const [usageRange, setUsageRange] = useState<"today" | "7d" | "30d" | "month" | "all" | "custom">("30d");
+  const [usageFilter, setUsageFilter] = useState<UsageStatsFilter>(() => ({
+    ...usageRangeFilter("30d"),
+    page: 1,
+    page_size: 20,
+  }));
 
   async function refresh() {
     setError("");
@@ -996,6 +1477,67 @@ function App() {
     }
   }
 
+  async function openUsageStats() {
+    setScreen("usage");
+    await loadUsageStats(usageFilter, !usageStats);
+  }
+
+  async function loadUsageStats(nextFilter = usageFilter, forceRefresh = false) {
+    if (forceRefresh) {
+      setUsageRefreshing(true);
+    }
+    setUsageBusy(true);
+    setError("");
+    try {
+      const stats = await callCommand<UsageStats>("load_usage_stats", {
+        payload: {
+          filter: usageFilterPayload(nextFilter),
+          force_refresh: forceRefresh,
+        },
+      });
+      setUsageStats(stats);
+      setUsageFilter(stats.filters ?? nextFilter);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setUsageBusy(false);
+      setUsageRefreshing(false);
+    }
+  }
+
+  function applyUsageRange(range: "today" | "7d" | "30d" | "month" | "all") {
+    const nextFilter = {
+      ...usageRangeFilter(range),
+      provider_key: usageFilter.provider_key,
+      provider_name: usageFilter.provider_name,
+      model: usageFilter.model,
+      page: 1,
+      page_size: usageFilter.page_size ?? 20,
+    };
+    setUsageRange(range);
+    setUsageFilter(nextFilter);
+    void loadUsageStats(nextFilter);
+  }
+
+  function updateUsageFilter(patch: UsageStatsFilter, range: typeof usageRange = "custom") {
+    const nextFilter = { ...usageFilter, ...patch };
+    setUsageRange(range);
+    setUsageFilter(nextFilter);
+    void loadUsageStats(nextFilter);
+  }
+
+  function updateUsagePage(page: number) {
+    const nextFilter = { ...usageFilter, page };
+    setUsageFilter(nextFilter);
+    void loadUsageStats(nextFilter);
+  }
+
+  function updateUsagePageSize(pageSize: number) {
+    const nextFilter = { ...usageFilter, page: 1, page_size: pageSize };
+    setUsageFilter(nextFilter);
+    void loadUsageStats(nextFilter);
+  }
+
   if (!appState) {
     return (
       <main className="loading-shell">
@@ -1015,6 +1557,262 @@ function App() {
         : "# 当前还没有 ~/.codex/config.toml"
       : previewState?.final_preview_toml ?? "";
   const modalDiffs = previewMode === "provider" ? previewState?.diffs ?? [] : [];
+  const appliedProvider = appState.providers.find((provider) => provider.enabled);
+
+  if (screen === "usage") {
+    const stats = usageStats;
+    const details = stats?.details ?? [];
+    const currency = stats?.summary.currency ?? "USD";
+    const detailPage = stats?.detail_page ?? usageFilter.page ?? 1;
+    const detailPageSize = stats?.detail_page_size ?? usageFilter.page_size ?? 20;
+    const detailTotalPages = stats?.detail_total_pages ?? 1;
+    const pageNumbers = usagePageNumbers(detailPage, detailTotalPages);
+
+    return (
+      <main className="usage-shell">
+        <header className="usage-topbar">
+          <div className="usage-brand">
+            <div className="brand-mark">C</div>
+            <div>
+              <strong>Codex 配置</strong>
+              <span>使用统计</span>
+            </div>
+          </div>
+          <div className="top-actions">
+            <button className="secondary" onClick={() => setScreen("main")}>
+              返回配置
+            </button>
+            <button
+              className="primary"
+              onClick={() => loadUsageStats(usageFilter, true)}
+              disabled={usageRefreshing}
+            >
+              {usageRefreshing ? "刷新中" : "刷新统计"}
+            </button>
+          </div>
+        </header>
+
+        <section className="usage-workspace">
+          <div className="usage-title-row">
+            <div>
+              <p className="eyebrow">本机使用统计</p>
+              <h2>使用情况概览</h2>
+              <p>只读取本机 Codex 会话 token_count 元数据，不展示 prompt 或 response 内容。</p>
+            </div>
+            <div className="usage-meta">
+              <span>来源：{stats?.source_dir ?? "~/.codex/sessions"}</span>
+              <span>
+                {stats
+                  ? `${formatInteger(stats.filtered_events)} / ${formatInteger(
+                      stats.parsed_events,
+                    )} 条记录 · ${formatInteger(stats.parsed_files)} 个文件`
+                  : "尚未读取"}
+              </span>
+            </div>
+          </div>
+
+          {error && <div className="error-banner">{error}</div>}
+
+          <section className="usage-filter-panel">
+            <div className="usage-filter-group">
+              <span>时间</span>
+              <div className="usage-range-buttons">
+                {[
+                  ["today", "今天"],
+                  ["7d", "7 天"],
+                  ["30d", "30 天"],
+                  ["month", "本月"],
+                  ["all", "全部"],
+                ].map(([value, label]) => (
+                  <button
+                    className={usageRange === value ? "selected" : ""}
+                    key={value}
+                    onClick={() =>
+                      applyUsageRange(value as "today" | "7d" | "30d" | "month" | "all")
+                    }
+                    type="button"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <input
+                aria-label="开始日期"
+                type="date"
+                value={usageFilter.start_day ?? ""}
+                onChange={(event) =>
+                  updateUsageFilter({
+                    start_day: event.currentTarget.value || null,
+                    page: 1,
+                  })
+                }
+              />
+              <input
+                aria-label="结束日期"
+                type="date"
+                value={usageFilter.end_day ?? ""}
+                onChange={(event) =>
+                  updateUsageFilter({
+                    end_day: event.currentTarget.value || null,
+                    page: 1,
+                  })
+                }
+              />
+            </div>
+
+            <div className="usage-filter-group usage-filter-selects">
+              <span>筛选</span>
+              <select
+                value={providerFilterValue(usageFilter)}
+                onChange={(event) =>
+                  updateUsageFilter({
+                    ...parseProviderFilterValue(event.currentTarget.value),
+                    page: 1,
+                  })
+                }
+              >
+                <option value="">全部供应商</option>
+                {(stats?.available_providers ?? []).map((provider) => (
+                  <option
+                    key={`${provider.provider_key}-${provider.provider_name}`}
+                    value={`${provider.provider_key}\u0000${provider.provider_name}`}
+                  >
+                    {provider.provider_name}
+                  </option>
+                ))}
+              </select>
+              <select
+                value={usageFilter.model ?? ""}
+                onChange={(event) =>
+                  updateUsageFilter({ model: event.currentTarget.value || null, page: 1 })
+                }
+              >
+                <option value="">全部模型</option>
+                {(stats?.available_models ?? []).map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="usage-note">
+              <strong>{stats?.unknown_provider_count ?? 0}</strong>
+              <span>个未识别供应商</span>
+            </div>
+          </section>
+
+          <section className={`usage-kpi-grid ${usageBusy && !usageRefreshing ? "is-loading" : ""}`}>
+            <article className="usage-kpi-card accent">
+              <span>输入（未缓存）</span>
+              <strong>{formatCompactNumber(stats?.summary.uncached_input_tokens ?? 0)}</strong>
+              <p>筛选范围：{usageRangeLabel(usageFilter)}</p>
+            </article>
+            <article className="usage-kpi-card">
+              <span>输入（已缓存）</span>
+              <strong>{formatCompactNumber(stats?.summary.cached_input_tokens ?? 0)}</strong>
+              <p>按缓存输入单价计费</p>
+            </article>
+            <article className="usage-kpi-card">
+              <span>输出</span>
+              <strong>{formatCompactNumber(stats?.summary.output_tokens ?? 0)}</strong>
+              <p>推理输出 {formatCompactNumber(stats?.summary.reasoning_output_tokens ?? 0)}</p>
+            </article>
+            <article
+              className="usage-kpi-card warning"
+              title={costTooltipForSummary(stats?.summary, "筛选范围金额")}
+            >
+              <span>金额</span>
+              <strong>{formatMoney(stats?.summary.estimated_cost ?? 0, currency)}</strong>
+              <p>悬停查看计算详情</p>
+            </article>
+          </section>
+
+          <section className={`usage-bottom-grid single ${usageBusy && !usageRefreshing ? "is-loading" : ""}`}>
+            <article className="usage-panel usage-details-panel">
+              <div className="panel-header">
+                <div>
+                  <h3>明细记录</h3>
+                  <p>按页查看筛选范围内的 token_count 记录。</p>
+                </div>
+                <span className="detail-count">
+                  第 {formatInteger(detailPage)} / {formatInteger(detailTotalPages)} 页 · 共{" "}
+                  {formatInteger(stats?.filtered_events ?? 0)} 条
+                </span>
+              </div>
+              <div className="usage-detail-wrap">
+                <div className="usage-detail-table">
+                  <span>时间</span>
+                  <span>供应商</span>
+                  <span>模型</span>
+                  <span>输入（未缓存）</span>
+                  <span>输入（已缓存）</span>
+                  <span>输出</span>
+                  <span>推理</span>
+                  <span>金额</span>
+                  {details.map((row) => (
+                    <div className="usage-detail-row" key={`${row.timestamp}-${row.session_id}-${row.total_tokens}`}>
+                      <span title={row.source}>{row.timestamp}</span>
+                      <strong title={row.provider_key}>{row.provider_name}</strong>
+                      <em title={row.pricing_model_match}>{row.model}</em>
+                      <b>{formatCompactNumber(row.uncached_input_tokens)}</b>
+                      <b>{formatCompactNumber(row.cached_input_tokens)}</b>
+                      <b>{formatCompactNumber(row.output_tokens)}</b>
+                      <b>{formatCompactNumber(row.reasoning_output_tokens)}</b>
+                      <i className="cost-cell" title={row.cost_breakdown}>
+                        {formatMoney(row.estimated_cost, row.currency || currency)}
+                      </i>
+                    </div>
+                  ))}
+                </div>
+                {!details.length && <div className="usage-empty">当前筛选范围没有明细。</div>}
+              </div>
+              <div className="usage-pagination">
+                <button
+                  className="secondary"
+                  disabled={usageBusy || detailPage <= 1}
+                  onClick={() => updateUsagePage(detailPage - 1)}
+                  type="button"
+                >
+                  上一页
+                </button>
+                {pageNumbers.map((page, index) => (
+                  <span className="pagination-page" key={page}>
+                    {index > 0 && pageNumbers[index - 1] !== page - 1 && <em>...</em>}
+                    <button
+                      className={page === detailPage ? "selected" : ""}
+                      onClick={() => updateUsagePage(page)}
+                      type="button"
+                    >
+                      {page}
+                    </button>
+                  </span>
+                ))}
+                <button
+                  className="secondary"
+                  disabled={usageBusy || detailPage >= detailTotalPages}
+                  onClick={() => updateUsagePage(detailPage + 1)}
+                  type="button"
+                >
+                  下一页
+                </button>
+                <select
+                  value={detailPageSize}
+                  onChange={(event) => updateUsagePageSize(Number(event.currentTarget.value))}
+                >
+                  {[20, 50, 100].map((size) => (
+                    <option key={size} value={size}>
+                      {size} 条/页
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </article>
+          </section>
+        </section>
+      </main>
+    );
+  }
 
   return (
     <main className="app-shell">
@@ -1057,6 +1855,9 @@ function App() {
         </nav>
 
         <div className="global-actions">
+          <button className="settings-button primary-nav" onClick={openUsageStats} disabled={busy}>
+            使用统计
+          </button>
           <button className="settings-button" onClick={previewCurrentConfig} disabled={busy}>
             查看实际配置
           </button>
@@ -1242,8 +2043,8 @@ function App() {
                   <h3>现有配置摘要</h3>
                   <p>主界面只展示最终会影响 Codex 的关键项。</p>
                 </div>
-                <span className={`status ${appState.marker_present ? "ok" : "warn"}`}>
-                  {appState.marker_present ? "标记已接管" : "首次接管"}
+                <span className={`status ${appliedProvider ? "ok" : "warn"}`}>
+                  {appliedProvider ? `已应用：${appliedProvider.name}` : "未应用供应商"}
                 </span>
               </div>
 
@@ -1695,8 +2496,8 @@ function App() {
                   <strong>{appState.current_config_exists ? "已读取" : "尚未创建"}</strong>
                 </div>
                 <div>
-                  <span>接管标记</span>
-                  <strong>{appState.marker_present ? "已接管" : "未接管"}</strong>
+                  <span>管理标记</span>
+                  <strong>{appState.marker_present ? "存在" : "缺失"}</strong>
                 </div>
               </div>
             </section>
@@ -1770,7 +2571,7 @@ function App() {
                       {previewState.diffs.length ? `${previewState.diffs.length} 处变化` : "无变化"}
                     </span>
                     <span className="status neutral">
-                      {previewState.marker_present ? "已有接管标记" : "将加入接管标记"}
+                      {previewState.marker_present ? "已有管理标记" : "将写入管理标记"}
                     </span>
                   </>
                 ) : (
@@ -1779,7 +2580,7 @@ function App() {
                       {previewState.current_config_exists ? "已读取" : "尚未创建"}
                     </span>
                     <span className="status neutral">
-                      {previewState.marker_present ? "已有接管标记" : "无接管标记"}
+                      {previewState.marker_present ? "已有管理标记" : "无管理标记"}
                     </span>
                   </>
                 )}
