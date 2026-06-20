@@ -15,6 +15,30 @@ type ProviderConfig = {
   name: string;
   enabled: boolean;
   config: JsonValue;
+  balance_query: BalanceQueryConfig;
+  balance_status?: BalanceStatus | null;
+};
+
+type BalanceQueryType = "disabled" | "new_api" | "sub2_api";
+type NewApiBalanceTarget = "token_quota" | "account_balance";
+type BalanceAuthMode = "provider_token" | "separate_token";
+
+type BalanceQueryConfig = {
+  enabled: boolean;
+  query_type: BalanceQueryType;
+  new_api_target: NewApiBalanceTarget;
+  endpoint: string;
+  path: string;
+  auth_mode: BalanceAuthMode;
+  query_token: string;
+  new_api_user_id: string;
+};
+
+type BalanceStatus = {
+  amount?: string | null;
+  label: string;
+  checked_at?: number | null;
+  error?: string | null;
 };
 
 type ProviderSummary = {
@@ -183,6 +207,74 @@ function buildCustomProviderToml(baseUrl: string, token: string) {
 
 function buildVisibleCustomProviderToml(baseUrl: string, token: string, tokenVisible: boolean) {
   return buildCustomProviderToml(baseUrl, tokenVisible || !token ? token : "********");
+}
+
+function defaultBalanceQuery(endpoint = ""): BalanceQueryConfig {
+  return {
+    enabled: false,
+    query_type: "disabled",
+    new_api_target: "token_quota",
+    endpoint,
+    path: "/api/usage/token/",
+    auth_mode: "provider_token",
+    query_token: "",
+    new_api_user_id: "",
+  };
+}
+
+function defaultBalancePath(
+  queryType: BalanceQueryType,
+  newApiTarget: NewApiBalanceTarget = "token_quota",
+) {
+  if (queryType === "sub2_api") return "/v1/usage";
+  if (queryType === "new_api" && newApiTarget === "account_balance") {
+    return "/api/user/self";
+  }
+  return "/api/usage/token/";
+}
+
+function endpointFromBaseUrl(baseUrl: string) {
+  return baseUrl.trim().replace(/\/v1\/?$/, "").replace(/\/$/, "");
+}
+
+function normalizeBalanceQuery(config?: BalanceQueryConfig | null, endpoint = "") {
+  const queryType = config?.query_type ?? "disabled";
+  const newApiTarget = config?.new_api_target ?? "token_quota";
+  const isLegacyNewApiPath =
+    queryType === "new_api" &&
+    newApiTarget === "token_quota" &&
+    config?.path === "/api/user/self" &&
+    !config?.new_api_user_id;
+  const normalized = {
+    ...defaultBalanceQuery(endpoint),
+    ...(config ?? {}),
+    endpoint: config?.endpoint || endpoint,
+    path: isLegacyNewApiPath
+      ? defaultBalancePath(queryType, newApiTarget)
+      : config?.path || defaultBalancePath(queryType, newApiTarget),
+  };
+
+  if (normalized.query_type === "new_api" && normalized.new_api_target === "account_balance") {
+    normalized.auth_mode = "separate_token";
+  }
+
+  return normalized;
+}
+
+function balanceChipLabel(provider: ProviderConfig | null | undefined) {
+  const query = provider?.balance_query;
+  if (!provider) return "未选择";
+  if (!query?.enabled || query.query_type === "disabled") return "未配置";
+  return provider.balance_status?.label ?? "未查询";
+}
+
+function balanceChipActionLabel(provider: ProviderConfig | null | undefined) {
+  const query = provider?.balance_query;
+  if (!provider) return "设置";
+  if (!query?.enabled || query.query_type === "disabled") return "设置";
+  if (provider.balance_status?.error) return "重试";
+  if (!provider.balance_status) return "查询";
+  return "刷新";
 }
 
 function syncCustomProviderToml(tomlText: string, baseUrl: string, token: string) {
@@ -372,6 +464,8 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>) {
         id: provider.id,
         name: provider.name,
         enabled: provider.enabled,
+        balance_query: provider.balance_query,
+        balance_status: provider.balance_status,
         config: provider.config,
       })),
       markerPresent: mockState.marker_present,
@@ -384,6 +478,7 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>) {
       provider_id: string;
       provider_name?: string;
       config_toml: string;
+      balance_query?: BalanceQueryConfig;
     };
     mockProviderStore = mockProviderStore.map((provider) => ({
       id: provider.id,
@@ -392,6 +487,11 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>) {
           ? payload.provider_name
           : provider.name,
       enabled: provider.enabled,
+      balance_query:
+        provider.id === payload.provider_id && payload.balance_query
+          ? payload.balance_query
+          : provider.balance_query,
+      balance_status: provider.balance_status,
       config:
         provider.id === payload.provider_id
           ? mockTomlToObject(payload.config_toml)
@@ -412,6 +512,7 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>) {
       provider_id: string;
       provider_name?: string;
       config_toml: string;
+      balance_query?: BalanceQueryConfig;
     };
     const previewProviders = mockProviderStore.map((provider) => ({
       id: provider.id,
@@ -420,6 +521,11 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>) {
           ? payload.provider_name
           : provider.name,
       enabled: provider.enabled,
+      balance_query:
+        provider.id === payload.provider_id && payload.balance_query
+          ? payload.balance_query
+          : provider.balance_query,
+      balance_status: provider.balance_status,
       config:
         provider.id === payload.provider_id
           ? mockTomlToObject(payload.config_toml)
@@ -443,6 +549,8 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>) {
         id,
         name,
         enabled: false,
+        balance_query: defaultBalanceQuery(),
+        balance_status: null,
         config: mockTomlToObject(
           'model_provider = "custom"\n\n[model_providers.custom]\nbase_url = ""\nexperimental_bearer_token = ""\n',
         ),
@@ -487,6 +595,30 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>) {
     return mockState as T;
   }
 
+  if (command === "query_provider_balance") {
+    const providerId = String((args?.payload as { provider_id?: string })?.provider_id ?? "");
+    mockProviderStore = mockProviderStore.map((provider) => ({
+      ...provider,
+      balance_status:
+        provider.id === providerId
+          ? {
+              amount: "23.41",
+              label: "余额 ¥ 23.41",
+              checked_at: Math.floor(Date.now() / 1000),
+              error: null,
+            }
+          : provider.balance_status,
+    }));
+    mockState = buildMockState({
+      activeProviderId: mockState.active_provider?.id ?? providerId,
+      base: mockState.base,
+      baseTemplateName: mockState.base_template_name,
+      providers: mockProviderStore,
+      markerPresent: mockState.marker_present,
+    });
+    return mockState as T;
+  }
+
   throw new Error(`未实现的模拟命令: ${command}`);
 }
 
@@ -503,6 +635,8 @@ function App() {
   const [customBaseUrl, setCustomBaseUrl] = useState("");
   const [customToken, setCustomToken] = useState("");
   const [customTokenVisible, setCustomTokenVisible] = useState(false);
+  const [balanceQuery, setBalanceQuery] = useState<BalanceQueryConfig>(defaultBalanceQuery());
+  const [balanceTokenVisible, setBalanceTokenVisible] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [previewState, setPreviewState] = useState<AppState | null>(null);
   const [previewMode, setPreviewMode] = useState<PreviewMode>("provider");
@@ -517,6 +651,7 @@ function App() {
   const [baseName, setBaseName] = useState("默认模板");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [balanceBusy, setBalanceBusy] = useState(false);
 
   async function refresh() {
     setError("");
@@ -527,6 +662,12 @@ function App() {
     const custom = parseCustomProviderFields(state.active_provider_toml);
     setCustomBaseUrl(custom.baseUrl);
     setCustomToken(custom.token);
+    setBalanceQuery(
+      normalizeBalanceQuery(
+        state.active_provider?.balance_query,
+        endpointFromBaseUrl(custom.baseUrl),
+      ),
+    );
     setBaseName(state.base_template_name);
     setVisibleSummarySecrets({});
     setPreviewState(null);
@@ -544,6 +685,13 @@ function App() {
     setCustomBaseUrl(custom.baseUrl);
     setCustomToken(custom.token);
     setCustomTokenVisible(false);
+    setBalanceTokenVisible(false);
+    setBalanceQuery(
+      normalizeBalanceQuery(
+        appState.active_provider?.balance_query,
+        endpointFromBaseUrl(custom.baseUrl),
+      ),
+    );
     setVisibleSummarySecrets({});
     setPreviewState(null);
   }, [appState?.active_provider?.id]);
@@ -597,7 +745,16 @@ function App() {
   }
 
   function updateCustomBaseUrl(baseUrl: string) {
+    const previousEndpoint = endpointFromBaseUrl(customBaseUrl);
+    const nextEndpoint = endpointFromBaseUrl(baseUrl);
     setCustomBaseUrl(baseUrl);
+    setBalanceQuery((current) => ({
+      ...current,
+      endpoint:
+        !current.endpoint || current.endpoint === previousEndpoint
+          ? nextEndpoint
+          : current.endpoint,
+    }));
     setProviderText((current) => syncCustomProviderToml(current, baseUrl, customToken));
     closePreview();
   }
@@ -621,6 +778,37 @@ function App() {
       ...current,
       [path]: !current[path],
     }));
+  }
+
+  function updateBalanceQuery(patch: Partial<BalanceQueryConfig>) {
+    setBalanceQuery((current) => {
+      const next = { ...current, ...patch };
+      const previousDefault = defaultBalancePath(
+        current.query_type,
+        current.new_api_target,
+      );
+      if (patch.query_type && patch.query_type !== "disabled") {
+        next.enabled = true;
+      }
+      if (patch.query_type === "disabled") {
+        next.enabled = false;
+      }
+      if (patch.query_type || patch.new_api_target) {
+        const nextDefault = defaultBalancePath(next.query_type, next.new_api_target);
+        if (!current.path || current.path === previousDefault) {
+          next.path = nextDefault;
+        }
+      }
+      if (!next.path) {
+        next.path = defaultBalancePath(next.query_type, next.new_api_target);
+      }
+      if (next.query_type === "new_api" && next.new_api_target === "account_balance") {
+        next.enabled = true;
+        next.auth_mode = "separate_token";
+      }
+      return next;
+    });
+    closePreview();
   }
 
   async function addProvider() {
@@ -652,6 +840,7 @@ function App() {
         payload: {
           provider_id: activeId,
           config_toml: buildCustomProviderToml(newBaseUrl, newToken),
+          balance_query: defaultBalanceQuery(endpointFromBaseUrl(newBaseUrl)),
         },
       });
 
@@ -673,6 +862,7 @@ function App() {
           provider_id: appState?.active_provider?.id,
           provider_name: providerName,
           config_toml: providerText,
+          balance_query: balanceQuery,
         },
       });
       setAppState(state);
@@ -689,6 +879,7 @@ function App() {
           provider_id: appState.active_provider?.id,
           provider_name: providerName,
           config_toml: providerText,
+          balance_query: balanceQuery,
         },
       });
       setPreviewState(state);
@@ -776,6 +967,7 @@ function App() {
           provider_id: appState.active_provider?.id,
           provider_name: providerName,
           config_toml: providerText,
+          balance_query: balanceQuery,
         },
       });
       const state = await callCommand<AppState>("apply_config");
@@ -783,6 +975,25 @@ function App() {
       setPreviewState(null);
       setScreen("main");
     });
+  }
+
+  async function queryBalance() {
+    if (!appState?.active_provider) return;
+
+    setBalanceBusy(true);
+    setError("");
+    try {
+      const state = await callCommand<AppState>("query_provider_balance", {
+        payload: {
+          provider_id: appState.active_provider?.id,
+        },
+      });
+      setAppState(state);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBalanceBusy(false);
+    }
   }
 
   if (!appState) {
@@ -882,6 +1093,27 @@ function App() {
           <div className="top-actions">
             {screen === "main" && (
               <>
+                <div
+                  className={`balance-chip ${
+                    appState.active_provider?.balance_status?.error ? "error" : ""
+                  }`}
+                  title={appState.active_provider?.balance_status?.error ?? undefined}
+                >
+                  <strong>
+                    {balanceBusy ? "查询中" : balanceChipLabel(appState.active_provider)}
+                  </strong>
+                  <button
+                    type="button"
+                    onClick={
+                      appState.active_provider?.balance_query.enabled
+                        ? queryBalance
+                        : () => setScreen("edit")
+                    }
+                    disabled={balanceBusy || !appState.active_provider}
+                  >
+                    {balanceBusy ? "..." : balanceChipActionLabel(appState.active_provider)}
+                  </button>
+                </div>
                 <button className="secondary" onClick={() => setScreen("edit")}>
                   编辑配置
                 </button>
@@ -1046,23 +1278,6 @@ function App() {
                 )}
               </div>
             </section>
-
-            <section className="panel compact">
-              <div className="apply-strip">
-                <div>
-                  <span>目标文件</span>
-                  <strong>{appState.codex_config_path}</strong>
-                </div>
-                <div>
-                  <span>基础模板</span>
-                  <strong>{appState.base_template_name}</strong>
-                </div>
-                <div>
-                  <span>校验</span>
-                  <strong>本地 TOML 正常</strong>
-                </div>
-              </div>
-            </section>
           </>
         )}
 
@@ -1219,6 +1434,212 @@ function App() {
                       </button>
                     </div>
                   </label>
+                </div>
+
+                <div className="balance-config">
+                  <div className="balance-config-head">
+                    <div>
+                      <strong>余额查询</strong>
+                      <p>仅保存到本工具状态，不写入 Codex config.toml。</p>
+                    </div>
+                    <label className="switch-row">
+                      <input
+                        checked={balanceQuery.enabled}
+                        onChange={(event) =>
+                          updateBalanceQuery({
+                            enabled: event.currentTarget.checked,
+                            query_type: event.currentTarget.checked
+                              ? balanceQuery.query_type === "disabled"
+                                ? "new_api"
+                                : balanceQuery.query_type
+                              : "disabled",
+                          })
+                        }
+                        type="checkbox"
+                      />
+                      <span />
+                    </label>
+                  </div>
+
+                  <div className="segmented">
+                    {[
+                      ["disabled", "不查询"],
+                      ["new_api", "NewAPI"],
+                      ["sub2_api", "Sub2API"],
+                    ].map(([value, label]) => (
+                      <button
+                        className={balanceQuery.query_type === value ? "selected" : ""}
+                        key={value}
+                        onClick={() =>
+                          updateBalanceQuery({
+                            query_type: value as BalanceQueryType,
+                            enabled: value !== "disabled",
+                          })
+                        }
+                        type="button"
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {balanceQuery.enabled && balanceQuery.query_type !== "disabled" && (
+                    <>
+                      {balanceQuery.query_type === "new_api" && (
+                        <div className="field">
+                          <span>查询内容</span>
+                          <div className="radio-row">
+                            <button
+                              className={`radio-pill ${
+                                balanceQuery.new_api_target === "token_quota"
+                                  ? "selected"
+                                  : ""
+                              }`}
+                              onClick={() =>
+                                updateBalanceQuery({ new_api_target: "token_quota" })
+                              }
+                              type="button"
+                            >
+                              API Key 额度
+                            </button>
+                            <button
+                              className={`radio-pill ${
+                                balanceQuery.new_api_target === "account_balance"
+                                  ? "selected"
+                                  : ""
+                              }`}
+                              onClick={() =>
+                                updateBalanceQuery({
+                                  new_api_target: "account_balance",
+                                  auth_mode: "separate_token",
+                                })
+                              }
+                              type="button"
+                            >
+                              账户余额
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="balance-config-grid">
+                        <label className="field">
+                          <span>查询地址</span>
+                          <input
+                            value={balanceQuery.endpoint}
+                            onChange={(event) =>
+                              updateBalanceQuery({ endpoint: event.currentTarget.value })
+                            }
+                            placeholder={endpointFromBaseUrl(customBaseUrl)}
+                          />
+                        </label>
+                        <label className="field">
+                          <span>余额路径</span>
+                          <input
+                            value={balanceQuery.path}
+                            onChange={(event) =>
+                              updateBalanceQuery({ path: event.currentTarget.value })
+                            }
+                            placeholder={defaultBalancePath(
+                              balanceQuery.query_type,
+                              balanceQuery.new_api_target,
+                            )}
+                          />
+                        </label>
+                      </div>
+
+                      <div className="field">
+                        <span>认证方式</span>
+                        <div className="radio-row">
+                          {!(
+                            balanceQuery.query_type === "new_api" &&
+                            balanceQuery.new_api_target === "account_balance"
+                          ) && (
+                            <button
+                              className={`radio-pill ${
+                                balanceQuery.auth_mode === "provider_token" ? "selected" : ""
+                              }`}
+                              onClick={() =>
+                                updateBalanceQuery({ auth_mode: "provider_token" })
+                              }
+                              type="button"
+                            >
+                              使用供应商 Token
+                            </button>
+                          )}
+                          <button
+                            className={`radio-pill ${
+                              balanceQuery.auth_mode === "separate_token" ? "selected" : ""
+                            }`}
+                            onClick={() =>
+                              updateBalanceQuery({ auth_mode: "separate_token" })
+                            }
+                            type="button"
+                          >
+                            {balanceQuery.query_type === "new_api" &&
+                            balanceQuery.new_api_target === "account_balance"
+                              ? "用户访问令牌"
+                              : "单独填写查询 Token"}
+                          </button>
+                        </div>
+                      </div>
+
+                      {balanceQuery.auth_mode === "separate_token" && (
+                        <label className="field">
+                          <span>
+                            {balanceQuery.query_type === "new_api" &&
+                            balanceQuery.new_api_target === "account_balance"
+                              ? "用户访问令牌"
+                              : "查询 Token"}
+                          </span>
+                          <div className="secret-input">
+                            <input
+                              autoComplete="off"
+                              type={balanceTokenVisible ? "text" : "password"}
+                              value={balanceQuery.query_token}
+                              onChange={(event) =>
+                                updateBalanceQuery({
+                                  query_token: event.currentTarget.value,
+                                })
+                              }
+                              placeholder={
+                                balanceQuery.query_type === "new_api" &&
+                                balanceQuery.new_api_target === "account_balance"
+                                  ? "粘贴 New API 用户访问令牌"
+                                  : "粘贴查询 token"
+                              }
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setBalanceTokenVisible((visible) => !visible)}
+                            >
+                              {balanceTokenVisible ? "隐藏" : "显示"}
+                            </button>
+                          </div>
+                        </label>
+                      )}
+
+                      {balanceQuery.query_type === "new_api" &&
+                        balanceQuery.new_api_target === "account_balance" && (
+                          <label className="field compact-field">
+                            <span>New-Api-User</span>
+                            <input
+                              inputMode="numeric"
+                              value={balanceQuery.new_api_user_id}
+                              onChange={(event) =>
+                                updateBalanceQuery({
+                                  new_api_user_id: event.currentTarget.value.replace(
+                                    /\D/g,
+                                    "",
+                                  ),
+                                })
+                              }
+                              placeholder="数字用户 ID"
+                            />
+                          </label>
+                        )}
+                    </>
+                  )}
                 </div>
 
                 <div className="advanced-block">
