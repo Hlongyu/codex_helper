@@ -4,6 +4,12 @@
 
 它用于管理 `~/.codex/config.toml`，重点是通过增量合并配置，而不是直接覆盖整个文件。这样 Codex 后续新增的配置项仍然可以保留，应用模板时只写入需要管理的字段。
 
+## 使用方式
+
+使用前请先通过 Codex 官方方式完成登录，并确保本机已有可用的官方登录态。
+
+这个工具的目标不是替代 Codex 登录流程，而是在保留官方登录态的前提下，通过管理 `config.toml` 选择是否使用自定义 API 供应商访问。典型场景是继续使用官方 Codex App，同时把模型访问切换到配置好的 `model_providers.custom`。
+
 ## 功能
 
 - 管理基础配置模板。
@@ -77,9 +83,3 @@ pnpm tauri build
 
 - `CI`：在 push、pull request 或手动触发时运行前端构建和 Rust 检查。
 - `Build Desktop App`：在推送 `v*` 标签或手动触发时构建 Windows 桌面安装包，并上传构建产物。
-
-## 目标仓库
-
-```text
-git@github.com:Hlongyu/codex_helper.git
-```
