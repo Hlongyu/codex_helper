@@ -65,8 +65,40 @@ jobs:
             $publish = "true"
           }
 
+          $version = ""
+          if ($publish -eq "true") {
+            $version = $tag -replace "^v", ""
+            if ($version -notmatch "^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$") {
+              throw "Release tag '$tag' must look like v1.2.3 or v1.2.3-beta.1."
+            }
+          }
+
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "publish=$publish" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Apply release version
+        if: steps.release.outputs.publish == 'true'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.release.outputs.version }}"
+
+          $packageJsonPath = "package.json"
+          $packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
+          $packageJson.version = $version
+          $packageJson | ConvertTo-Json -Depth 20 | Set-Content $packageJsonPath -Encoding UTF8
+
+          $tauriConfigPath = "src-tauri/tauri.conf.json"
+          $tauriConfig = Get-Content $tauriConfigPath -Raw | ConvertFrom-Json
+          $tauriConfig.version = $version
+          $tauriConfig | ConvertTo-Json -Depth 20 | Set-Content $tauriConfigPath -Encoding UTF8
+
+          $cargoTomlPath = "src-tauri/Cargo.toml"
+          $cargoToml = Get-Content $cargoTomlPath -Raw
+          $cargoToml = $cargoToml -replace '(?m)^version = "[^"]+"', "version = `"$version`""
+          Set-Content $cargoTomlPath $cargoToml -Encoding UTF8
+
+          Write-Host "Building release ${{ steps.release.outputs.tag }} as app version $version."
 
       - name: Build and publish Tauri app
         if: steps.release.outputs.publish == 'true'
