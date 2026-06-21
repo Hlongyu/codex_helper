@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex 配置管理器",
+  "productName": "Codex Helper",
   "version": "0.1.0",
   "identifier": "com.local.codex-config-manager",
   "build": {
@@ -12,11 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "Codex 配置管理器",
-        "width": 1280,
-        "height": 800,
-        "minWidth": 1024,
-        "minHeight": 700
+        "title": "Codex Helper",
+        "width": 1600,
+        "height": 1000,
+        "minWidth": 1180,
+        "minHeight": 760
       }
     ],
     "security": {

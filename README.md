@@ -1,48 +1,44 @@
 # Codex Helper
 
-一个本地 Codex 配置管理器，使用 Rust + Tauri + React 实现。
+本地 Codex 网关管理器，使用 Rust + Tauri + React 实现。
 
-它用于管理 `~/.codex/config.toml`，重点是通过增量合并配置，而不是直接覆盖整个文件。这样 Codex 后续新增的配置项仍然可以保留，应用模板时只写入需要管理的字段。
+它的目标是把 Codex 的模型请求接到本机路由，再由本工具转发到你配置的上游供应商。开启接管时只修改 `~/.codex/config.toml` 中两个字段：
+
+```toml
+[model_providers.custom]
+base_url = "http://127.0.0.1:18080/v1"
+experimental_bearer_token = "codex-helper-local-token"
+```
+
+除此之外，`config.toml` 里的其他内容都保持原样，不再做基础模板、全量 merge、供应商配置覆盖等逻辑。
 
 ## 使用方式
 
 使用前请先通过 Codex 官方方式完成登录，并确保本机已有可用的官方登录态。
 
-这个工具的目标不是替代 Codex 登录流程，而是在保留官方登录态的前提下，通过管理 `config.toml` 选择是否使用自定义 API 供应商访问。典型场景是继续使用官方 Codex App，同时把模型访问切换到配置好的 `model_providers.custom`。
+然后在 Codex Helper 中：
 
-左侧切换供应商只会切换当前编辑和预览对象。真正写入 `~/.codex/config.toml` 并让 Codex 使用该供应商，需要点击右上角的“应用”。
+1. 添加上游供应商，填写 Base URL 与 API Key。
+2. 启用需要参与路由的供应商。
+3. 打开右上角“接管 Codex”开关。
+4. Codex 会连接本机 `/v1`，真实请求由 Codex Helper 转发到上游供应商。
 
 ## 功能
 
-- 管理基础配置模板。
-- 管理多个供应商配置。
-- 快速编辑 `model_providers.custom` 下的 `base_url` 与 `experimental_bearer_token`。
-- Token 默认隐藏，可按需显示。
-- 查看当前实际 `config.toml`。
-- 预览选择供应商后最终会写入磁盘的 TOML。
-- 应用配置前自动计算差异。
-- 应用时备份原始 `config.toml`。
-- 标记已经应用的供应商，和当前选中的供应商分开显示。
-- 查询当前选中供应商的额度，支持 Sub2API 和 New API。
-- 统计本机 Codex 使用情况，按时间、供应商、模型筛选 token 明细和金额。
+- 本地 `/v1/*` 路由转发。
+- 供应商管理：Base URL、API Key、启用状态。
+- 余额查询：支持 Sub2API 与 New API。
+- 使用统计：读取本机 Codex 会话目录中的 token 统计元数据。
+- 接管 Codex：只补丁修改 `base_url` 与 `experimental_bearer_token`。
+- UI 设计稿保存在 `docs/design/`。
 
-## 供应商配置
+## 本地路由
 
-供应商配置使用 TOML 编辑，常用字段会在界面中提供快捷输入：
+本地路由只代理 OpenAI-compatible 的 `/v1/*` 请求。请求进入本地路由后，工具会校验本地访问令牌，并把上游请求的 `Authorization` 替换成当前可用供应商的 API Key。
 
-```toml
-model_provider = "custom"
-
-[model_providers.custom]
-base_url = "https://example.com/v1"
-experimental_bearer_token = "sk-..."
-```
-
-基础模板只用于放通用配置。供应商配置会在基础模板之上增量合并，应用时只改动本工具管理到的字段。
+本地路由不会代理 Codex 官方登录、账号、授权或会话请求，也不会复用官方 token/cookie/session。
 
 ## 额度查询
-
-额度查询只针对当前选中的供应商，密钥默认使用该供应商配置中的 `experimental_bearer_token`，也可以单独填写查询令牌。
 
 Sub2API 使用：
 
@@ -51,44 +47,26 @@ GET /v1/usage
 Authorization: Bearer sk-...
 ```
 
-New API 支持两种模式：
+New API 支持：
 
 - 普通 `sk-` 密钥查询令牌额度：`GET /api/usage/token/`
 - 用户访问令牌查询账户余额：`GET /api/user/self`，需要填写用户 ID
 
 为了避免泄露密钥，不支持把 Key 放进 URL 查询参数。
 
-## 使用统计
-
-使用统计只读取本机 Codex 会话目录中的 token 统计元数据，不读取 prompt 或 response 内容。
-
-统计入口是左下角“使用统计”。首次进入会扫描 `~/.codex/sessions`，之后切换筛选条件会复用内存缓存；点击“刷新统计”才会重新扫描磁盘。
-
-明细会区分：
-
-- 输入（未缓存）
-- 输入（已缓存）
-- 输出
-- 推理输出
-- 金额
-
-金额按内置 GPT 官方 API 价格规则计算，鼠标悬停可以查看计算详情；无法匹配价格的模型按 0 处理。
-
 ## 配置位置
 
-应用会读取并写入：
+Codex 配置：
 
 ```text
 ~/.codex/config.toml
 ```
 
-应用自身的状态文件保存在：
+Codex Helper 状态：
 
 ```text
 ~/.codex/config-manager/state.json
 ```
-
-其中 `config.toml` 里的管理标记只是注释标记。即使 Codex 重写配置时移除了该注释，已应用供应商状态仍以 `state.json` 为准。
 
 ## 开发
 
@@ -110,40 +88,16 @@ pnpm tauri dev
 pnpm dev
 ```
 
-前端构建：
+检查：
 
 ```bash
 pnpm build
-```
-
-Rust 后端检查：
-
-```bash
 cd src-tauri
 cargo check
 ```
 
-## 打包
+打包：
 
 ```bash
 pnpm tauri build
 ```
-
-当前 Tauri 配置默认生成 Windows NSIS 安装包。
-
-macOS 可以在 macOS 环境中构建：
-
-```bash
-pnpm tauri build -- --target universal-apple-darwin --bundles dmg
-```
-
-目前 GitHub Actions 生成的是未签名、未公证的 macOS DMG。首次打开时可能需要在系统安全设置中手动允许；如果后续配置 Apple Developer 证书，可以再接入签名和 notarization。
-
-## GitHub Actions
-
-项目包含两个 workflow：
-
-- `CI`：在 push、pull request 或手动触发时运行前端构建和 Rust 检查。
-- `Build Desktop App`：在推送 `v*` 标签时构建 Windows NSIS 和 macOS universal DMG，自动创建或更新同名 GitHub Release，并把安装包上传到 Release 资产。
-
-如果某个 tag 已经存在但没有产出 Release 安装包，可以手动运行 `Build Desktop App`，在 `release_tag` 中填写已有 tag，例如 `v0.1.0`，workflow 会按该 tag 构建并补发 Release 资产。

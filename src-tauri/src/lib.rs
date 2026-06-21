@@ -1,17 +1,32 @@
+use axum::{
+    body::Body,
+    extract::{Path, State as AxumState},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    response::Response,
+    routing::any,
+    Router,
+};
 use chrono::{DateTime, Datelike, Local, Utc};
+use futures_util::TryStreamExt;
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, HOST};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fs;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::Manager;
+use tokio::sync::oneshot;
 use toml_edit::{Array, DocumentMut, Item, Value as TomlValue};
 
 const MARKER: &str = "# managed-by: codex-config-manager";
+const DEFAULT_ROUTER_HOST: &str = "127.0.0.1";
+const DEFAULT_ROUTER_PORT: u16 = 18080;
+const DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderConfig {
@@ -109,6 +124,36 @@ struct BalanceStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct RouterConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_router_host")]
+    host: String,
+    #[serde(default = "default_router_port")]
+    port: u16,
+    #[serde(default = "default_router_token")]
+    local_token: String,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_router_host(),
+            port: default_router_port(),
+            local_token: default_router_token(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RouterStatus {
+    running: bool,
+    address: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManagerState {
     active_provider_id: String,
     #[serde(default)]
@@ -121,6 +166,8 @@ struct ManagerState {
     applied_history: Vec<AppliedProviderSnapshot>,
     #[serde(default)]
     pricing: Vec<PricingRule>,
+    #[serde(default)]
+    router: RouterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +337,13 @@ struct ProviderSummary {
     name: String,
     enabled: bool,
     pending_changes: usize,
+    base_url: String,
+    provider_type: String,
+    route_order: usize,
+    balance_label: String,
+    balance_error: Option<String>,
+    latency_label: String,
+    last_checked_label: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -327,6 +381,8 @@ struct AppState {
     summary: Vec<ConfigRow>,
     diffs: Vec<DiffEntry>,
     marker_present: bool,
+    router: RouterConfig,
+    router_status: RouterStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,12 +391,23 @@ struct SaveProviderPayload {
     provider_name: Option<String>,
     config_toml: String,
     balance_query: Option<BalanceQueryConfig>,
+    enabled: Option<bool>,
+    base_url: Option<String>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SaveBasePayload {
     base_template_name: String,
     base_toml: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveRouterPayload {
+    enabled: bool,
+    host: String,
+    port: u16,
+    local_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -378,6 +445,29 @@ struct UsageCache {
 #[derive(Default)]
 struct UsageCacheState {
     cache: Mutex<Option<UsageCache>>,
+}
+
+#[derive(Default)]
+struct RouterRuntime {
+    handle: Mutex<Option<RouterHandle>>,
+}
+
+struct RouterHandle {
+    address: String,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for RouterHandle {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProxyState {
+    client: reqwest::Client,
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +515,32 @@ struct UsageFilterOption {
 
 fn default_balance_path() -> String {
     "/api/usage/token/".to_string()
+}
+
+fn default_router_host() -> String {
+    DEFAULT_ROUTER_HOST.to_string()
+}
+
+fn default_router_port() -> u16 {
+    DEFAULT_ROUTER_PORT
+}
+
+fn default_router_token() -> String {
+    DEFAULT_ROUTER_TOKEN.to_string()
+}
+
+fn router_address(config: &RouterConfig) -> String {
+    let host = config.host.trim();
+    let host = if host.is_empty() {
+        DEFAULT_ROUTER_HOST
+    } else {
+        host
+    };
+    format!("{host}:{}", config.port)
+}
+
+fn router_base_url(config: &RouterConfig) -> String {
+    format!("http://{}/v1", router_address(config))
 }
 
 fn default_balance_path_for(
@@ -493,6 +609,7 @@ fn default_state() -> ManagerState {
         last_applied: None,
         applied_history: vec![],
         pricing: default_pricing_rules(),
+        router: RouterConfig::default(),
     }
 }
 
@@ -627,9 +744,17 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
         {
             state.active_provider_id = applied_provider_id.clone();
         }
-        for provider in &mut state.providers {
-            provider.enabled = provider.id == applied_provider_id;
-        }
+    } else if state.active_provider_id.trim().is_empty()
+        || !state
+            .providers
+            .iter()
+            .any(|provider| provider.id == state.active_provider_id)
+    {
+        state.active_provider_id = state
+            .providers
+            .first()
+            .map(|provider| provider.id.clone())
+            .unwrap_or_default();
     }
     state
 }
@@ -670,24 +795,6 @@ fn active_provider(state: &ManagerState) -> Option<ProviderConfig> {
         .or_else(|| state.providers.first().cloned())
 }
 
-fn resolved_applied_provider_id(state: &ManagerState) -> Option<String> {
-    if state.applied_provider_id.as_ref().is_some_and(|id| {
-        state
-            .providers
-            .iter()
-            .any(|provider| provider.id.as_str() == id.as_str())
-    }) {
-        return state.applied_provider_id.clone();
-    }
-
-    let last_applied = state.last_applied.as_ref()?;
-    state
-        .providers
-        .iter()
-        .find(|provider| desired_config(state, Some(provider)) == *last_applied)
-        .map(|provider| provider.id.clone())
-}
-
 fn merge_values(base: &mut Value, overlay: &Value) {
     match (base, overlay) {
         (Value::Object(base_map), Value::Object(overlay_map)) => {
@@ -706,9 +813,51 @@ fn merge_values(base: &mut Value, overlay: &Value) {
     }
 }
 
+fn set_json_path(value: &mut Value, path: &[&str], next: Value) -> Result<(), String> {
+    if path.is_empty() {
+        *value = next;
+        return Ok(());
+    }
+    if !value.is_object() {
+        *value = Value::Object(Map::new());
+    }
+
+    let mut current = value;
+    for key in &path[..path.len() - 1] {
+        let map = current
+            .as_object_mut()
+            .ok_or_else(|| format!("路径 {key} 不是对象"))?;
+        current = map
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !current.is_object() {
+            *current = Value::Object(Map::new());
+        }
+    }
+
+    let map = current
+        .as_object_mut()
+        .ok_or_else(|| "无法写入 JSON 路径".to_string())?;
+    map.insert(path[path.len() - 1].to_string(), next);
+    Ok(())
+}
+
 fn desired_config(state: &ManagerState, provider: Option<&ProviderConfig>) -> Value {
     let mut desired = state.base.clone();
-    if let Some(provider) = provider {
+    if state.router.enabled {
+        merge_values(
+            &mut desired,
+            &json!({
+                "model_provider": "custom",
+                "model_providers": {
+                    "custom": {
+                        "base_url": router_base_url(&state.router),
+                        "experimental_bearer_token": state.router.local_token,
+                    }
+                }
+            }),
+        );
+    } else if let Some(provider) = provider {
         merge_values(&mut desired, &provider.config);
     }
     desired
@@ -730,6 +879,14 @@ fn custom_provider_token(provider: &ProviderConfig) -> Option<String> {
         .map(str::to_string)
 }
 
+fn provider_type(provider: &ProviderConfig) -> String {
+    match provider.balance_query.query_type {
+        BalanceQueryType::NewApi => "New API".to_string(),
+        BalanceQueryType::Sub2Api => "Sub2API".to_string(),
+        BalanceQueryType::Disabled => "通用兼容".to_string(),
+    }
+}
+
 fn model_provider_name(provider: &ProviderConfig) -> String {
     provider
         .config
@@ -739,10 +896,23 @@ fn model_provider_name(provider: &ProviderConfig) -> String {
         .to_string()
 }
 
-fn hash_text(text: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+fn elapsed_label(checked_at: Option<u64>) -> String {
+    let Some(checked_at) = checked_at else {
+        return "未检查".to_string();
+    };
+    let Ok(now) = now_epoch_seconds() else {
+        return "刚刚".to_string();
+    };
+    let elapsed = now.saturating_sub(checked_at);
+    if elapsed < 60 {
+        "刚刚".to_string()
+    } else if elapsed < 3600 {
+        format!("{} 分钟前", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{} 小时前", elapsed / 3600)
+    } else {
+        format!("{} 天前", elapsed / 86_400)
+    }
 }
 
 fn current_epoch_ms() -> Result<i64, String> {
@@ -812,6 +982,17 @@ fn flatten_into(prefix: Option<String>, value: &Value, out: &mut BTreeMap<String
 }
 
 fn source_for_path(state: &ManagerState, provider: Option<&ProviderConfig>, path: &str) -> String {
+    if state.router.enabled
+        && matches!(
+            path,
+            "model_provider"
+                | "model_providers.custom.base_url"
+                | "model_providers.custom.experimental_bearer_token"
+        )
+    {
+        return "本地路由".to_string();
+    }
+
     if provider
         .map(|provider| flatten(&provider.config).contains_key(path))
         .unwrap_or(false)
@@ -968,14 +1149,21 @@ fn set_toml_path(doc: &mut DocumentMut, path: &str, value: &Value) -> Result<(),
     Ok(())
 }
 
-fn render_final_disk_toml(
+fn render_router_patch_toml(
     mut doc: DocumentMut,
     marker_present: bool,
-    desired: &Value,
+    router: &RouterConfig,
 ) -> Result<String, String> {
-    for (path, value) in flatten(desired) {
-        set_toml_path(&mut doc, &path, &value)?;
-    }
+    set_toml_path(
+        &mut doc,
+        "model_providers.custom.base_url",
+        &Value::String(router_base_url(router)),
+    )?;
+    set_toml_path(
+        &mut doc,
+        "model_providers.custom.experimental_bearer_token",
+        &Value::String(router.local_token.clone()),
+    )?;
 
     let mut raw = doc.to_string();
     if !marker_present && !raw.contains(MARKER) {
@@ -983,6 +1171,17 @@ fn render_final_disk_toml(
     }
 
     Ok(raw)
+}
+
+fn router_patch_desired(router: &RouterConfig) -> Value {
+    json!({
+        "model_providers": {
+            "custom": {
+                "base_url": router_base_url(router),
+                "experimental_bearer_token": router.local_token,
+            }
+        }
+    })
 }
 
 fn compute_diffs(
@@ -1039,6 +1238,212 @@ fn join_url(endpoint: &str, path: &str) -> String {
     } else {
         format!("{endpoint}/{}", path.trim_start_matches('/'))
     }
+}
+
+fn proxy_error(status: StatusCode, message: impl Into<String>) -> Response {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json; charset=utf-8")
+        .body(Body::from(
+            json!({ "error": { "message": message.into() } }).to_string(),
+        ))
+        .unwrap_or_else(|_| Response::new(Body::from("proxy error")))
+}
+
+fn upstream_config() -> Result<(RouterConfig, ProviderConfig, String, String), String> {
+    let state = load_state_file()?;
+    if !state.router.enabled {
+        return Err("本地路由未启用".to_string());
+    }
+    let provider = state
+        .providers
+        .iter()
+        .find(|provider| provider.enabled)
+        .or_else(|| state.providers.first())
+        .cloned()
+        .ok_or_else(|| "没有可用的上游供应商".to_string())?;
+    let base_url = custom_provider_base_url(&provider)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "上游供应商缺少 base_url".to_string())?;
+    let token = custom_provider_token(&provider)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "上游供应商缺少 experimental_bearer_token".to_string())?;
+    Ok((state.router, provider, base_url, token))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get("authorization")?.to_str().ok()?.trim();
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+}
+
+async fn proxy_request(
+    AxumState(proxy_state): AxumState<Arc<ProxyState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    body: Body,
+) -> Response {
+    let (router, provider, base_url, token) = match upstream_config() {
+        Ok(config) => config,
+        Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
+    };
+    if bearer_token(&headers) != Some(router.local_token.trim()) {
+        return proxy_error(StatusCode::UNAUTHORIZED, "本地路由 Token 无效");
+    }
+
+    let query = uri
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    let upstream_url = join_url(&base_url, &path) + &query;
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
+    };
+
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("请求方法无效: {err}")),
+    };
+    let mut request = proxy_state
+        .client
+        .request(reqwest_method, upstream_url)
+        .body(body_bytes);
+
+    for (name, value) in headers.iter() {
+        if name == AUTHORIZATION || name == HOST || name == CONTENT_LENGTH {
+            continue;
+        }
+        request = request.header(name.as_str(), value.as_bytes());
+    }
+    request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            return proxy_error(
+                StatusCode::BAD_GATEWAY,
+                format!("转发到 {} 失败: {err}", provider.name),
+            )
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    if let Some(headers_mut) = builder.headers_mut() {
+        for (name, value) in upstream.headers().iter() {
+            if name == CONTENT_LENGTH {
+                continue;
+            }
+            if let (Ok(header_name), Ok(header_value)) = (
+                HeaderName::from_bytes(name.as_str().as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                headers_mut.insert(header_name, header_value);
+            }
+        }
+    }
+
+    let stream = upstream.bytes_stream().map_err(std::io::Error::other);
+    builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"))
+}
+
+async fn proxy_not_found() -> Response {
+    proxy_error(StatusCode::NOT_FOUND, "本地路由只代理 /v1/* 请求")
+}
+
+fn router_status(runtime: &RouterRuntime, config: &RouterConfig) -> RouterStatus {
+    if let Ok(handle) = runtime.handle.lock() {
+        if let Some(handle) = handle.as_ref() {
+            return RouterStatus {
+                running: true,
+                address: handle.address.clone(),
+                error: None,
+            };
+        }
+    }
+
+    RouterStatus {
+        running: false,
+        address: router_address(config),
+        error: if config.enabled {
+            Some("本地路由未运行，点击应用后会尝试启动。".to_string())
+        } else {
+            None
+        },
+    }
+}
+
+fn stop_router(runtime: &RouterRuntime) {
+    if let Ok(mut handle) = runtime.handle.lock() {
+        handle.take();
+    }
+}
+
+fn ensure_router(runtime: &RouterRuntime, config: &RouterConfig) -> Result<(), String> {
+    if !config.enabled {
+        stop_router(runtime);
+        return Ok(());
+    }
+
+    let address = router_address(config);
+    if let Ok(handle) = runtime.handle.lock() {
+        if handle
+            .as_ref()
+            .is_some_and(|handle| handle.address == address)
+        {
+            return Ok(());
+        }
+    }
+
+    stop_router(runtime);
+    let socket_addr: SocketAddr = address
+        .parse()
+        .map_err(|err| format!("本地路由监听地址无效 {address}: {err}"))?;
+    let std_listener = std::net::TcpListener::bind(socket_addr)
+        .map_err(|err| format!("无法启动本地路由 {address}: {err}"))?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|err| format!("无法配置本地路由监听: {err}"))?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let proxy_state = Arc::new(ProxyState {
+        client: reqwest::Client::new(),
+    });
+    let app = Router::new()
+        .route("/v1/{*path}", any(proxy_request))
+        .fallback(proxy_not_found)
+        .with_state(proxy_state);
+
+    tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!("无法创建本地路由监听: {err}");
+                return;
+            }
+        };
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let mut handle = runtime
+        .handle
+        .lock()
+        .map_err(|_| "无法锁定本地路由状态".to_string())?;
+    *handle = Some(RouterHandle {
+        address,
+        shutdown: Some(shutdown_tx),
+    });
+    Ok(())
 }
 
 fn find_balance_value(value: &Value) -> Option<f64> {
@@ -2097,13 +2502,23 @@ fn build_usage_stats_from_cache(
     })
 }
 
-fn build_app_state(state: ManagerState) -> Result<AppState, String> {
+fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppState, String> {
     let provider = active_provider(&state);
-    let applied_provider_id = resolved_applied_provider_id(&state);
-    let desired = desired_config(&state, provider.as_ref());
+    let desired = if state.router.enabled {
+        router_patch_desired(&state.router)
+    } else {
+        provider
+            .as_ref()
+            .map(|provider| provider.config.clone())
+            .unwrap_or_else(|| json!({}))
+    };
     let (doc, marker_present, current_config_raw, current_config_exists) = read_current_toml()?;
     let current_json = toml_doc_to_json(&doc);
-    let final_preview_toml = render_final_disk_toml(doc, marker_present, &desired)?;
+    let final_preview_toml = if state.router.enabled {
+        render_router_patch_toml(doc, marker_present, &state.router)?
+    } else {
+        current_config_raw.clone()
+    };
     let diffs = compute_diffs(&state, provider.as_ref(), &current_json, &desired);
     let desired_flat = flatten(&desired);
 
@@ -2121,17 +2536,40 @@ fn build_app_state(state: ManagerState) -> Result<AppState, String> {
     let providers = state
         .providers
         .iter()
-        .map(|provider| {
-            let provider_desired = desired_config(&state, Some(provider));
+        .enumerate()
+        .map(|(index, provider)| {
+            let provider_desired = if state.router.enabled {
+                desired.clone()
+            } else {
+                desired_config(&state, Some(provider))
+            };
             let pending_changes =
                 compute_diffs(&state, Some(provider), &current_json, &provider_desired).len();
+            let balance_status = provider.balance_status.as_ref();
             ProviderSummary {
                 id: provider.id.clone(),
                 name: provider.name.clone(),
-                enabled: applied_provider_id
-                    .as_deref()
-                    .is_some_and(|id| id == provider.id.as_str()),
+                enabled: provider.enabled,
                 pending_changes,
+                base_url: custom_provider_base_url(provider).unwrap_or_default(),
+                provider_type: provider_type(provider),
+                route_order: index + 1,
+                balance_label: balance_status
+                    .map(|status| status.label.clone())
+                    .unwrap_or_else(|| "未配置".to_string()),
+                balance_error: balance_status.and_then(|status| status.error.clone()),
+                latency_label: balance_status
+                    .map(|status| {
+                        if status.error.is_some() {
+                            "超时".to_string()
+                        } else {
+                            "正常".to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "未检查".to_string()),
+                last_checked_label: balance_status
+                    .map(|status| elapsed_label(status.checked_at))
+                    .unwrap_or_else(|| "未检查".to_string()),
             }
         })
         .collect();
@@ -2157,16 +2595,21 @@ fn build_app_state(state: ManagerState) -> Result<AppState, String> {
         summary,
         diffs,
         marker_present,
+        router: state.router.clone(),
+        router_status: router_status(runtime, &state.router),
     })
 }
 
 #[tauri::command]
-fn load_app_state() -> Result<AppState, String> {
-    build_app_state(load_state_file()?)
+fn load_app_state(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState, String> {
+    build_app_state(load_state_file()?, &router_runtime)
 }
 
 #[tauri::command]
-fn select_provider(provider_id: String) -> Result<AppState, String> {
+fn select_provider(
+    provider_id: String,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
     let mut state = load_state_file()?;
     if state
         .providers
@@ -2178,11 +2621,14 @@ fn select_provider(provider_id: String) -> Result<AppState, String> {
 
     state.active_provider_id = provider_id;
     save_state(&state)?;
-    build_app_state(state)
+    build_app_state(state, &router_runtime)
 }
 
 #[tauri::command]
-fn save_provider(payload: SaveProviderPayload) -> Result<AppState, String> {
+fn save_provider(
+    payload: SaveProviderPayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
     let mut state = load_state_file()?;
     let provider = state
         .providers
@@ -2198,17 +2644,56 @@ fn save_provider(payload: SaveProviderPayload) -> Result<AppState, String> {
         provider.name = trimmed.to_string();
     }
 
-    provider.config = toml_text_to_json(&payload.config_toml)?;
+    if let Some(enabled) = payload.enabled {
+        provider.enabled = enabled;
+    }
+    if payload.base_url.is_some() || payload.api_key.is_some() {
+        let mut config = provider.config.clone();
+        if let Some(base_url) = payload.base_url.as_deref() {
+            let base_url = base_url.trim();
+            if base_url.is_empty() {
+                return Err("Base URL 不能为空".to_string());
+            }
+            set_json_path(
+                &mut config,
+                &["model_provider"],
+                Value::String("custom".to_string()),
+            )?;
+            set_json_path(
+                &mut config,
+                &["model_providers", "custom", "base_url"],
+                Value::String(base_url.to_string()),
+            )?;
+        }
+        if let Some(api_key) = payload.api_key.as_deref() {
+            set_json_path(
+                &mut config,
+                &["model_provider"],
+                Value::String("custom".to_string()),
+            )?;
+            set_json_path(
+                &mut config,
+                &["model_providers", "custom", "experimental_bearer_token"],
+                Value::String(api_key.trim().to_string()),
+            )?;
+        }
+        provider.config = config;
+    } else if !payload.config_toml.trim().is_empty() {
+        provider.config = toml_text_to_json(&payload.config_toml)?;
+    }
     if let Some(balance_query) = payload.balance_query {
         provider.balance_query = normalize_balance_config(balance_query, provider);
         provider.balance_status = None;
     }
     save_state(&state)?;
-    build_app_state(state)
+    build_app_state(state, &router_runtime)
 }
 
 #[tauri::command]
-fn preview_provider(payload: SaveProviderPayload) -> Result<AppState, String> {
+fn preview_provider(
+    payload: SaveProviderPayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
     let mut state = load_state_file()?;
     let active_provider_id = payload.provider_id.clone();
     let provider = state
@@ -2232,11 +2717,14 @@ fn preview_provider(payload: SaveProviderPayload) -> Result<AppState, String> {
     }
     state.active_provider_id = active_provider_id;
 
-    build_app_state(state)
+    build_app_state(state, &router_runtime)
 }
 
 #[tauri::command]
-fn add_provider(name: String) -> Result<AppState, String> {
+fn add_provider(
+    name: String,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
     let mut state = load_state_file()?;
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -2267,7 +2755,7 @@ fn add_provider(name: String) -> Result<AppState, String> {
     state.providers.push(ProviderConfig {
         id: id.clone(),
         name: trimmed.to_string(),
-        enabled: false,
+        enabled: true,
         balance_query: BalanceQueryConfig::default(),
         balance_status: None,
         config: toml_text_to_json(
@@ -2276,29 +2764,84 @@ fn add_provider(name: String) -> Result<AppState, String> {
     });
 
     save_state(&state)?;
-    build_app_state(state)
+    build_app_state(state, &router_runtime)
 }
 
 #[tauri::command]
-fn save_base_template(payload: SaveBasePayload) -> Result<AppState, String> {
+fn save_base_template(
+    payload: SaveBasePayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
     let mut state = load_state_file()?;
     state.base_template_name = payload.base_template_name;
     state.base = toml_text_to_json(&payload.base_toml)?;
     save_state(&state)?;
-    build_app_state(state)
+    build_app_state(state, &router_runtime)
 }
 
 #[tauri::command]
-fn apply_config() -> Result<AppState, String> {
+fn save_router_config(
+    payload: SaveRouterPayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
     let mut state = load_state_file()?;
-    let provider = active_provider(&state);
-    let applied_provider_id = provider.as_ref().map(|provider| provider.id.clone());
-    let desired = desired_config(&state, provider.as_ref());
+    let host = payload.host.trim();
+    if payload.enabled && host.is_empty() {
+        return Err("本地路由监听地址不能为空".to_string());
+    }
+    if payload.enabled && payload.port == 0 {
+        return Err("本地路由端口无效".to_string());
+    }
+    let local_token = payload.local_token.trim();
+    if payload.enabled && local_token.is_empty() {
+        return Err("本地路由 Token 不能为空".to_string());
+    }
+
+    state.router = RouterConfig {
+        enabled: payload.enabled,
+        host: if host.is_empty() {
+            default_router_host()
+        } else {
+            host.to_string()
+        },
+        port: payload.port,
+        local_token: if local_token.is_empty() {
+            default_router_token()
+        } else {
+            local_token.to_string()
+        },
+    };
+    save_state(&state)?;
+    ensure_router(&router_runtime, &state.router)?;
+    build_app_state(state, &router_runtime)
+}
+
+#[tauri::command]
+fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
     let config_path = codex_config_path()?;
 
     fs::create_dir_all(codex_home()?).map_err(|err| format!("无法创建 Codex 目录: {err}"))?;
 
-    if config_path.exists() {
+    if state.router.enabled {
+        if config_path.exists() {
+            let backup_name = format!(
+                "config.toml.{}.bak",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|err| format!("系统时间异常: {err}"))?
+                    .as_secs()
+            );
+            fs::copy(&config_path, manager_dir()?.join(backup_name))
+                .map_err(|err| format!("无法备份现有配置: {err}"))?;
+        }
+
+        let (doc, marker_present, _, _) = read_current_toml()?;
+        let raw = render_router_patch_toml(doc, marker_present, &state.router)?;
+
+        fs::write(&config_path, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
+        state.last_applied = Some(router_patch_desired(&state.router));
+    } else if config_path.exists() {
         let backup_name = format!(
             "config.toml.{}.bak",
             SystemTime::now()
@@ -2308,42 +2851,12 @@ fn apply_config() -> Result<AppState, String> {
         );
         fs::copy(&config_path, manager_dir()?.join(backup_name))
             .map_err(|err| format!("无法备份现有配置: {err}"))?;
+        state.last_applied = None;
     }
-
-    let (doc, marker_present, _, _) = read_current_toml()?;
-    let raw = render_final_disk_toml(doc, marker_present, &desired)?;
-
-    fs::write(&config_path, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
-    state.last_applied = Some(desired);
-    if let Some(applied_provider_id) = applied_provider_id {
-        state.applied_provider_id = Some(applied_provider_id.clone());
-        state.active_provider_id = applied_provider_id.clone();
-        if let Some(provider) = provider.as_ref() {
-            state.applied_history.push(AppliedProviderSnapshot {
-                provider_id: provider.id.clone(),
-                provider_name: provider.name.clone(),
-                model_provider: model_provider_name(provider),
-                base_url_hash: custom_provider_base_url(provider)
-                    .map(|base_url| hash_text(&base_url)),
-                applied_at_ms: current_epoch_ms()?,
-            });
-            if state.applied_history.len() > 300 {
-                state
-                    .applied_history
-                    .drain(0..state.applied_history.len() - 300);
-            }
-        }
-        for provider in &mut state.providers {
-            provider.enabled = provider.id == applied_provider_id;
-        }
-    } else {
-        state.applied_provider_id = None;
-        for provider in &mut state.providers {
-            provider.enabled = false;
-        }
-    }
+    state.applied_provider_id = None;
     save_state(&state)?;
-    build_app_state(state)
+    ensure_router(&router_runtime, &state.router)?;
+    build_app_state(state, &router_runtime)
 }
 
 #[tauri::command]
@@ -2376,7 +2889,10 @@ fn load_usage_stats(
 }
 
 #[tauri::command]
-async fn query_provider_balance(payload: QueryBalancePayload) -> Result<AppState, String> {
+async fn query_provider_balance(
+    payload: QueryBalancePayload,
+    router_runtime: tauri::State<'_, RouterRuntime>,
+) -> Result<AppState, String> {
     let mut state = load_state_file()?;
     let provider = state
         .providers
@@ -2395,13 +2911,22 @@ async fn query_provider_balance(payload: QueryBalancePayload) -> Result<AppState
     }
 
     save_state(&state)?;
-    build_app_state(state)
+    build_app_state(state, &router_runtime)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(UsageCacheState::default())
+        .manage(RouterRuntime::default())
+        .setup(|app| {
+            let state = load_state_file()?;
+            let router_runtime = app.state::<RouterRuntime>();
+            if let Err(err) = ensure_router(&router_runtime, &state.router) {
+                eprintln!("本地路由启动失败: {err}");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             load_app_state,
             select_provider,
@@ -2409,6 +2934,7 @@ pub fn run() {
             preview_provider,
             add_provider,
             save_base_template,
+            save_router_config,
             apply_config,
             load_usage_stats,
             query_provider_balance
