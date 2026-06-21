@@ -2,9 +2,17 @@ name: Build Desktop App
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional tag name to publish a GitHub Release, for example v0.1.0"
+        required: false
+        type: string
   push:
     tags:
       - "v*"
+
+permissions:
+  contents: write
 
 jobs:
   build-windows:
@@ -14,6 +22,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -34,6 +44,59 @@ jobs:
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve release tag
+        id: release
+        shell: pwsh
+        run: |
+          $manualTag = "${{ github.event.inputs.release_tag }}"
+          $tag = ""
+          if (-not [string]::IsNullOrWhiteSpace($manualTag)) {
+            $tag = $manualTag
+          } elseif ("${{ startsWith(github.ref, 'refs/tags/') }}" -eq "true") {
+            $tag = "${{ github.ref_name }}"
+          }
+
+          $publish = "false"
+          if (-not [string]::IsNullOrWhiteSpace($tag)) {
+            $publish = "true"
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "publish=$publish" >> $env:GITHUB_OUTPUT
+
+      - name: Collect release assets
+        if: steps.release.outputs.publish == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+
+          $bundleDirs = @(
+            "src-tauri/target/release/bundle/nsis",
+            "src-tauri/target/release/bundle/msi"
+          )
+
+          foreach ($dir in $bundleDirs) {
+            if (Test-Path $dir) {
+              Get-ChildItem -Path $dir -File | Copy-Item -Destination release-assets
+            }
+          }
+
+          if (-not (Get-ChildItem -Path release-assets -File -ErrorAction SilentlyContinue)) {
+            throw "No installer files found in Tauri bundle output."
+          }
+
+      - name: Publish GitHub Release
+        if: steps.release.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ${{ steps.release.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

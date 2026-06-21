@@ -136,4 +136,6 @@ pnpm tauri build
 项目包含两个 workflow：
 
 - `CI`：在 push、pull request 或手动触发时运行前端构建和 Rust 检查。
-- `Build Desktop App`：在推送 `v*` 标签或手动触发时构建 Windows 桌面安装包，并上传构建产物。
+- `Build Desktop App`：在推送 `v*` 标签时构建 Windows 桌面安装包，自动创建或更新同名 GitHub Release，并把安装包上传到 Release 资产。
+
+如果某个 tag 已经存在但没有产出 Release 安装包，可以手动运行 `Build Desktop App`，在 `release_tag` 中填写已有 tag，例如 `v0.1.0`，workflow 会按该 tag 构建并补发 Release 资产。
