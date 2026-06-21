@@ -131,11 +131,19 @@ pnpm tauri build
 
 当前 Tauri 配置默认生成 Windows NSIS 安装包。
 
+macOS 可以在 macOS 环境中构建：
+
+```bash
+pnpm tauri build -- --target universal-apple-darwin --bundles dmg
+```
+
+目前 GitHub Actions 生成的是未签名、未公证的 macOS DMG。首次打开时可能需要在系统安全设置中手动允许；如果后续配置 Apple Developer 证书，可以再接入签名和 notarization。
+
 ## GitHub Actions
 
 项目包含两个 workflow：
 
 - `CI`：在 push、pull request 或手动触发时运行前端构建和 Rust 检查。
-- `Build Desktop App`：在推送 `v*` 标签时构建 Windows 桌面安装包，自动创建或更新同名 GitHub Release，并把安装包上传到 Release 资产。
+- `Build Desktop App`：在推送 `v*` 标签时构建 Windows NSIS 和 macOS universal DMG，自动创建或更新同名 GitHub Release，并把安装包上传到 Release 资产。
 
 如果某个 tag 已经存在但没有产出 Release 安装包，可以手动运行 `Build Desktop App`，在 `release_tag` 中填写已有 tag，例如 `v0.1.0`，workflow 会按该 tag 构建并补发 Release 资产。
