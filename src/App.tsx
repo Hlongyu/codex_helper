@@ -163,6 +163,11 @@ type RouteUsageStats = {
   summary: UsageSummary;
   today: UsageSummary;
   failed_count: number;
+  success_count: number;
+  running_count: number;
+  average_first_byte_ms?: number | null;
+  average_total_ms?: number | null;
+  bucket_granularity: "hour" | "day" | "month" | string;
   buckets: RouteUsageBucket[];
   providers: RouteUsageBreakdown[];
   models: RouteUsageBreakdown[];
@@ -216,7 +221,7 @@ function defaultRouterConfig(): RouterConfig {
     enabled: false,
     host: "127.0.0.1",
     port: 18080,
-    local_token: "codex-helper-local-token",
+    local_token: "",
   };
 }
 
@@ -293,6 +298,12 @@ function trendMetricLabel(metric: TrendMetric) {
   if (metric === "cost") return "费用";
   if (metric === "tokens") return "Token";
   return "请求";
+}
+
+function bucketGranularityLabel(value?: string) {
+  if (value === "month") return "按月聚合";
+  if (value === "day") return "按日聚合";
+  return "按小时聚合";
 }
 
 function trendBucketValue(bucket: Pick<RouteUsageBucket, "estimated_cost" | "total_tokens" | "request_count">, metric: TrendMetric) {
@@ -411,6 +422,10 @@ function apiKeyPreview(value: string) {
   return `${value.slice(0, 3)}••••••••••••••••`;
 }
 
+function savedApiKeyLabel(value: string) {
+  return value ? apiKeyPreview(value) : "使用已保存转发 Key";
+}
+
 function providerFields(provider: ProviderConfig | null | undefined) {
   const baseUrl = jsonPath(provider?.config, ["model_providers", "custom", "base_url"]) ?? "";
   const apiKey =
@@ -433,36 +448,43 @@ function NavIcon({ type }: { type: Screen }) {
   const common = {
     fill: "none",
     stroke: "currentColor",
-    strokeLinecap: "round" as const,
-    strokeLinejoin: "round" as const,
-    strokeWidth: 1.8,
     viewBox: "0 0 24 24",
   };
   return (
-    <svg aria-hidden="true" className="nav-glyph" {...common}>
+    <svg
+      aria-hidden="true"
+      className="nav-glyph"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth={1.8}
+      {...common}
+    >
       {type === "dashboard" && (
         <>
-          <rect height="6" rx="1.2" width="6" x="3.5" y="3.5" />
-          <rect height="6" rx="1.2" width="6" x="14.5" y="3.5" />
-          <rect height="6" rx="1.2" width="6" x="3.5" y="14.5" />
-          <rect height="6" rx="1.2" width="6" x="14.5" y="14.5" />
+          <path d="M4 4h7v7H4z" />
+          <path d="M13 4h7v5h-7z" />
+          <path d="M4 13h7v7H4z" />
+          <path d="M13 11h7v9h-7z" />
         </>
       )}
       {type === "route" && (
         <>
-          <circle cx="5" cy="12" r="2.2" />
-          <circle cx="19" cy="5.5" r="2.2" />
-          <circle cx="19" cy="18.5" r="2.2" />
-          <path d="M7.2 11.1 16.9 6.5" />
-          <path d="M7.2 12.9 16.9 17.5" />
+          <path d="M5 12h6" />
+          <path d="M13 6h6" />
+          <path d="M13 18h6" />
+          <path d="M11 12c2.2 0 2.2-6 4.8-6" />
+          <path d="M11 12c2.2 0 2.2 6 4.8 6" />
+          <circle cx="5" cy="12" r="2" />
+          <circle cx="19" cy="6" r="2" />
+          <circle cx="19" cy="18" r="2" />
         </>
       )}
       {type === "providers" && (
         <>
-          <rect height="16" rx="2" width="14" x="5" y="4" />
-          <path d="M8.5 8h7" />
-          <path d="M8.5 12h7" />
-          <path d="M8.5 16h4" />
+          <path d="M6 5h12v14H6z" />
+          <path d="M9 9h6" />
+          <path d="M9 13h6" />
+          <path d="M9 17h3" />
         </>
       )}
       {type === "usage" && (
@@ -540,6 +562,7 @@ function App() {
   }));
   const [trendMetric, setTrendMetric] = useState<TrendMetric>("cost");
   const [requestFilter, setRequestFilter] = useState<RouteLogFilter>({ model: "", page_size: 20 });
+  const [requestAutoRefresh, setRequestAutoRefresh] = useState(true);
   const [screen, setScreen] = useState<Screen>("dashboard");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -549,6 +572,7 @@ function App() {
   const [providerName, setProviderName] = useState("");
   const [providerBaseUrl, setProviderBaseUrl] = useState("");
   const [providerApiKey, setProviderApiKey] = useState("");
+  const [providerApiKeyDirty, setProviderApiKeyDirty] = useState(false);
   const [providerEnabled, setProviderEnabled] = useState(true);
   const [balanceQuery, setBalanceQuery] = useState<BalanceQueryConfig>(() =>
     defaultBalanceQuery(),
@@ -600,6 +624,14 @@ function App() {
     refresh().catch((err) => setError(String(err)));
   }, []);
 
+  useEffect(() => {
+    if (screen !== "requests" || !requestAutoRefresh) return;
+    const timer = window.setInterval(() => {
+      refreshRouteLogs(requestFilter).catch((err) => setError(String(err)));
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [requestAutoRefresh, requestFilter, screen]);
+
   const activeProvider = useMemo(() => {
     if (!appState) return null;
     return (
@@ -626,23 +658,18 @@ function App() {
   const failedCount = routeUsageStats?.failed_count ?? 0;
   const successRate = requestCount ? ((requestCount - failedCount) / requestCount) * 100 : 0;
 
-  function openProviderEditor(provider?: ProviderSummary, tab: EditorTab = "base") {
-    const full =
-      provider && appState?.active_provider?.id === provider.id
-        ? appState.active_provider
-        : appState?.active_provider ?? null;
-    const targetSummary = provider ?? activeProvider;
-    const targetFull = full?.id === targetSummary?.id ? full : null;
+  function fillProviderEditor(targetFull: ProviderConfig, summary: ProviderSummary | null, tab: EditorTab) {
     const fields = providerFields(targetFull);
-    setEditingId(targetSummary?.id ?? "");
-    setProviderName(targetSummary?.name ?? targetFull?.name ?? "");
-    setProviderBaseUrl(targetSummary?.base_url || fields.baseUrl);
+    setEditingId(summary?.id ?? targetFull.id);
+    setProviderName(summary?.name ?? targetFull.name ?? "");
+    setProviderBaseUrl(summary?.base_url || fields.baseUrl);
     setProviderApiKey(fields.apiKey);
-    setProviderEnabled(targetSummary?.enabled ?? targetFull?.enabled ?? true);
+    setProviderApiKeyDirty(false);
+    setProviderEnabled(summary?.enabled ?? targetFull.enabled ?? true);
     setBalanceQuery(
       normalizeBalanceQuery(
-        targetFull?.balance_query,
-        endpointFromBaseUrl(targetSummary?.base_url || fields.baseUrl),
+        targetFull.balance_query,
+        endpointFromBaseUrl(summary?.base_url || fields.baseUrl),
       ),
     );
     setEditorTab(tab);
@@ -651,10 +678,14 @@ function App() {
     setEditorOpen(true);
   }
 
-  async function selectProvider(providerId: string) {
+  async function openProviderEditor(provider?: ProviderSummary, tab: EditorTab = "base") {
+    const targetSummary = provider ?? activeProvider;
+    if (!targetSummary) return;
     await run(async () => {
-      const state = await callCommand<AppState>("select_provider", { providerId });
-      setAppState(state);
+      const targetFull = await callCommand<ProviderConfig>("get_provider", {
+        providerId: targetSummary.id,
+      });
+      fillProviderEditor(targetFull, targetSummary, tab);
     });
   }
 
@@ -665,7 +696,12 @@ function App() {
       setNewProviderCount((value) => value + 1);
       setAppState(state);
       const created = state.providers.find((provider) => provider.id === state.active_provider_id);
-      setTimeout(() => openProviderEditor(created, "base"), 0);
+      if (created) {
+        const targetFull = await callCommand<ProviderConfig>("get_provider", {
+          providerId: created.id,
+        });
+        fillProviderEditor(targetFull, created, "base");
+      }
     });
   }
 
@@ -676,16 +712,19 @@ function App() {
         ...balanceQuery,
         endpoint: balanceQuery.endpoint || endpointFromBaseUrl(providerBaseUrl),
       };
+      const payload: Record<string, unknown> = {
+        provider_id: editingId,
+        provider_name: providerName,
+        config_toml: "",
+        base_url: providerBaseUrl,
+        enabled: providerEnabled,
+        balance_query: nextBalance,
+      };
+      if (providerApiKeyDirty) {
+        payload.api_key = providerApiKey;
+      }
       const state = await callCommand<AppState>("save_provider", {
-        payload: {
-          provider_id: editingId,
-          provider_name: providerName,
-          config_toml: "",
-          base_url: providerBaseUrl,
-          api_key: providerApiKey,
-          enabled: providerEnabled,
-          balance_query: nextBalance,
-        },
+        payload,
       });
       setAppState(state);
       setEditorOpen(false);
@@ -695,20 +734,6 @@ function App() {
   async function testBalance() {
     if (!editingId) return;
     await run(async () => {
-      await callCommand<AppState>("save_provider", {
-        payload: {
-          provider_id: editingId,
-          provider_name: providerName,
-          config_toml: "",
-          base_url: providerBaseUrl,
-          api_key: providerApiKey,
-          enabled: providerEnabled,
-          balance_query: {
-            ...balanceQuery,
-            endpoint: balanceQuery.endpoint || endpointFromBaseUrl(providerBaseUrl),
-          },
-        },
-      });
       const state = await callCommand<AppState>("query_provider_balance", {
         payload: { provider_id: editingId },
       });
@@ -769,6 +794,11 @@ function App() {
     const next = { ...requestFilter, ...patch, page: patch.page ?? 1 };
     setRequestFilter(next);
     await run(async () => refreshRouteLogs(next));
+  }
+
+  async function applyTodayRequestFilter() {
+    const today = dateKey(new Date());
+    await applyRequestFilter({ start_day: today, end_day: today, page: 1 });
   }
 
   function updateBalanceQuery(patch: Partial<BalanceQueryConfig>) {
@@ -913,7 +943,7 @@ function App() {
             busy={busy}
             onAdd={addProvider}
             onEdit={(provider, tab) => {
-              void selectProvider(provider.id).then(() => openProviderEditor(provider, tab));
+              void openProviderEditor(provider, tab);
             }}
             onToggle={toggleProvider}
             providers={appState.providers}
@@ -935,10 +965,13 @@ function App() {
 
         {screen === "requests" && (
           <RequestLogsScreen
+            autoRefresh={requestAutoRefresh}
             filter={requestFilter}
             logs={routeLogs}
             onFilter={applyRequestFilter}
             onRefresh={() => run(() => refreshRouteLogs(requestFilter))}
+            onSetAutoRefresh={setRequestAutoRefresh}
+            onToday={applyTodayRequestFilter}
           />
         )}
 
@@ -979,6 +1012,7 @@ function App() {
           providerName={providerName}
           secretVisible={secretVisible}
           setProviderApiKey={setProviderApiKey}
+          setProviderApiKeyDirty={setProviderApiKeyDirty}
           setProviderBaseUrl={setProviderBaseUrl}
           setProviderEnabled={setProviderEnabled}
           setProviderName={setProviderName}
@@ -1087,7 +1121,12 @@ function RouteScreen({
               <strong>允许局域网访问</strong>
               <p>关闭时仅本机可以连接</p>
             </div>
-            <Toggle checked={routerDraft.host !== "127.0.0.1"} onChange={() => undefined} />
+            <Toggle
+              checked={routerDraft.host !== "127.0.0.1"}
+              onChange={(checked) =>
+                setRouterDraft({ ...routerDraft, host: checked ? "0.0.0.0" : "127.0.0.1" })
+              }
+            />
           </div>
         </article>
       </div>
@@ -1107,20 +1146,20 @@ function RouteScreen({
         <div className="route-rule-line">
           <div>
             <strong>会话固定</strong>
-            <p>同一 Codex 会话优先继续使用当前供应商</p>
+            <p>同一 Codex 会话优先继续使用当前供应商，即将支持</p>
           </div>
-          <Toggle checked onChange={() => undefined} />
+          <Toggle checked={false} disabled onChange={() => undefined} />
         </div>
         <div className="route-rule-line">
           <div>
             <strong>余额不足时自动跳过</strong>
-            <p>供应商余额低于其配置阈值时不再分配新请求</p>
+            <p>供应商余额低于其配置阈值时不再分配新请求，即将支持</p>
           </div>
-          <Toggle checked onChange={() => undefined} />
+          <Toggle checked={false} disabled onChange={() => undefined} />
         </div>
         <button className="route-strategy-row" type="button">
           <strong>故障转移策略</strong>
-          <span>网络错误、超时、429、5xx · 连续失败 3 次 · 冷却 60 秒</span>
+          <span>已支持网络错误、429、5xx 顺序重试；连续失败冷却即将支持</span>
           <b>›</b>
         </button>
       </article>
@@ -1207,7 +1246,7 @@ function UsageScreen({
             <option key={model} value={model}>{model}</option>
           ))}
         </select>
-        <button className="ghost">按小时聚合</button>
+        <button className="ghost" type="button">{bucketGranularityLabel(stats?.bucket_granularity)}</button>
         <small>本程序路由日志</small>
       </div>
 
@@ -1215,8 +1254,8 @@ function UsageScreen({
         <Metric title="官方估算成本" value={formatMoney(summary.estimated_cost, summary.currency)} tone="purple" sub="按官方 API 价格" />
         <Metric title="非缓存输入" value={formatCompact(summary.uncached_input_tokens)} tone="cyan" sub={`${formatCompact(summary.input_tokens)} 输入`} />
         <Metric title="缓存输入" value={formatCompact(summary.cached_input_tokens)} tone="blue" sub="路由后统计" />
-        <Metric title="输出 Token" value={formatCompact(summary.output_tokens)} tone="amber" sub="今日累计" />
-        <Metric title="请求数" value={String(summary.request_count)} tone="green" sub={`成功 ${(stats?.details ?? []).filter((log) => log.status === "success").length}`} />
+        <Metric title="输出 Token" value={formatCompact(summary.output_tokens)} tone="amber" sub={rangeLabel(timeRange)} />
+        <Metric title="请求数" value={String(summary.request_count)} tone="green" sub={`成功 ${stats?.success_count ?? 0}`} />
       </div>
 
       <div className="usage-main-grid">
@@ -1224,7 +1263,7 @@ function UsageScreen({
           <div className="card-head">
             <div>
               <h3>使用趋势</h3>
-              <p>{trendMetricLabel(trendMetric)} · {rangeLabel(timeRange)} · 按小时聚合</p>
+              <p>{trendMetricLabel(trendMetric)} · {rangeLabel(timeRange)} · {bucketGranularityLabel(stats?.bucket_granularity)}</p>
             </div>
             <div className="mini-tabs">
               {(["cost", "tokens", "requests"] as TrendMetric[]).map((metric) => (
@@ -1284,7 +1323,7 @@ function UsageScreen({
         <div className="panel-head">
           <div>
             <h2>用量明细</h2>
-            <p>按小时汇总经过 Codex Helper 转发并成功记录用量的请求。</p>
+            <p>展示经过 Codex Helper 转发并成功记录用量的请求。</p>
           </div>
         </div>
         <div className="usage-detail-table">
@@ -1317,15 +1356,21 @@ function UsageScreen({
 }
 
 function RequestLogsScreen({
+  autoRefresh,
   filter,
   logs,
   onFilter,
   onRefresh,
+  onSetAutoRefresh,
+  onToday,
 }: {
+  autoRefresh: boolean;
   filter: RouteLogFilter;
   logs: RouteLogsResponse | null;
   onFilter: (patch: Partial<RouteLogFilter>) => Promise<void>;
   onRefresh: () => void;
+  onSetAutoRefresh: (enabled: boolean) => void;
+  onToday: () => Promise<void>;
 }) {
   const rows = logs?.logs ?? [];
 
@@ -1334,7 +1379,7 @@ function RequestLogsScreen({
       <div className="section-title">
         <h2>请求列表</h2>
         <button className="ghost" onClick={() => exportRouteLogsCsv(rows)} type="button">
-          导出 CSV
+          导出当前页 CSV
         </button>
       </div>
       <div className="request-filter-bar">
@@ -1363,9 +1408,15 @@ function RequestLogsScreen({
             <option key={model} value={model}>{model}</option>
           ))}
         </select>
-        <button className="ghost">今日</button>
+        <button className="ghost" onClick={onToday} type="button">今日</button>
         <span>实时刷新</span>
-        <Toggle checked onChange={onRefresh} />
+        <Toggle
+          checked={autoRefresh}
+          onChange={(checked) => {
+            onSetAutoRefresh(checked);
+            if (checked) onRefresh();
+          }}
+        />
         <small>共 {logs?.total ?? 0} 条</small>
       </div>
 
@@ -1457,16 +1508,10 @@ function Dashboard(props: {
     uncachedInput,
   } = props;
   const healthyProviders = providers.filter((provider) => provider.enabled && !provider.balance_error).length;
-  const details = stats?.details ?? [];
-  const successCount = requestCount - (stats?.failed_count ?? 0);
-  const activeRequests = details.filter((log) => log.status === "running").length;
-  const logsWithFirstByte = details.filter((log) => log.first_byte_ms != null);
-  const avgFirstByte = logsWithFirstByte.length
-    ? logsWithFirstByte.reduce((sum, log) => sum + (log.first_byte_ms ?? 0), 0) / logsWithFirstByte.length
-    : null;
-  const avgTotalMs = details.length
-    ? details.reduce((sum, log) => sum + log.total_ms, 0) / details.length
-    : null;
+  const successCount = stats?.success_count ?? Math.max(requestCount - (stats?.failed_count ?? 0), 0);
+  const activeRequests = stats?.running_count ?? 0;
+  const avgFirstByte = stats?.average_first_byte_ms ?? null;
+  const avgTotalMs = stats?.average_total_ms ?? null;
   const trendBuckets = stats?.buckets.length
     ? stats.buckets
     : [{ label: "暂无", estimated_cost: 0, total_tokens: 0, request_count: 0 }];
@@ -1505,7 +1550,7 @@ function Dashboard(props: {
           <div className="card-head">
             <div>
               <h3>使用趋势</h3>
-              <p>{trendMetricLabel(trendMetric)} · {rangeLabel(timeRange)} · 按小时聚合</p>
+              <p>{trendMetricLabel(trendMetric)} · {rangeLabel(timeRange)} · {bucketGranularityLabel(stats?.bucket_granularity)}</p>
             </div>
             <div className="mini-tabs">
               {(["cost", "tokens", "requests"] as TrendMetric[]).map((metric) => (
@@ -1758,6 +1803,7 @@ function ProviderEditor(props: {
   providerName: string;
   secretVisible: boolean;
   setProviderApiKey: (value: string) => void;
+  setProviderApiKeyDirty: (dirty: boolean) => void;
   setProviderBaseUrl: (value: string) => void;
   setProviderEnabled: (value: boolean) => void;
   setProviderName: (value: string) => void;
@@ -1780,6 +1826,7 @@ function ProviderEditor(props: {
     providerName,
     secretVisible,
     setProviderApiKey,
+    setProviderApiKeyDirty,
     setProviderBaseUrl,
     setProviderEnabled,
     setProviderName,
@@ -1825,8 +1872,11 @@ function ProviderEditor(props: {
                   <input
                     type={secretVisible ? "text" : "password"}
                     value={providerApiKey}
-                    onChange={(event) => setProviderApiKey(event.currentTarget.value)}
-                    placeholder="sk-..."
+                    onChange={(event) => {
+                      setProviderApiKey(event.currentTarget.value);
+                      setProviderApiKeyDirty(true);
+                    }}
+                    placeholder="留空保持已保存的 API Key"
                   />
                   <button onClick={() => setSecretVisible(!secretVisible)} type="button">
                     {secretVisible ? "隐藏" : "显示"}
@@ -1915,7 +1965,7 @@ function ProviderEditor(props: {
                 <div className="secret-field">
                   <input
                     type={balanceTokenVisible ? "text" : "password"}
-                    value={balanceQuery.auth_mode === "provider_token" ? apiKeyPreview(providerApiKey) : balanceQuery.query_token}
+                    value={balanceQuery.auth_mode === "provider_token" ? savedApiKeyLabel(providerApiKey) : balanceQuery.query_token}
                     onChange={(event) => onUpdateBalance({ query_token: event.currentTarget.value, auth_mode: "separate_token" })}
                     readOnly={balanceQuery.auth_mode === "provider_token"}
                   />
@@ -1998,8 +2048,8 @@ function ProviderEditor(props: {
                   <Toggle checked onChange={() => undefined} />
                 </div>
                 <div className="mini-toggle-line">
-                  <span>余额低于阈值时跳过此供应商</span>
-                  <Toggle checked onChange={() => undefined} />
+                  <span>余额低于阈值时跳过此供应商（即将支持）</span>
+                  <Toggle checked={false} disabled onChange={() => undefined} />
                 </div>
               </div>
               <div className="form-row">

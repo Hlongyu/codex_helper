@@ -8,7 +8,9 @@ use axum::{
 };
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use futures_util::{stream::BoxStream, StreamExt};
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, HOST};
+use reqwest::header::{
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -29,6 +31,7 @@ const MARKER: &str = "# managed-by: codex-config-manager";
 const DEFAULT_ROUTER_HOST: &str = "127.0.0.1";
 const DEFAULT_ROUTER_PORT: u16 = 18080;
 const DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
+const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
 static ROUTE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +174,26 @@ struct ManagerState {
     pricing: Vec<PricingRule>,
     #[serde(default)]
     router: RouterConfig,
+    #[serde(default)]
+    router_backup: Option<RouterApplyBackup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RouterApplyBackup {
+    #[serde(default)]
+    model_provider: RouterFieldBackup,
+    #[serde(default)]
+    custom_base_url: RouterFieldBackup,
+    #[serde(default)]
+    custom_token: RouterFieldBackup,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RouterFieldBackup {
+    #[serde(default)]
+    existed: bool,
+    #[serde(default)]
+    value: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -636,6 +659,11 @@ struct RouteUsageStats {
     summary: UsageSummary,
     today: UsageSummary,
     failed_count: usize,
+    success_count: usize,
+    running_count: usize,
+    average_first_byte_ms: Option<u64>,
+    average_total_ms: Option<u64>,
+    bucket_granularity: String,
     buckets: Vec<RouteUsageBucket>,
     providers: Vec<RouteUsageBreakdown>,
     models: Vec<RouteUsageBreakdown>,
@@ -672,7 +700,8 @@ struct RouteStreamState {
     pending: PendingRouteLog,
     status_success: bool,
     first_byte_ms: Option<u64>,
-    captured_text: String,
+    sse_buffer: String,
+    usage: TokenUsage,
     finished: bool,
 }
 
@@ -689,7 +718,22 @@ fn default_router_port() -> u16 {
 }
 
 fn default_router_token() -> String {
-    DEFAULT_ROUTER_TOKEN.to_string()
+    random_router_token()
+}
+
+fn random_router_token() -> String {
+    let mut bytes = [0_u8; 32];
+    if getrandom::fill(&mut bytes).is_ok() {
+        let encoded = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("codex-helper-{encoded}")
+    } else {
+        let fallback = current_epoch_ms().unwrap_or_default();
+        let sequence = ROUTE_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        format!("codex-helper-{fallback:x}-{sequence:x}")
+    }
 }
 
 fn router_address(config: &RouterConfig) -> String {
@@ -777,6 +821,7 @@ fn default_state() -> ManagerState {
         applied_history: vec![],
         pricing: default_pricing_rules(),
         router: RouterConfig::default(),
+        router_backup: None,
     }
 }
 
@@ -875,6 +920,11 @@ fn load_state_file() -> Result<ManagerState, String> {
 
 fn normalize_state(mut state: ManagerState) -> ManagerState {
     state.pricing = default_pricing_rules();
+    if state.router.local_token.trim().is_empty()
+        || state.router.local_token == DEFAULT_ROUTER_TOKEN
+    {
+        state.router.local_token = random_router_token();
+    }
     let provider_exists = |provider_id: &str| {
         state
             .providers
@@ -1061,6 +1111,69 @@ fn model_provider_name(provider: &ProviderConfig) -> String {
         .and_then(Value::as_str)
         .unwrap_or("custom")
         .to_string()
+}
+
+fn redacted_provider(mut provider: ProviderConfig) -> ProviderConfig {
+    if let Err(err) = set_json_path(
+        &mut provider.config,
+        &["model_providers", "custom", "experimental_bearer_token"],
+        Value::String(String::new()),
+    ) {
+        eprintln!("无法脱敏供应商 Token: {err}");
+    }
+    provider.balance_query.query_token.clear();
+    provider
+}
+
+fn redacted_config_value(mut value: Value) -> Value {
+    if value
+        .pointer("/model_providers/custom/experimental_bearer_token")
+        .is_some()
+    {
+        if let Err(err) = set_json_path(
+            &mut value,
+            &["model_providers", "custom", "experimental_bearer_token"],
+            Value::String(String::new()),
+        ) {
+            eprintln!("无法脱敏配置 Token: {err}");
+        }
+    }
+    value
+}
+
+fn redacted_toml_text(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+    let Ok(mut doc) = raw.parse::<DocumentMut>() else {
+        return raw.to_string();
+    };
+    if toml_path_value(&doc, "model_providers.custom.experimental_bearer_token").is_some() {
+        if let Err(err) = set_toml_path(
+            &mut doc,
+            "model_providers.custom.experimental_bearer_token",
+            &Value::String(String::new()),
+        ) {
+            eprintln!("无法脱敏 TOML Token: {err}");
+        }
+    }
+    doc.to_string()
+}
+
+fn redacted_path_value(path: &str, value: &Value) -> Value {
+    if path == "model_providers.custom.experimental_bearer_token" {
+        Value::String(String::new())
+    } else {
+        value.clone()
+    }
+}
+
+fn redacted_diff(mut diff: DiffEntry) -> DiffEntry {
+    if diff.path == "model_providers.custom.experimental_bearer_token" {
+        diff.current = diff.current.map(|_| Value::String(String::new()));
+        diff.desired = diff.desired.map(|_| Value::String(String::new()));
+    }
+    diff
 }
 
 fn elapsed_label(checked_at: Option<u64>) -> String {
@@ -1316,11 +1429,113 @@ fn set_toml_path(doc: &mut DocumentMut, path: &str, value: &Value) -> Result<(),
     Ok(())
 }
 
+fn toml_path_value(doc: &DocumentMut, path: &str) -> Option<Value> {
+    let mut table = doc.as_table();
+    let parts = path.split('.').collect::<Vec<_>>();
+    let (last, parents) = parts.split_last()?;
+    for part in parents {
+        table = table.get(part)?.as_table()?;
+    }
+    table
+        .get(last)
+        .filter(|item| !item.is_none())
+        .map(toml_item_to_json)
+}
+
+fn remove_toml_path(doc: &mut DocumentMut, path: &str) {
+    let parts = path.split('.').collect::<Vec<_>>();
+    let Some((last, parents)) = parts.split_last() else {
+        return;
+    };
+
+    let mut table = doc.as_table_mut();
+    for part in parents {
+        let Some(next) = table.get_mut(part).and_then(Item::as_table_mut) else {
+            return;
+        };
+        table = next;
+    }
+    table.remove(last);
+}
+
+fn capture_toml_field(doc: &DocumentMut, path: &str) -> RouterFieldBackup {
+    let value = toml_path_value(doc, path);
+    RouterFieldBackup {
+        existed: value.is_some(),
+        value,
+    }
+}
+
+fn capture_router_backup(doc: &DocumentMut) -> RouterApplyBackup {
+    RouterApplyBackup {
+        model_provider: capture_toml_field(doc, "model_provider"),
+        custom_base_url: capture_toml_field(doc, "model_providers.custom.base_url"),
+        custom_token: capture_toml_field(doc, "model_providers.custom.experimental_bearer_token"),
+    }
+}
+
+fn restore_toml_field(
+    doc: &mut DocumentMut,
+    path: &str,
+    backup: &RouterFieldBackup,
+) -> Result<(), String> {
+    if backup.existed {
+        if let Some(value) = backup.value.as_ref() {
+            set_toml_path(doc, path, value)?;
+        } else {
+            remove_toml_path(doc, path);
+        }
+    } else {
+        remove_toml_path(doc, path);
+    }
+    Ok(())
+}
+
+fn restore_router_backup(
+    mut doc: DocumentMut,
+    backup: Option<&RouterApplyBackup>,
+    router: &RouterConfig,
+) -> Result<String, String> {
+    if let Some(backup) = backup {
+        restore_toml_field(&mut doc, "model_provider", &backup.model_provider)?;
+        restore_toml_field(
+            &mut doc,
+            "model_providers.custom.base_url",
+            &backup.custom_base_url,
+        )?;
+        restore_toml_field(
+            &mut doc,
+            "model_providers.custom.experimental_bearer_token",
+            &backup.custom_token,
+        )?;
+    } else {
+        let desired = router_patch_desired(router);
+        let desired_flat = flatten(&desired);
+        let current = toml_doc_to_json(&doc);
+        let current_flat = flatten(&current);
+        for path in [
+            "model_provider",
+            "model_providers.custom.base_url",
+            "model_providers.custom.experimental_bearer_token",
+        ] {
+            if desired_flat.get(path) == current_flat.get(path) {
+                remove_toml_path(&mut doc, path);
+            }
+        }
+    }
+    Ok(doc.to_string())
+}
+
 fn render_router_patch_toml(
     mut doc: DocumentMut,
     marker_present: bool,
     router: &RouterConfig,
 ) -> Result<String, String> {
+    set_toml_path(
+        &mut doc,
+        "model_provider",
+        &Value::String("custom".to_string()),
+    )?;
     set_toml_path(
         &mut doc,
         "model_providers.custom.base_url",
@@ -1342,6 +1557,7 @@ fn render_router_patch_toml(
 
 fn router_patch_desired(router: &RouterConfig) -> Value {
     json!({
+        "model_provider": "custom",
         "model_providers": {
             "custom": {
                 "base_url": router_base_url(router),
@@ -1399,12 +1615,19 @@ fn now_epoch_seconds() -> Result<u64, String> {
 
 fn join_url(endpoint: &str, path: &str) -> String {
     let endpoint = endpoint.trim().trim_end_matches('/');
-    let path = path.trim();
-    if path.starts_with("http://") || path.starts_with("https://") {
-        path.to_string()
-    } else {
-        format!("{endpoint}/{}", path.trim_start_matches('/'))
-    }
+    let path = path.trim().trim_start_matches('/');
+    format!("{endpoint}/{path}")
+}
+
+fn is_hop_by_hop_header(name: &HeaderName) -> bool {
+    name == CONNECTION
+        || name == TRANSFER_ENCODING
+        || name == UPGRADE
+        || name.as_str().eq_ignore_ascii_case("keep-alive")
+        || name.as_str().eq_ignore_ascii_case("te")
+        || name.as_str().eq_ignore_ascii_case("trailer")
+        || name.as_str().eq_ignore_ascii_case("proxy-authenticate")
+        || name.as_str().eq_ignore_ascii_case("proxy-authorization")
 }
 
 fn proxy_error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -1422,14 +1645,14 @@ fn upstream_candidates() -> Result<(RouterConfig, Vec<UpstreamCandidate>), Strin
     if !state.router.enabled {
         return Err("本地路由未启用".to_string());
     }
-    let mut candidates = state
+    let candidates = state
         .providers
         .iter()
         .enumerate()
         .filter(|(_, provider)| provider.enabled)
         .filter_map(|(index, provider)| {
-            let base_url = custom_provider_base_url(provider)
-                .filter(|value| !value.trim().is_empty())?;
+            let base_url =
+                custom_provider_base_url(provider).filter(|value| !value.trim().is_empty())?;
             let token = custom_provider_token(provider).filter(|value| !value.trim().is_empty())?;
             Some(UpstreamCandidate {
                 provider: provider.clone(),
@@ -1441,25 +1664,7 @@ fn upstream_candidates() -> Result<(RouterConfig, Vec<UpstreamCandidate>), Strin
         .collect::<Vec<_>>();
 
     if candidates.is_empty() {
-        if let Some((index, provider)) = state.providers.iter().enumerate().find(|(_, provider)| {
-            custom_provider_base_url(provider)
-                .filter(|value| !value.trim().is_empty())
-                .is_some()
-                && custom_provider_token(provider)
-                    .filter(|value| !value.trim().is_empty())
-                    .is_some()
-        }) {
-            candidates.push(UpstreamCandidate {
-                provider: provider.clone(),
-                base_url: custom_provider_base_url(provider).unwrap_or_default(),
-                token: custom_provider_token(provider).unwrap_or_default(),
-                route_order: index + 1,
-            });
-        }
-    }
-
-    if candidates.is_empty() {
-        return Err("没有可用的上游供应商".to_string());
+        return Err("没有已启用且配置完整的供应商".to_string());
     }
     Ok((state.router, candidates))
 }
@@ -1474,7 +1679,12 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 fn model_from_request_body(body: &[u8]) -> String {
     serde_json::from_slice::<Value>(body)
         .ok()
-        .and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "未知模型".to_string())
 }
@@ -1482,8 +1692,82 @@ fn model_from_request_body(body: &[u8]) -> String {
 fn usage_from_response_value(value: &Value) -> TokenUsage {
     value
         .get("usage")
+        .or_else(|| value.pointer("/response/usage"))
         .map(usage_from_value)
         .unwrap_or_default()
+}
+
+fn usage_from_sse_event(event: &str) -> TokenUsage {
+    let mut usage = TokenUsage::default();
+    let mut data = String::new();
+    for line in event.lines() {
+        let line = line.trim();
+        let Some(value) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() || value == "[DONE]" {
+            continue;
+        }
+        if !data.is_empty() {
+            data.push('\n');
+        }
+        data.push_str(value);
+    }
+    if data.is_empty() {
+        return usage;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(&data) {
+        let next = usage_from_response_value(&value);
+        if !usage_is_zero(&next) {
+            usage = next;
+        }
+    }
+    usage
+}
+
+fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) {
+    buffer.push_str(&String::from_utf8_lossy(bytes));
+    while let Some(index) = buffer.find("\n\n") {
+        let event = buffer[..index].to_string();
+        buffer.drain(..index + 2);
+        let next = usage_from_sse_event(&event);
+        if !usage_is_zero(&next) {
+            *usage = next;
+        }
+    }
+
+    if buffer.len() > 128 * 1024 {
+        let keep_from = buffer.len().saturating_sub(64 * 1024);
+        let tail = buffer[keep_from..].to_string();
+        *buffer = tail;
+    }
+}
+
+fn finish_sse_usage(buffer: &mut String, usage: &mut TokenUsage) {
+    if !buffer.trim().is_empty() {
+        let next = usage_from_sse_event(buffer);
+        if !usage_is_zero(&next) {
+            *usage = next;
+        }
+    }
+    buffer.clear();
+}
+
+fn route_stream_ingest(state: &mut RouteStreamState, bytes: &[u8]) {
+    let mut buffer = std::mem::take(&mut state.sse_buffer);
+    let mut usage = std::mem::take(&mut state.usage);
+    ingest_sse_chunk(&mut buffer, &mut usage, bytes);
+    state.sse_buffer = buffer;
+    state.usage = usage;
+}
+
+fn route_stream_finish_usage(state: &mut RouteStreamState) {
+    let mut buffer = std::mem::take(&mut state.sse_buffer);
+    let mut usage = std::mem::take(&mut state.usage);
+    finish_sse_usage(&mut buffer, &mut usage);
+    state.sse_buffer = buffer;
+    state.usage = usage;
 }
 
 fn usage_from_response_text(text: &str) -> TokenUsage {
@@ -1574,6 +1858,8 @@ fn finish_route_log(
 }
 
 fn build_pending_route_log(
+    started_at_ms: i64,
+    start: Instant,
     candidate: &UpstreamCandidate,
     method: &Method,
     path: &str,
@@ -1583,7 +1869,6 @@ fn build_pending_route_log(
     route_attempts: usize,
     error: Option<String>,
 ) -> PendingRouteLog {
-    let started_at_ms = current_epoch_ms().unwrap_or_default();
     PendingRouteLog {
         id: request_id(started_at_ms),
         started_at_ms,
@@ -1604,7 +1889,7 @@ fn build_pending_route_log(
         },
         route_attempts,
         error,
-        start: Instant::now(),
+        start,
     }
 }
 
@@ -1620,36 +1905,27 @@ impl futures_util::Stream for RouteStreamState {
                 if self.first_byte_ms.is_none() {
                     self.first_byte_ms = Some(self.pending.start.elapsed().as_millis() as u64);
                 }
-                if self.captured_text.len() < 512 * 1024 {
-                    self.captured_text
-                        .push_str(&String::from_utf8_lossy(bytes.as_ref()));
-                }
+                route_stream_ingest(&mut self, bytes.as_ref());
                 std::task::Poll::Ready(Some(Ok(bytes)))
             }
             std::task::Poll::Ready(Some(Err(err))) => {
                 if !self.finished {
                     self.finished = true;
                     self.pending.error = Some(format!("读取上游流失败: {err}"));
+                    route_stream_finish_usage(&mut self);
                     let pending = self.pending.clone();
-                    finish_route_log(
-                        pending,
-                        false,
-                        usage_from_response_text(&self.captured_text),
-                        self.first_byte_ms,
-                    );
+                    let usage = self.usage.clone();
+                    finish_route_log(pending, false, usage, self.first_byte_ms);
                 }
                 std::task::Poll::Ready(Some(Err(std::io::Error::other(err))))
             }
             std::task::Poll::Ready(None) => {
                 if !self.finished {
                     self.finished = true;
+                    route_stream_finish_usage(&mut self);
                     let pending = self.pending.clone();
-                    finish_route_log(
-                        pending,
-                        self.status_success,
-                        usage_from_response_text(&self.captured_text),
-                        self.first_byte_ms,
-                    );
+                    let usage = self.usage.clone();
+                    finish_route_log(pending, self.status_success, usage, self.first_byte_ms);
                 }
                 std::task::Poll::Ready(None)
             }
@@ -1666,6 +1942,8 @@ async fn proxy_request(
     Path(path): Path<String>,
     body: Body,
 ) -> Response {
+    let request_started = Instant::now();
+    let request_started_at_ms = current_epoch_ms().unwrap_or_default();
     let (router, candidates) = match upstream_candidates() {
         Ok(config) => config,
         Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
@@ -1678,7 +1956,7 @@ async fn proxy_request(
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
     };
@@ -1700,7 +1978,11 @@ async fn proxy_request(
             .body(body_bytes.clone());
 
         for (name, value) in headers.iter() {
-            if name == AUTHORIZATION || name == HOST || name == CONTENT_LENGTH {
+            if name == AUTHORIZATION
+                || name == HOST
+                || name == CONTENT_LENGTH
+                || is_hop_by_hop_header(name)
+            {
                 continue;
             }
             request = request.header(name.as_str(), value.as_bytes());
@@ -1715,6 +1997,8 @@ async fn proxy_request(
                     continue;
                 }
                 let pending = build_pending_route_log(
+                    request_started_at_ms,
+                    request_started,
                     candidate,
                     &method,
                     &path,
@@ -1731,14 +2015,16 @@ async fn proxy_request(
 
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let should_retry = matches!(status.as_u16(), 429 | 500..=599)
-            && attempt_index + 1 < candidates.len();
+        let should_retry =
+            matches!(status.as_u16(), 429 | 500..=599) && attempt_index + 1 < candidates.len();
         if should_retry {
             last_error = format!("{} 返回 {}", candidate.provider.name, status.as_u16());
             continue;
         }
 
         let pending = build_pending_route_log(
+            request_started_at_ms,
+            request_started,
             candidate,
             &method,
             &path,
@@ -1766,7 +2052,7 @@ async fn proxy_request(
             let mut builder = Response::builder().status(status);
             if let Some(headers_mut) = builder.headers_mut() {
                 for (name, value) in response_headers.iter() {
-                    if name == CONTENT_LENGTH {
+                    if name == CONTENT_LENGTH || is_hop_by_hop_header(name) {
                         continue;
                     }
                     if let (Ok(header_name), Ok(header_value)) = (
@@ -1782,7 +2068,8 @@ async fn proxy_request(
                 pending,
                 status_success,
                 first_byte_ms: None,
-                captured_text: String::new(),
+                sse_buffer: String::new(),
+                usage: TokenUsage::default(),
                 finished: false,
             };
             return builder
@@ -1806,7 +2093,7 @@ async fn proxy_request(
         let mut builder = Response::builder().status(status);
         if let Some(headers_mut) = builder.headers_mut() {
             for (name, value) in response_headers.iter() {
-                if name == CONTENT_LENGTH {
+                if name == CONTENT_LENGTH || is_hop_by_hop_header(name) {
                     continue;
                 }
                 if let (Ok(header_name), Ok(header_value)) = (
@@ -1983,6 +2270,14 @@ fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
 
 fn number_at_path(value: &Value, path: &[&str]) -> Option<f64> {
     value_at_path(value, path).and_then(find_balance_value)
+}
+
+fn scalar_number_at_path(value: &Value, path: &[&str]) -> Option<f64> {
+    value_at_path(value, path).and_then(|value| match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    })
 }
 
 fn string_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
@@ -2324,8 +2619,7 @@ fn read_route_logs() -> Result<Vec<RouteRequestLog>, String> {
 
 fn append_route_log(log: &RouteRequestLog) -> Result<(), String> {
     fs::create_dir_all(manager_dir()?).map_err(|err| format!("无法创建管理目录: {err}"))?;
-    let line =
-        serde_json::to_string(log).map_err(|err| format!("无法序列化路由日志: {err}"))?;
+    let line = serde_json::to_string(log).map_err(|err| format!("无法序列化路由日志: {err}"))?;
     let path = route_logs_path()?;
     let mut file = OpenOptions::new()
         .create(true)
@@ -2445,17 +2739,19 @@ fn route_breakdown_by(
     let mut map = BTreeMap::<String, RouteUsageBreakdown>::new();
     for log in logs {
         let (key, label) = key_for(log);
-        let entry = map.entry(key.clone()).or_insert_with(|| RouteUsageBreakdown {
-            key,
-            label,
-            request_count: 0,
-            input_tokens: 0,
-            uncached_input_tokens: 0,
-            cached_input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            estimated_cost: 0.0,
-        });
+        let entry = map
+            .entry(key.clone())
+            .or_insert_with(|| RouteUsageBreakdown {
+                key,
+                label,
+                request_count: 0,
+                input_tokens: 0,
+                uncached_input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                estimated_cost: 0.0,
+            });
         entry.request_count += 1;
         entry.input_tokens += log.input_tokens;
         entry.uncached_input_tokens += log.uncached_input_tokens;
@@ -2473,6 +2769,21 @@ fn route_breakdown_by(
             .then_with(|| right.request_count.cmp(&left.request_count))
     });
     rows
+}
+
+fn route_bucket_label(log: &RouteRequestLog, filter: &RouteLogFilter) -> (String, String) {
+    if filter.start_day.is_none() && filter.end_day.is_none() {
+        return (
+            log.day.chars().take(7).collect::<String>(),
+            "month".to_string(),
+        );
+    }
+    if let (Some(start), Some(end)) = (&filter.start_day, &filter.end_day) {
+        if start == end {
+            return (log.hour.clone(), "hour".to_string());
+        }
+    }
+    (log.day.clone(), "day".to_string())
 }
 
 fn build_route_logs_response(
@@ -2520,20 +2831,41 @@ fn build_route_usage_stats(
     let mut summary = UsageSummary::default();
     let mut today = UsageSummary::default();
     let mut failed_count = 0;
+    let mut success_count = 0;
+    let mut running_count = 0;
+    let mut first_byte_total = 0_u64;
+    let mut first_byte_count = 0_u64;
+    let mut total_ms_total = 0_u64;
+    let mut total_ms_count = 0_u64;
+    let mut bucket_granularity = String::new();
     let mut bucket_map = BTreeMap::<String, RouteUsageBucket>::new();
 
     for log in &filtered {
         if log.status == "failed" {
             failed_count += 1;
+        } else if log.status == "success" {
+            success_count += 1;
+        } else if log.status == "running" {
+            running_count += 1;
         }
+        if let Some(first_byte_ms) = log.first_byte_ms {
+            first_byte_total = first_byte_total.saturating_add(first_byte_ms);
+            first_byte_count += 1;
+        }
+        total_ms_total = total_ms_total.saturating_add(log.total_ms);
+        total_ms_count += 1;
         add_route_log_usage(&mut summary, log);
         if log.day == today_key {
             add_route_log_usage(&mut today, log);
         }
+        let (bucket_label, granularity) = route_bucket_label(log, &filter);
+        if bucket_granularity.is_empty() {
+            bucket_granularity = granularity;
+        }
         let entry = bucket_map
-            .entry(log.hour.clone())
+            .entry(bucket_label.clone())
             .or_insert_with(|| RouteUsageBucket {
-                label: log.hour.clone(),
+                label: bucket_label,
                 request_count: 0,
                 input_tokens: 0,
                 uncached_input_tokens: 0,
@@ -2561,6 +2893,17 @@ fn build_route_usage_stats(
         .take(page_size)
         .map(|log| (*log).clone())
         .collect::<Vec<_>>();
+    let bucket_granularity = if bucket_granularity.is_empty() {
+        if filter.start_day.is_none() && filter.end_day.is_none() {
+            "month".to_string()
+        } else if filter.start_day == filter.end_day {
+            "hour".to_string()
+        } else {
+            "day".to_string()
+        }
+    } else {
+        bucket_granularity
+    };
 
     Ok(RouteUsageStats {
         generated_at_ms: current_epoch_ms()?,
@@ -2568,6 +2911,19 @@ fn build_route_usage_stats(
         summary,
         today,
         failed_count,
+        success_count,
+        running_count,
+        average_first_byte_ms: if first_byte_count > 0 {
+            Some(first_byte_total / first_byte_count)
+        } else {
+            None
+        },
+        average_total_ms: if total_ms_count > 0 {
+            Some(total_ms_total / total_ms_count)
+        } else {
+            None
+        },
+        bucket_granularity,
         buckets: bucket_map.into_values().collect(),
         providers: route_breakdown_by(&filtered, |log| {
             (log.provider_id.clone(), log.provider_name.clone())
@@ -2600,14 +2956,24 @@ fn parse_event_timestamp(value: &Value) -> Option<DateTime<Utc>> {
 }
 
 fn usage_from_value(value: &Value) -> TokenUsage {
+    let input_tokens = scalar_number_at_path(value, &["input_tokens"]).unwrap_or_default() as i64;
+    let cached_input_tokens = scalar_number_at_path(value, &["cached_input_tokens"])
+        .or_else(|| scalar_number_at_path(value, &["input_tokens_details", "cached_tokens"]))
+        .unwrap_or_default() as i64;
+    let output_tokens = scalar_number_at_path(value, &["output_tokens"]).unwrap_or_default() as i64;
+    let reasoning_output_tokens = scalar_number_at_path(value, &["reasoning_output_tokens"])
+        .or_else(|| scalar_number_at_path(value, &["output_tokens_details", "reasoning_tokens"]))
+        .unwrap_or_default() as i64;
+    let total_tokens = scalar_number_at_path(value, &["total_tokens"])
+        .map(|value| value as i64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+
     TokenUsage {
-        input_tokens: number_at_path(value, &["input_tokens"]).unwrap_or_default() as i64,
-        cached_input_tokens: number_at_path(value, &["cached_input_tokens"]).unwrap_or_default()
-            as i64,
-        output_tokens: number_at_path(value, &["output_tokens"]).unwrap_or_default() as i64,
-        reasoning_output_tokens: number_at_path(value, &["reasoning_output_tokens"])
-            .unwrap_or_default() as i64,
-        total_tokens: number_at_path(value, &["total_tokens"]).unwrap_or_default() as i64,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
     }
 }
 
@@ -3300,6 +3666,7 @@ fn build_usage_stats_from_cache(
 
 fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppState, String> {
     let provider = active_provider(&state);
+    let redacted_active_provider = provider.clone().map(redacted_provider);
     let desired = if state.router.enabled {
         router_patch_desired(&state.router)
     } else {
@@ -3316,6 +3683,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
         current_config_raw.clone()
     };
     let diffs = compute_diffs(&state, provider.as_ref(), &current_json, &desired);
+    let redacted_diffs = diffs.iter().cloned().map(redacted_diff).collect::<Vec<_>>();
     let desired_flat = flatten(&desired);
 
     let summary = desired_flat
@@ -3323,7 +3691,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
         .take(10)
         .map(|(path, value)| ConfigRow {
             path: path.clone(),
-            value: value.clone(),
+            value: redacted_path_value(path, value),
             source: source_for_path(&state, provider.as_ref(), path),
             changed: diffs.iter().any(|diff| diff.path == *path),
         })
@@ -3373,23 +3741,23 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
     Ok(AppState {
         codex_config_path: codex_config_path()?.display().to_string(),
         manager_dir: manager_dir()?.display().to_string(),
-        current_config_raw,
+        current_config_raw: redacted_toml_text(&current_config_raw),
         current_config_exists,
         active_provider_id: state.active_provider_id,
         base_template_name: state.base_template_name,
-        base_toml: json_to_toml_text(&state.base)?,
-        base: state.base,
+        base_toml: redacted_toml_text(&json_to_toml_text(&state.base)?),
+        base: redacted_config_value(state.base),
         providers,
-        active_provider_toml: provider
+        active_provider_toml: redacted_active_provider
             .as_ref()
             .map(|provider| json_to_toml_text(&provider.config))
             .transpose()?
             .unwrap_or_default(),
-        active_provider: provider,
-        desired: desired.clone(),
-        final_preview_toml,
+        active_provider: redacted_active_provider,
+        desired: redacted_config_value(desired.clone()),
+        final_preview_toml: redacted_toml_text(&final_preview_toml),
         summary,
-        diffs,
+        diffs: redacted_diffs,
         marker_present,
         router: state.router.clone(),
         router_status: router_status(runtime, &state.router),
@@ -3418,6 +3786,16 @@ fn select_provider(
     state.active_provider_id = provider_id;
     save_state(&state)?;
     build_app_state(state, &router_runtime)
+}
+
+#[tauri::command]
+fn get_provider(provider_id: String) -> Result<ProviderConfig, String> {
+    load_state_file()?
+        .providers
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
+        .map(redacted_provider)
+        .ok_or_else(|| "供应商不存在".to_string())
 }
 
 #[tauri::command]
@@ -3633,6 +4011,9 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
         }
 
         let (doc, marker_present, _, _) = read_current_toml()?;
+        if state.router_backup.is_none() {
+            state.router_backup = Some(capture_router_backup(&doc));
+        }
         let raw = render_router_patch_toml(doc, marker_present, &state.router)?;
 
         fs::write(&config_path, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
@@ -3647,7 +4028,11 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
         );
         fs::copy(&config_path, manager_dir()?.join(backup_name))
             .map_err(|err| format!("无法备份现有配置: {err}"))?;
+        let (doc, _, _, _) = read_current_toml()?;
+        let raw = restore_router_backup(doc, state.router_backup.as_ref(), &state.router)?;
+        fs::write(&config_path, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
         state.last_applied = None;
+        state.router_backup = None;
     }
     state.applied_provider_id = None;
     save_state(&state)?;
@@ -3744,6 +4129,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_app_state,
             select_provider,
+            get_provider,
             save_provider,
             preview_provider,
             add_provider,
