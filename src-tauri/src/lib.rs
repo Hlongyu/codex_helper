@@ -1726,11 +1726,44 @@ fn usage_from_sse_event(event: &str) -> TokenUsage {
     usage
 }
 
+fn next_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
+    let bytes = buffer.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\n' => {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'\n' {
+                    return Some((index, 2));
+                }
+                if index + 2 < bytes.len() && bytes[index + 1] == b'\r' && bytes[index + 2] == b'\n'
+                {
+                    return Some((index, 3));
+                }
+            }
+            b'\r' => {
+                if index + 3 < bytes.len()
+                    && bytes[index + 1] == b'\n'
+                    && bytes[index + 2] == b'\r'
+                    && bytes[index + 3] == b'\n'
+                {
+                    return Some((index, 4));
+                }
+                if index + 1 < bytes.len() && bytes[index + 1] == b'\r' {
+                    return Some((index, 2));
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
 fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) {
     buffer.push_str(&String::from_utf8_lossy(bytes));
-    while let Some(index) = buffer.find("\n\n") {
+    while let Some((index, delimiter_len)) = next_sse_event_boundary(buffer) {
         let event = buffer[..index].to_string();
-        buffer.drain(..index + 2);
+        buffer.drain(..index + delimiter_len);
         let next = usage_from_sse_event(&event);
         if !usage_is_zero(&next) {
             *usage = next;
@@ -2956,13 +2989,21 @@ fn parse_event_timestamp(value: &Value) -> Option<DateTime<Utc>> {
 }
 
 fn usage_from_value(value: &Value) -> TokenUsage {
-    let input_tokens = scalar_number_at_path(value, &["input_tokens"]).unwrap_or_default() as i64;
+    let input_tokens = scalar_number_at_path(value, &["input_tokens"])
+        .or_else(|| scalar_number_at_path(value, &["prompt_tokens"]))
+        .unwrap_or_default() as i64;
     let cached_input_tokens = scalar_number_at_path(value, &["cached_input_tokens"])
         .or_else(|| scalar_number_at_path(value, &["input_tokens_details", "cached_tokens"]))
+        .or_else(|| scalar_number_at_path(value, &["prompt_tokens_details", "cached_tokens"]))
         .unwrap_or_default() as i64;
-    let output_tokens = scalar_number_at_path(value, &["output_tokens"]).unwrap_or_default() as i64;
+    let output_tokens = scalar_number_at_path(value, &["output_tokens"])
+        .or_else(|| scalar_number_at_path(value, &["completion_tokens"]))
+        .unwrap_or_default() as i64;
     let reasoning_output_tokens = scalar_number_at_path(value, &["reasoning_output_tokens"])
         .or_else(|| scalar_number_at_path(value, &["output_tokens_details", "reasoning_tokens"]))
+        .or_else(|| {
+            scalar_number_at_path(value, &["completion_tokens_details", "reasoning_tokens"])
+        })
         .unwrap_or_default() as i64;
     let total_tokens = scalar_number_at_path(value, &["total_tokens"])
         .map(|value| value as i64)
@@ -4143,4 +4184,51 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_responses_usage_from_crlf_sse_chunks() {
+        let mut buffer = String::new();
+        let mut usage = TokenUsage::default();
+        let first = b"event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\r\n\r\n";
+        ingest_sse_chunk(&mut buffer, &mut usage, first);
+        assert!(usage_is_zero(&usage));
+
+        let usage_event = b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":123,\"input_tokens_details\":{\"cached_tokens\":45},\"output_tokens\":67,\"output_tokens_details\":{\"reasoning_tokens\":8},\"total_tokens\":190}}}\r\n\r\n";
+        let split = 80;
+        ingest_sse_chunk(&mut buffer, &mut usage, &usage_event[..split]);
+        assert!(usage_is_zero(&usage));
+        ingest_sse_chunk(&mut buffer, &mut usage, &usage_event[split..]);
+
+        assert_eq!(usage.input_tokens, 123);
+        assert_eq!(usage.cached_input_tokens, 45);
+        assert_eq!(usage.output_tokens, 67);
+        assert_eq!(usage.reasoning_output_tokens, 8);
+        assert_eq!(usage.total_tokens, 190);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn parses_chat_completion_usage_aliases() {
+        let value = json!({
+            "usage": {
+                "prompt_tokens": 30,
+                "prompt_tokens_details": { "cached_tokens": 12 },
+                "completion_tokens": 20,
+                "completion_tokens_details": { "reasoning_tokens": 5 },
+                "total_tokens": 50
+            }
+        });
+
+        let usage = usage_from_response_value(&value);
+        assert_eq!(usage.input_tokens, 30);
+        assert_eq!(usage.cached_input_tokens, 12);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.reasoning_output_tokens, 5);
+        assert_eq!(usage.total_tokens, 50);
+    }
 }
