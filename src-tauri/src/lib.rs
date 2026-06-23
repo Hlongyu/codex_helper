@@ -1,23 +1,25 @@
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, State as AxumState},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     response::Response,
     routing::any,
     Router,
 };
-use chrono::{DateTime, Datelike, Local, Utc};
-use futures_util::TryStreamExt;
+use chrono::{DateTime, Datelike, Local, Timelike, Utc};
+use futures_util::{stream::BoxStream, StreamExt};
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, HOST};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 use tokio::sync::oneshot;
@@ -27,6 +29,7 @@ const MARKER: &str = "# managed-by: codex-config-manager";
 const DEFAULT_ROUTER_HOST: &str = "127.0.0.1";
 const DEFAULT_ROUTER_PORT: u16 = 18080;
 const DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
+static ROUTE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderConfig {
@@ -513,6 +516,166 @@ struct UsageFilterOption {
     known: bool,
 }
 
+#[derive(Debug, Clone)]
+struct UpstreamCandidate {
+    provider: ProviderConfig,
+    base_url: String,
+    token: String,
+    route_order: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RouteRequestLog {
+    id: String,
+    started_at_ms: i64,
+    day: String,
+    hour: String,
+    method: String,
+    path: String,
+    model: String,
+    provider_id: String,
+    provider_name: String,
+    provider_order: usize,
+    upstream_chain: Vec<String>,
+    status: String,
+    status_code: Option<u16>,
+    error: Option<String>,
+    route_result: String,
+    route_attempts: usize,
+    input_tokens: i64,
+    uncached_input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+    total_tokens: i64,
+    estimated_cost: f64,
+    currency: String,
+    cost_breakdown: String,
+    pricing_model_match: String,
+    pricing_source: String,
+    first_byte_ms: Option<u64>,
+    total_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RouteLogFilter {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    provider_name: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    start_day: Option<String>,
+    #[serde(default)]
+    end_day: Option<String>,
+    #[serde(default)]
+    page: Option<usize>,
+    #[serde(default)]
+    page_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LoadRouteLogsPayload {
+    #[serde(default)]
+    filter: Option<RouteLogFilter>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RouteLogFilterOption {
+    id: String,
+    name: String,
+    request_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RouteLogsResponse {
+    logs: Vec<RouteRequestLog>,
+    total: usize,
+    page: usize,
+    page_size: usize,
+    total_pages: usize,
+    available_providers: Vec<RouteLogFilterOption>,
+    available_models: Vec<String>,
+    available_days: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RouteUsageBucket {
+    label: String,
+    request_count: usize,
+    input_tokens: i64,
+    uncached_input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    estimated_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RouteUsageBreakdown {
+    key: String,
+    label: String,
+    request_count: usize,
+    input_tokens: i64,
+    uncached_input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    estimated_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RouteUsageStats {
+    generated_at_ms: i64,
+    filters: RouteLogFilter,
+    summary: UsageSummary,
+    today: UsageSummary,
+    failed_count: usize,
+    buckets: Vec<RouteUsageBucket>,
+    providers: Vec<RouteUsageBreakdown>,
+    models: Vec<RouteUsageBreakdown>,
+    details: Vec<RouteRequestLog>,
+    total: usize,
+    page: usize,
+    page_size: usize,
+    total_pages: usize,
+    available_providers: Vec<RouteLogFilterOption>,
+    available_models: Vec<String>,
+    available_days: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRouteLog {
+    id: String,
+    started_at_ms: i64,
+    method: String,
+    path: String,
+    model: String,
+    provider_id: String,
+    provider_name: String,
+    provider_order: usize,
+    upstream_chain: Vec<String>,
+    status_code: Option<u16>,
+    route_result: String,
+    route_attempts: usize,
+    error: Option<String>,
+    start: Instant,
+}
+
+struct RouteStreamState {
+    stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    pending: PendingRouteLog,
+    status_success: bool,
+    first_byte_ms: Option<u64>,
+    captured_text: String,
+    finished: bool,
+}
+
 fn default_balance_path() -> String {
     "/api/usage/token/".to_string()
 }
@@ -589,6 +752,10 @@ fn manager_dir() -> Result<PathBuf, String> {
 
 fn state_path() -> Result<PathBuf, String> {
     Ok(manager_dir()?.join("state.json"))
+}
+
+fn route_logs_path() -> Result<PathBuf, String> {
+    Ok(manager_dir()?.join("route-logs.jsonl"))
 }
 
 fn codex_config_path() -> Result<PathBuf, String> {
@@ -1250,25 +1417,51 @@ fn proxy_error(status: StatusCode, message: impl Into<String>) -> Response {
         .unwrap_or_else(|_| Response::new(Body::from("proxy error")))
 }
 
-fn upstream_config() -> Result<(RouterConfig, ProviderConfig, String, String), String> {
+fn upstream_candidates() -> Result<(RouterConfig, Vec<UpstreamCandidate>), String> {
     let state = load_state_file()?;
     if !state.router.enabled {
         return Err("本地路由未启用".to_string());
     }
-    let provider = state
+    let mut candidates = state
         .providers
         .iter()
-        .find(|provider| provider.enabled)
-        .or_else(|| state.providers.first())
-        .cloned()
-        .ok_or_else(|| "没有可用的上游供应商".to_string())?;
-    let base_url = custom_provider_base_url(&provider)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "上游供应商缺少 base_url".to_string())?;
-    let token = custom_provider_token(&provider)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "上游供应商缺少 experimental_bearer_token".to_string())?;
-    Ok((state.router, provider, base_url, token))
+        .enumerate()
+        .filter(|(_, provider)| provider.enabled)
+        .filter_map(|(index, provider)| {
+            let base_url = custom_provider_base_url(provider)
+                .filter(|value| !value.trim().is_empty())?;
+            let token = custom_provider_token(provider).filter(|value| !value.trim().is_empty())?;
+            Some(UpstreamCandidate {
+                provider: provider.clone(),
+                base_url,
+                token,
+                route_order: index + 1,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        if let Some((index, provider)) = state.providers.iter().enumerate().find(|(_, provider)| {
+            custom_provider_base_url(provider)
+                .filter(|value| !value.trim().is_empty())
+                .is_some()
+                && custom_provider_token(provider)
+                    .filter(|value| !value.trim().is_empty())
+                    .is_some()
+        }) {
+            candidates.push(UpstreamCandidate {
+                provider: provider.clone(),
+                base_url: custom_provider_base_url(provider).unwrap_or_default(),
+                token: custom_provider_token(provider).unwrap_or_default(),
+                route_order: index + 1,
+            });
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err("没有可用的上游供应商".to_string());
+    }
+    Ok((state.router, candidates))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -1276,6 +1469,193 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     value
         .strip_prefix("Bearer ")
         .or_else(|| value.strip_prefix("bearer "))
+}
+
+fn model_from_request_body(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_string))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "未知模型".to_string())
+}
+
+fn usage_from_response_value(value: &Value) -> TokenUsage {
+    value
+        .get("usage")
+        .map(usage_from_value)
+        .unwrap_or_default()
+}
+
+fn usage_from_response_text(text: &str) -> TokenUsage {
+    let mut usage = serde_json::from_str::<Value>(text)
+        .ok()
+        .map(|value| usage_from_response_value(&value))
+        .unwrap_or_default();
+    if !usage_is_zero(&usage) {
+        return usage;
+    }
+
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(data) {
+            let next = usage_from_response_value(&value);
+            if !usage_is_zero(&next) {
+                usage = next;
+            }
+        }
+    }
+    usage
+}
+
+fn finish_route_log(
+    pending: PendingRouteLog,
+    status_success: bool,
+    usage: TokenUsage,
+    first_byte_ms: Option<u64>,
+) {
+    let total_ms = pending.start.elapsed().as_millis() as u64;
+    let (day, hour) = timestamp_to_route_parts(pending.started_at_ms);
+    let cost = estimate_cost(
+        &default_pricing_rules(),
+        &pending.provider_id,
+        &pending.provider_name,
+        &pending.model,
+        &usage,
+    );
+    let status = if pending.error.is_some() || !status_success {
+        "failed"
+    } else {
+        "success"
+    };
+    let log = RouteRequestLog {
+        id: pending.id,
+        started_at_ms: pending.started_at_ms,
+        day,
+        hour,
+        method: pending.method,
+        path: pending.path,
+        model: pending.model,
+        provider_id: pending.provider_id,
+        provider_name: pending.provider_name,
+        provider_order: pending.provider_order,
+        upstream_chain: pending.upstream_chain,
+        status: status.to_string(),
+        status_code: pending.status_code,
+        error: pending.error,
+        route_result: pending.route_result,
+        route_attempts: pending.route_attempts,
+        input_tokens: usage.input_tokens,
+        uncached_input_tokens: usage
+            .input_tokens
+            .saturating_sub(usage.cached_input_tokens)
+            .max(0),
+        cached_input_tokens: usage.cached_input_tokens,
+        output_tokens: usage.output_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
+        total_tokens: usage.total_tokens,
+        estimated_cost: cost.amount,
+        currency: cost.currency,
+        cost_breakdown: cost.breakdown,
+        pricing_model_match: cost.pricing_model_match,
+        pricing_source: cost.pricing_source,
+        first_byte_ms,
+        total_ms,
+    };
+    if let Err(err) = append_route_log(&log) {
+        eprintln!("{err}");
+    }
+}
+
+fn build_pending_route_log(
+    candidate: &UpstreamCandidate,
+    method: &Method,
+    path: &str,
+    model: &str,
+    upstream_chain: &[String],
+    status_code: Option<u16>,
+    route_attempts: usize,
+    error: Option<String>,
+) -> PendingRouteLog {
+    let started_at_ms = current_epoch_ms().unwrap_or_default();
+    PendingRouteLog {
+        id: request_id(started_at_ms),
+        started_at_ms,
+        method: method.as_str().to_string(),
+        path: format!("/v1/{path}"),
+        model: model.to_string(),
+        provider_id: candidate.provider.id.clone(),
+        provider_name: candidate.provider.name.clone(),
+        provider_order: candidate.route_order,
+        upstream_chain: upstream_chain.to_vec(),
+        status_code,
+        route_result: if route_attempts > 1 {
+            format!("切换 {} 次", route_attempts - 1)
+        } else if error.is_some() {
+            "未完成".to_string()
+        } else {
+            "直连".to_string()
+        },
+        route_attempts,
+        error,
+        start: Instant::now(),
+    }
+}
+
+impl futures_util::Stream for RouteStreamState {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.stream.poll_next_unpin(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                if self.first_byte_ms.is_none() {
+                    self.first_byte_ms = Some(self.pending.start.elapsed().as_millis() as u64);
+                }
+                if self.captured_text.len() < 512 * 1024 {
+                    self.captured_text
+                        .push_str(&String::from_utf8_lossy(bytes.as_ref()));
+                }
+                std::task::Poll::Ready(Some(Ok(bytes)))
+            }
+            std::task::Poll::Ready(Some(Err(err))) => {
+                if !self.finished {
+                    self.finished = true;
+                    self.pending.error = Some(format!("读取上游流失败: {err}"));
+                    let pending = self.pending.clone();
+                    finish_route_log(
+                        pending,
+                        false,
+                        usage_from_response_text(&self.captured_text),
+                        self.first_byte_ms,
+                    );
+                }
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(err))))
+            }
+            std::task::Poll::Ready(None) => {
+                if !self.finished {
+                    self.finished = true;
+                    let pending = self.pending.clone();
+                    finish_route_log(
+                        pending,
+                        self.status_success,
+                        usage_from_response_text(&self.captured_text),
+                        self.first_byte_ms,
+                    );
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 async fn proxy_request(
@@ -1286,7 +1666,7 @@ async fn proxy_request(
     Path(path): Path<String>,
     body: Body,
 ) -> Response {
-    let (router, provider, base_url, token) = match upstream_config() {
+    let (router, candidates) = match upstream_candidates() {
         Ok(config) => config,
         Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
     };
@@ -1298,60 +1678,158 @@ async fn proxy_request(
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let upstream_url = join_url(&base_url, &path) + &query;
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
     };
+    let model = model_from_request_body(&body_bytes);
 
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(method) => method,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("请求方法无效: {err}")),
     };
-    let mut request = proxy_state
-        .client
-        .request(reqwest_method, upstream_url)
-        .body(body_bytes);
 
-    for (name, value) in headers.iter() {
-        if name == AUTHORIZATION || name == HOST || name == CONTENT_LENGTH {
-            continue;
-        }
-        request = request.header(name.as_str(), value.as_bytes());
-    }
-    request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+    let mut upstream_chain = Vec::new();
+    let mut last_error = String::new();
+    for (attempt_index, candidate) in candidates.iter().enumerate() {
+        upstream_chain.push(candidate.provider.name.clone());
+        let upstream_url = join_url(&candidate.base_url, &path) + &query;
+        let mut request = proxy_state
+            .client
+            .request(reqwest_method.clone(), upstream_url)
+            .body(body_bytes.clone());
 
-    let upstream = match request.send().await {
-        Ok(response) => response,
-        Err(err) => {
-            return proxy_error(
-                StatusCode::BAD_GATEWAY,
-                format!("转发到 {} 失败: {err}", provider.name),
-            )
-        }
-    };
-
-    let status =
-        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut builder = Response::builder().status(status);
-    if let Some(headers_mut) = builder.headers_mut() {
-        for (name, value) in upstream.headers().iter() {
-            if name == CONTENT_LENGTH {
+        for (name, value) in headers.iter() {
+            if name == AUTHORIZATION || name == HOST || name == CONTENT_LENGTH {
                 continue;
             }
-            if let (Ok(header_name), Ok(header_value)) = (
-                HeaderName::from_bytes(name.as_str().as_bytes()),
-                HeaderValue::from_bytes(value.as_bytes()),
-            ) {
-                headers_mut.insert(header_name, header_value);
+            request = request.header(name.as_str(), value.as_bytes());
+        }
+        request = request.header(AUTHORIZATION, format!("Bearer {}", candidate.token));
+
+        let upstream = match request.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                last_error = format!("转发到 {} 失败: {err}", candidate.provider.name);
+                if attempt_index + 1 < candidates.len() {
+                    continue;
+                }
+                let pending = build_pending_route_log(
+                    candidate,
+                    &method,
+                    &path,
+                    &model,
+                    &upstream_chain,
+                    None,
+                    attempt_index + 1,
+                    Some(last_error.clone()),
+                );
+                finish_route_log(pending, false, TokenUsage::default(), None);
+                return proxy_error(StatusCode::BAD_GATEWAY, last_error);
+            }
+        };
+
+        let status =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let should_retry = matches!(status.as_u16(), 429 | 500..=599)
+            && attempt_index + 1 < candidates.len();
+        if should_retry {
+            last_error = format!("{} 返回 {}", candidate.provider.name, status.as_u16());
+            continue;
+        }
+
+        let pending = build_pending_route_log(
+            candidate,
+            &method,
+            &path,
+            &model,
+            &upstream_chain,
+            Some(status.as_u16()),
+            attempt_index + 1,
+            if status.is_success() {
+                None
+            } else {
+                Some(format!("上游返回 {}", status.as_u16()))
+            },
+        );
+        let status_success = status.is_success();
+        let content_type = upstream
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_lowercase();
+        let is_event_stream = content_type.contains("text/event-stream");
+        let response_headers = upstream.headers().clone();
+
+        if is_event_stream {
+            let mut builder = Response::builder().status(status);
+            if let Some(headers_mut) = builder.headers_mut() {
+                for (name, value) in response_headers.iter() {
+                    if name == CONTENT_LENGTH {
+                        continue;
+                    }
+                    if let (Ok(header_name), Ok(header_value)) = (
+                        HeaderName::from_bytes(name.as_str().as_bytes()),
+                        HeaderValue::from_bytes(value.as_bytes()),
+                    ) {
+                        headers_mut.insert(header_name, header_value);
+                    }
+                }
+            }
+            let stream = RouteStreamState {
+                stream: upstream.bytes_stream().boxed(),
+                pending,
+                status_success,
+                first_byte_ms: None,
+                captured_text: String::new(),
+                finished: false,
+            };
+            return builder
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"));
+        }
+
+        let first_byte_ms = Some(pending.start.elapsed().as_millis() as u64);
+        let bytes = match upstream.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let mut failed = pending;
+                failed.error = Some(format!("读取上游响应失败: {err}"));
+                finish_route_log(failed, false, TokenUsage::default(), first_byte_ms);
+                return proxy_error(StatusCode::BAD_GATEWAY, format!("读取上游响应失败: {err}"));
+            }
+        };
+        let usage = usage_from_response_text(&String::from_utf8_lossy(&bytes));
+        finish_route_log(pending, status_success, usage, first_byte_ms);
+
+        let mut builder = Response::builder().status(status);
+        if let Some(headers_mut) = builder.headers_mut() {
+            for (name, value) in response_headers.iter() {
+                if name == CONTENT_LENGTH {
+                    continue;
+                }
+                if let (Ok(header_name), Ok(header_value)) = (
+                    HeaderName::from_bytes(name.as_str().as_bytes()),
+                    HeaderValue::from_bytes(value.as_bytes()),
+                ) {
+                    headers_mut.insert(header_name, header_value);
+                }
             }
         }
+        return builder
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"));
     }
 
-    let stream = upstream.bytes_stream().map_err(std::io::Error::other);
-    builder
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"))
+    proxy_error(
+        StatusCode::BAD_GATEWAY,
+        if last_error.is_empty() {
+            "没有可用的上游供应商".to_string()
+        } else {
+            last_error
+        },
+    )
 }
 
 async fn proxy_not_found() -> Response {
@@ -1793,6 +2271,324 @@ fn timestamp_to_local_parts(timestamp: DateTime<Utc>) -> (String, String) {
         ),
         format!("{:04}-{:02}", local.year(), local.month()),
     )
+}
+
+fn timestamp_to_route_parts(timestamp_ms: i64) -> (String, String) {
+    let local = DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .unwrap_or_else(Utc::now)
+        .with_timezone(&Local);
+    (
+        format!(
+            "{:04}-{:02}-{:02}",
+            local.year(),
+            local.month(),
+            local.day()
+        ),
+        format!("{:02}:00", local.hour()),
+    )
+}
+
+fn request_id(timestamp_ms: i64) -> String {
+    let sequence = ROUTE_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("req-{timestamp_ms:x}-{sequence:x}")
+}
+
+fn normalize_route_filter_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != "all")
+}
+
+fn read_route_logs() -> Result<Vec<RouteRequestLog>, String> {
+    let path = route_logs_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = fs::File::open(&path)
+        .map_err(|err| format!("无法读取路由日志 {}: {err}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut logs = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|err| format!("无法读取路由日志行: {err}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(log) = serde_json::from_str::<RouteRequestLog>(&line) {
+            logs.push(log);
+        }
+    }
+    logs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+    Ok(logs)
+}
+
+fn append_route_log(log: &RouteRequestLog) -> Result<(), String> {
+    fs::create_dir_all(manager_dir()?).map_err(|err| format!("无法创建管理目录: {err}"))?;
+    let line =
+        serde_json::to_string(log).map_err(|err| format!("无法序列化路由日志: {err}"))?;
+    let path = route_logs_path()?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| format!("无法写入路由日志 {}: {err}", path.display()))?;
+    writeln!(file, "{line}").map_err(|err| format!("无法写入路由日志: {err}"))
+}
+
+fn usage_from_route_log(log: &RouteRequestLog) -> TokenUsage {
+    TokenUsage {
+        input_tokens: log.input_tokens,
+        cached_input_tokens: log.cached_input_tokens,
+        output_tokens: log.output_tokens,
+        reasoning_output_tokens: log.reasoning_output_tokens,
+        total_tokens: log.total_tokens,
+    }
+}
+
+fn route_log_matches_filter(log: &RouteRequestLog, filter: &RouteLogFilter) -> bool {
+    if let Some(query) = normalize_route_filter_text(filter.query.clone()) {
+        let query = query.to_lowercase();
+        let haystack = format!(
+            "{} {} {} {} {} {}",
+            log.id, log.path, log.model, log.provider_name, log.status, log.route_result
+        )
+        .to_lowercase();
+        if !haystack.contains(&query) {
+            return false;
+        }
+    }
+    if let Some(status) = normalize_route_filter_text(filter.status.clone()) {
+        if !log.status.eq_ignore_ascii_case(&status) {
+            return false;
+        }
+    }
+    if let Some(provider_id) = normalize_route_filter_text(filter.provider_id.clone()) {
+        if log.provider_id != provider_id {
+            return false;
+        }
+    }
+    if let Some(provider_name) = normalize_route_filter_text(filter.provider_name.clone()) {
+        if !log.provider_name.eq_ignore_ascii_case(&provider_name) {
+            return false;
+        }
+    }
+    if let Some(model) = normalize_route_filter_text(filter.model.clone()) {
+        if !log.model.eq_ignore_ascii_case(&model) {
+            return false;
+        }
+    }
+    if let Some(start_day) = normalize_route_filter_text(filter.start_day.clone()) {
+        if log.day < start_day {
+            return false;
+        }
+    }
+    if let Some(end_day) = normalize_route_filter_text(filter.end_day.clone()) {
+        if log.day > end_day {
+            return false;
+        }
+    }
+    true
+}
+
+fn add_route_log_usage(summary: &mut UsageSummary, log: &RouteRequestLog) {
+    if summary.request_count == 0 {
+        summary.currency = log.currency.clone();
+    }
+    add_usage(summary, &usage_from_route_log(log), log.estimated_cost);
+}
+
+fn route_available_providers(logs: &[RouteRequestLog]) -> Vec<RouteLogFilterOption> {
+    let mut map = BTreeMap::<String, RouteLogFilterOption>::new();
+    for log in logs {
+        let entry = map
+            .entry(log.provider_id.clone())
+            .or_insert_with(|| RouteLogFilterOption {
+                id: log.provider_id.clone(),
+                name: log.provider_name.clone(),
+                request_count: 0,
+            });
+        entry.name = log.provider_name.clone();
+        entry.request_count += 1;
+    }
+    let mut providers = map.into_values().collect::<Vec<_>>();
+    providers.sort_by(|left, right| {
+        right
+            .request_count
+            .cmp(&left.request_count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    providers
+}
+
+fn route_available_models(logs: &[RouteRequestLog]) -> Vec<String> {
+    let mut models = logs
+        .iter()
+        .map(|log| log.model.clone())
+        .filter(|model| !model.trim().is_empty() && model != "未知模型")
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn route_available_days(logs: &[RouteRequestLog]) -> Vec<String> {
+    let mut days = logs.iter().map(|log| log.day.clone()).collect::<Vec<_>>();
+    days.sort();
+    days.dedup();
+    days
+}
+
+fn route_breakdown_by(
+    logs: &[&RouteRequestLog],
+    key_for: impl Fn(&RouteRequestLog) -> (String, String),
+) -> Vec<RouteUsageBreakdown> {
+    let mut map = BTreeMap::<String, RouteUsageBreakdown>::new();
+    for log in logs {
+        let (key, label) = key_for(log);
+        let entry = map.entry(key.clone()).or_insert_with(|| RouteUsageBreakdown {
+            key,
+            label,
+            request_count: 0,
+            input_tokens: 0,
+            uncached_input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            estimated_cost: 0.0,
+        });
+        entry.request_count += 1;
+        entry.input_tokens += log.input_tokens;
+        entry.uncached_input_tokens += log.uncached_input_tokens;
+        entry.cached_input_tokens += log.cached_input_tokens;
+        entry.output_tokens += log.output_tokens;
+        entry.total_tokens += log.total_tokens;
+        entry.estimated_cost += log.estimated_cost;
+    }
+    let mut rows = map.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .estimated_cost
+            .partial_cmp(&left.estimated_cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.request_count.cmp(&left.request_count))
+    });
+    rows
+}
+
+fn build_route_logs_response(
+    logs: Vec<RouteRequestLog>,
+    filter: RouteLogFilter,
+) -> RouteLogsResponse {
+    let filtered = logs
+        .iter()
+        .filter(|log| route_log_matches_filter(log, &filter))
+        .cloned()
+        .collect::<Vec<_>>();
+    let page_size = normalized_page_size(filter.page_size);
+    let total_pages = filtered.len().div_ceil(page_size).max(1);
+    let page = filter.page.unwrap_or(1).clamp(1, total_pages);
+    let start = (page - 1) * page_size;
+    let page_logs = filtered
+        .iter()
+        .skip(start)
+        .take(page_size)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    RouteLogsResponse {
+        logs: page_logs,
+        total: filtered.len(),
+        page,
+        page_size,
+        total_pages,
+        available_providers: route_available_providers(&logs),
+        available_models: route_available_models(&logs),
+        available_days: route_available_days(&logs),
+    }
+}
+
+fn build_route_usage_stats(
+    logs: Vec<RouteRequestLog>,
+    filter: RouteLogFilter,
+) -> Result<RouteUsageStats, String> {
+    let filtered = logs
+        .iter()
+        .filter(|log| route_log_matches_filter(log, &filter))
+        .collect::<Vec<_>>();
+    let now = Local::now();
+    let today_key = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
+    let mut summary = UsageSummary::default();
+    let mut today = UsageSummary::default();
+    let mut failed_count = 0;
+    let mut bucket_map = BTreeMap::<String, RouteUsageBucket>::new();
+
+    for log in &filtered {
+        if log.status == "failed" {
+            failed_count += 1;
+        }
+        add_route_log_usage(&mut summary, log);
+        if log.day == today_key {
+            add_route_log_usage(&mut today, log);
+        }
+        let entry = bucket_map
+            .entry(log.hour.clone())
+            .or_insert_with(|| RouteUsageBucket {
+                label: log.hour.clone(),
+                request_count: 0,
+                input_tokens: 0,
+                uncached_input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                estimated_cost: 0.0,
+            });
+        entry.request_count += 1;
+        entry.input_tokens += log.input_tokens;
+        entry.uncached_input_tokens += log.uncached_input_tokens;
+        entry.cached_input_tokens += log.cached_input_tokens;
+        entry.output_tokens += log.output_tokens;
+        entry.total_tokens += log.total_tokens;
+        entry.estimated_cost += log.estimated_cost;
+    }
+
+    let page_size = normalized_page_size(filter.page_size);
+    let total_pages = filtered.len().div_ceil(page_size).max(1);
+    let page = filter.page.unwrap_or(1).clamp(1, total_pages);
+    let start = (page - 1) * page_size;
+    let details = filtered
+        .iter()
+        .skip(start)
+        .take(page_size)
+        .map(|log| (*log).clone())
+        .collect::<Vec<_>>();
+
+    Ok(RouteUsageStats {
+        generated_at_ms: current_epoch_ms()?,
+        filters: filter,
+        summary,
+        today,
+        failed_count,
+        buckets: bucket_map.into_values().collect(),
+        providers: route_breakdown_by(&filtered, |log| {
+            (log.provider_id.clone(), log.provider_name.clone())
+        }),
+        models: route_breakdown_by(&filtered, |log| {
+            let model = if log.model.trim().is_empty() {
+                "未知模型".to_string()
+            } else {
+                log.model.clone()
+            };
+            (model.clone(), model)
+        }),
+        details,
+        total: filtered.len(),
+        page,
+        page_size,
+        total_pages,
+        available_providers: route_available_providers(&logs),
+        available_models: route_available_models(&logs),
+        available_days: route_available_days(&logs),
+    })
 }
 
 fn parse_event_timestamp(value: &Value) -> Option<DateTime<Utc>> {
@@ -2889,6 +3685,24 @@ fn load_usage_stats(
 }
 
 #[tauri::command]
+fn load_route_logs(payload: Option<LoadRouteLogsPayload>) -> Result<RouteLogsResponse, String> {
+    let filter = payload
+        .and_then(|payload| payload.filter)
+        .unwrap_or_default();
+    Ok(build_route_logs_response(read_route_logs()?, filter))
+}
+
+#[tauri::command]
+fn load_route_usage_stats(
+    payload: Option<LoadRouteLogsPayload>,
+) -> Result<RouteUsageStats, String> {
+    let filter = payload
+        .and_then(|payload| payload.filter)
+        .unwrap_or_default();
+    build_route_usage_stats(read_route_logs()?, filter)
+}
+
+#[tauri::command]
 async fn query_provider_balance(
     payload: QueryBalancePayload,
     router_runtime: tauri::State<'_, RouterRuntime>,
@@ -2937,6 +3751,8 @@ pub fn run() {
             save_router_config,
             apply_config,
             load_usage_stats,
+            load_route_logs,
+            load_route_usage_stats,
             query_provider_balance
         ])
         .run(tauri::generate_context!())

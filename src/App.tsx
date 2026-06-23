@@ -80,78 +80,100 @@ type UsageSummary = {
   currency: string;
 };
 
-type UsageProviderPoint = {
-  provider_key: string;
+type RouteRequestLog = {
+  id: string;
+  started_at_ms: number;
+  day: string;
+  hour: string;
+  method: string;
+  path: string;
+  model: string;
+  provider_id: string;
   provider_name: string;
+  provider_order: number;
+  upstream_chain: string[];
+  status: "success" | "failed" | "running" | "cancelled" | string;
+  status_code?: number | null;
+  error?: string | null;
+  route_result: string;
+  route_attempts: number;
+  input_tokens: number;
+  uncached_input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+  estimated_cost: number;
+  currency: string;
+  cost_breakdown: string;
+  pricing_model_match: string;
+  pricing_source: string;
+  first_byte_ms?: number | null;
+  total_ms: number;
+};
+
+type RouteLogFilter = {
+  query?: string;
+  status?: string;
+  provider_id?: string;
+  provider_name?: string;
+  model?: string;
+  start_day?: string;
+  end_day?: string;
+  page?: number;
+  page_size?: number;
+};
+
+type RouteLogFilterOption = {
+  id: string;
+  name: string;
+  request_count: number;
+};
+
+type RouteLogsResponse = {
+  logs: RouteRequestLog[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+  available_providers: RouteLogFilterOption[];
+  available_models: string[];
+  available_days: string[];
+};
+
+type RouteUsageBucket = {
+  label: string;
   request_count: number;
   input_tokens: number;
   uncached_input_tokens: number;
   cached_input_tokens: number;
   output_tokens: number;
-  reasoning_output_tokens: number;
   total_tokens: number;
   estimated_cost: number;
-  known: boolean;
 };
 
-type UsageDetailRow = {
-  timestamp: string;
-  day: string;
-  session_id: string;
-  provider_key: string;
-  provider_name: string;
-  model: string;
-  input_tokens: number;
-  uncached_input_tokens: number;
-  cached_input_tokens: number;
-  output_tokens: number;
-  reasoning_output_tokens: number;
-  total_tokens: number;
-  estimated_cost: number;
-  cost_breakdown: string;
-  pricing_model_match: string;
-  pricing_source: string;
-  currency: string;
-  source: string;
+type RouteUsageBreakdown = RouteUsageBucket & {
+  key: string;
+  label: string;
 };
 
-type UsageStats = {
+type RouteUsageStats = {
   generated_at_ms: number;
-  source_dir: string;
-  filters: Record<string, unknown>;
+  filters: RouteLogFilter;
   summary: UsageSummary;
   today: UsageSummary;
-  this_month: UsageSummary;
-  daily: Array<{
-    day: string;
-    request_count: number;
-    total_tokens: number;
-    estimated_cost: number;
-    providers: UsageProviderPoint[];
-  }>;
-  monthly: Array<{
-    month: string;
-    request_count: number;
-    total_tokens: number;
-    estimated_cost: number;
-  }>;
-  providers: UsageProviderPoint[];
-  details: UsageDetailRow[];
-  available_providers: Array<{
-    provider_key: string;
-    provider_name: string;
-    request_count: number;
-    known: boolean;
-  }>;
+  failed_count: number;
+  buckets: RouteUsageBucket[];
+  providers: RouteUsageBreakdown[];
+  models: RouteUsageBreakdown[];
+  details: RouteRequestLog[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+  available_providers: RouteLogFilterOption[];
   available_models: string[];
   available_days: string[];
-  unknown_provider_count: number;
-  parsed_files: number;
-  parsed_events: number;
-  filtered_events: number;
-  detail_page: number;
-  detail_page_size: number;
-  detail_total_pages: number;
 };
 
 type AppState = {
@@ -169,8 +191,10 @@ type AppState = {
   router_status: RouterStatus;
 };
 
-type Screen = "dashboard" | "providers" | "usage" | "requests" | "settings";
+type Screen = "dashboard" | "route" | "providers" | "usage" | "requests" | "settings";
 type EditorTab = "base" | "balance" | "route";
+type TimeRange = "today" | "week" | "month" | "all";
+type TrendMetric = "cost" | "tokens" | "requests";
 
 const isTauriRuntime = "__TAURI_INTERNALS__" in window;
 
@@ -242,6 +266,125 @@ function formatCompact(value: number) {
   return Math.round(value || 0).toLocaleString("zh-CN");
 }
 
+function dateKey(date: Date) {
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function filterForRange(range: TimeRange): Pick<RouteLogFilter, "start_day" | "end_day"> {
+  if (range === "all") return { start_day: undefined, end_day: undefined };
+  const end = new Date();
+  const start = new Date(end);
+  if (range === "week") start.setDate(end.getDate() - 6);
+  if (range === "month") start.setDate(1);
+  return { start_day: dateKey(start), end_day: dateKey(end) };
+}
+
+function rangeLabel(range: TimeRange) {
+  if (range === "today") return "今日";
+  if (range === "week") return "本周";
+  if (range === "month") return "本月";
+  return "全部";
+}
+
+function trendMetricLabel(metric: TrendMetric) {
+  if (metric === "cost") return "费用";
+  if (metric === "tokens") return "Token";
+  return "请求";
+}
+
+function trendBucketValue(bucket: Pick<RouteUsageBucket, "estimated_cost" | "total_tokens" | "request_count">, metric: TrendMetric) {
+  if (metric === "cost") return bucket.estimated_cost;
+  if (metric === "tokens") return bucket.total_tokens;
+  return bucket.request_count;
+}
+
+function formatTrendValue(value: number, metric: TrendMetric) {
+  if (metric === "cost") return formatMoney(value);
+  if (metric === "tokens") return `${formatCompact(value)} Token`;
+  return `${Math.round(value)} 次`;
+}
+
+function formatTokenTriplet(log: RouteRequestLog) {
+  if (!log.total_tokens) return "-";
+  return `${formatCompact(log.uncached_input_tokens)} / ${formatCompact(log.cached_input_tokens)} / ${formatCompact(log.output_tokens)}`;
+}
+
+function formatMs(value?: number | null) {
+  if (value == null) return "-";
+  if (value >= 1000) return `${(value / 1000).toFixed(value >= 10_000 ? 1 : 1)} s`;
+  return `${Math.round(value)} ms`;
+}
+
+function formatDuration(value: number) {
+  if (value >= 1000) return `${(value / 1000).toFixed(1)} s`;
+  return `${Math.round(value)} ms`;
+}
+
+function formatLogTime(value: number) {
+  if (!value) return "--:--:--";
+  return new Date(value).toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+function statusMeta(status: string) {
+  if (status === "success") return { label: "成功", tone: "ok" };
+  if (status === "failed") return { label: "失败", tone: "danger" };
+  if (status === "cancelled") return { label: "已取消", tone: "amber" };
+  return { label: "进行中", tone: "cyan" };
+}
+
+function routeResultTone(result: string) {
+  if (result.includes("切换")) return "amber";
+  if (result.includes("未完成") || result.includes("重试")) return "danger";
+  return "ok";
+}
+
+function csvEscape(value: string | number | null | undefined) {
+  const text = String(value ?? "");
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function exportRouteLogsCsv(logs: RouteRequestLog[]) {
+  const headers = [
+    "时间",
+    "状态",
+    "模型",
+    "供应商",
+    "Token",
+    "首字延迟",
+    "总耗时",
+    "官方估算",
+    "路由结果",
+    "错误",
+  ];
+  const rows = logs.map((log) => [
+    new Date(log.started_at_ms).toLocaleString("zh-CN"),
+    statusMeta(log.status).label,
+    log.model,
+    log.provider_name,
+    log.total_tokens,
+    log.first_byte_ms ?? "",
+    log.total_ms,
+    log.estimated_cost.toFixed(6),
+    log.route_result,
+    log.error ?? "",
+  ]);
+  const csv = [headers, ...rows].map((row) => row.map(csvEscape).join(",")).join("\n");
+  const url = URL.createObjectURL(new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `codex-helper-route-logs-${Date.now()}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 function formatBalanceForCard(label: string) {
   if (!label || label === "未配置") return "未配置";
   return label.replace(/^账户余额\s*/, "").replace(/^Key额度\s*/, "").replace(/^余额\s*/, "");
@@ -286,9 +429,72 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>) {
   throw new Error(`当前环境不支持命令：${command}`);
 }
 
-function NavIcon({ type }: { type: Screen | "route" }) {
-  const className = `nav-glyph ${type}`;
-  return <span className={className} />;
+function NavIcon({ type }: { type: Screen }) {
+  const common = {
+    fill: "none",
+    stroke: "currentColor",
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    strokeWidth: 1.8,
+    viewBox: "0 0 24 24",
+  };
+  return (
+    <svg aria-hidden="true" className="nav-glyph" {...common}>
+      {type === "dashboard" && (
+        <>
+          <rect height="6" rx="1.2" width="6" x="3.5" y="3.5" />
+          <rect height="6" rx="1.2" width="6" x="14.5" y="3.5" />
+          <rect height="6" rx="1.2" width="6" x="3.5" y="14.5" />
+          <rect height="6" rx="1.2" width="6" x="14.5" y="14.5" />
+        </>
+      )}
+      {type === "route" && (
+        <>
+          <circle cx="5" cy="12" r="2.2" />
+          <circle cx="19" cy="5.5" r="2.2" />
+          <circle cx="19" cy="18.5" r="2.2" />
+          <path d="M7.2 11.1 16.9 6.5" />
+          <path d="M7.2 12.9 16.9 17.5" />
+        </>
+      )}
+      {type === "providers" && (
+        <>
+          <rect height="16" rx="2" width="14" x="5" y="4" />
+          <path d="M8.5 8h7" />
+          <path d="M8.5 12h7" />
+          <path d="M8.5 16h4" />
+        </>
+      )}
+      {type === "usage" && (
+        <>
+          <path d="M4 19V5" />
+          <path d="M4 19h16" />
+          <path d="m7 15 3.5-4 3 2.5L19 7" />
+        </>
+      )}
+      {type === "requests" && (
+        <>
+          <rect height="16" rx="2" width="14" x="5" y="4" />
+          <path d="M8.5 8.5h7" />
+          <path d="M8.5 12h5.5" />
+          <path d="M8.5 15.5h7" />
+        </>
+      )}
+      {type === "settings" && (
+        <>
+          <circle cx="12" cy="12" r="3" />
+          <path d="M12 2.8v3" />
+          <path d="M12 18.2v3" />
+          <path d="m4.2 4.2 2.1 2.1" />
+          <path d="m17.7 17.7 2.1 2.1" />
+          <path d="M2.8 12h3" />
+          <path d="M18.2 12h3" />
+          <path d="m4.2 19.8 2.1-2.1" />
+          <path d="m17.7 6.3 2.1-2.1" />
+        </>
+      )}
+    </svg>
+  );
 }
 
 function Toggle({
@@ -324,7 +530,16 @@ function StatusPill({ ok }: { ok: boolean }) {
 
 function App() {
   const [appState, setAppState] = useState<AppState | null>(null);
-  const [usageStats, setUsageStats] = useState<UsageStats | null>(null);
+  const [routeUsageStats, setRouteUsageStats] = useState<RouteUsageStats | null>(null);
+  const [routeLogs, setRouteLogs] = useState<RouteLogsResponse | null>(null);
+  const [usageRange, setUsageRange] = useState<TimeRange>("today");
+  const [usageFilter, setUsageFilter] = useState<RouteLogFilter>(() => ({
+    model: "",
+    page_size: 20,
+    ...filterForRange("today"),
+  }));
+  const [trendMetric, setTrendMetric] = useState<TrendMetric>("cost");
+  const [requestFilter, setRequestFilter] = useState<RouteLogFilter>({ model: "", page_size: 20 });
   const [screen, setScreen] = useState<Screen>("dashboard");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -355,22 +570,29 @@ function App() {
     }
   }
 
-  async function refresh(forceUsage = false) {
+  async function refreshRouteUsage(filter = usageFilter) {
+    const usage = await callCommand<RouteUsageStats>("load_route_usage_stats", {
+      payload: { filter },
+    });
+    setRouteUsageStats(usage);
+  }
+
+  async function refreshRouteLogs(filter = requestFilter) {
+    const logs = await callCommand<RouteLogsResponse>("load_route_logs", {
+      payload: { filter },
+    });
+    setRouteLogs(logs);
+  }
+
+  async function refresh() {
     const state = await callCommand<AppState>("load_app_state");
     setAppState(state);
     setRouterDraft(state.router ?? defaultRouterConfig());
-    if (forceUsage || !usageStats) {
-      try {
-        const usage = await callCommand<UsageStats>("load_usage_stats", {
-          payload: {
-            filter: {},
-            force_refresh: forceUsage,
-          },
-        });
-        setUsageStats(usage);
-      } catch {
-        setUsageStats(null);
-      }
+    try {
+      await Promise.all([refreshRouteUsage(), refreshRouteLogs()]);
+    } catch {
+      setRouteUsageStats(null);
+      setRouteLogs(null);
     }
   }
 
@@ -387,28 +609,22 @@ function App() {
     );
   }, [appState]);
 
-  const routeEnabledCount = appState?.providers.filter((provider) => provider.enabled).length ?? 0;
-  const requestCount = usageStats?.summary.request_count ?? 0;
-  const officialCost = usageStats?.summary.estimated_cost ?? 0;
-  const uncachedInput = usageStats?.summary.uncached_input_tokens ?? 0;
-  const cachedInput = usageStats?.summary.cached_input_tokens ?? 0;
-  const outputTokens = usageStats?.summary.output_tokens ?? 0;
-  const totalTokens = usageStats?.summary.total_tokens ?? 0;
-  const topModels = usageStats?.details.reduce<Record<string, UsageDetailRow[]>>((acc, row) => {
-    const key = row.model || "其他";
-    acc[key] = [...(acc[key] ?? []), row];
-    return acc;
-  }, {});
-  const modelRows = Object.entries(topModels ?? {})
-    .map(([model, rows]) => ({
-      model,
-      requests: rows.length,
-      tokens: rows.reduce((sum, row) => sum + row.total_tokens, 0),
-      cost: rows.reduce((sum, row) => sum + row.estimated_cost, 0),
+  const requestCount = routeUsageStats?.summary.request_count ?? 0;
+  const officialCost = routeUsageStats?.summary.estimated_cost ?? 0;
+  const uncachedInput = routeUsageStats?.summary.uncached_input_tokens ?? 0;
+  const cachedInput = routeUsageStats?.summary.cached_input_tokens ?? 0;
+  const outputTokens = routeUsageStats?.summary.output_tokens ?? 0;
+  const totalTokens = routeUsageStats?.summary.total_tokens ?? 0;
+  const modelRows = (routeUsageStats?.models ?? [])
+    .map((row) => ({
+      model: row.label,
+      requests: row.request_count,
+      tokens: row.total_tokens,
+      cost: row.estimated_cost,
     }))
-    .sort((a, b) => b.cost - a.cost)
     .slice(0, 3);
-  const successRate = requestCount ? 99.2 : 0;
+  const failedCount = routeUsageStats?.failed_count ?? 0;
+  const successRate = requestCount ? ((requestCount - failedCount) / requestCount) * 100 : 0;
 
   function openProviderEditor(provider?: ProviderSummary, tab: EditorTab = "base") {
     const full =
@@ -536,6 +752,25 @@ function App() {
     await saveRouter(next, true);
   }
 
+  async function applyUsageFilter(patch: Partial<RouteLogFilter>) {
+    const next = { ...usageFilter, ...patch, page: patch.page ?? 1 };
+    setUsageFilter(next);
+    await run(async () => refreshRouteUsage(next));
+  }
+
+  async function applyUsageRange(range: TimeRange) {
+    setUsageRange(range);
+    const next = { ...usageFilter, ...filterForRange(range), page: 1 };
+    setUsageFilter(next);
+    await run(async () => refreshRouteUsage(next));
+  }
+
+  async function applyRequestFilter(patch: Partial<RouteLogFilter>) {
+    const next = { ...requestFilter, ...patch, page: patch.page ?? 1 };
+    setRequestFilter(next);
+    await run(async () => refreshRouteLogs(next));
+  }
+
   function updateBalanceQuery(patch: Partial<BalanceQueryConfig>) {
     setBalanceQuery((current) => {
       const next = { ...current, ...patch };
@@ -584,6 +819,7 @@ function App() {
         <nav className="nav">
           {[
             ["dashboard", "总览"],
+            ["route", "路由"],
             ["providers", "供应商"],
             ["usage", "使用统计"],
             ["requests", "请求记录"],
@@ -608,6 +844,8 @@ function App() {
             <h1>
               {screen === "dashboard"
                 ? "总览"
+                : screen === "route"
+                  ? "路由"
                 : screen === "providers"
                   ? "供应商"
                   : screen === "usage"
@@ -619,10 +857,12 @@ function App() {
             <p>
               {screen === "dashboard"
                 ? "用量、供应商与请求质量"
+                : screen === "route"
+                  ? "管理 Codex 接管、本地代理与故障转移规则"
                 : screen === "providers"
                   ? "管理上游连接、余额监控与路由顺序"
-                  : screen === "usage"
-                    ? "本机 Codex 使用情况"
+                : screen === "usage"
+                    ? "分析本地路由后的 Token、费用与供应商使用情况"
                     : screen === "requests"
                       ? "经 Codex Helper 转发的请求"
                       : "本地网关运行参数"}
@@ -642,14 +882,29 @@ function App() {
             activeProvider={activeProvider}
             cachedInput={cachedInput}
             modelRows={modelRows}
+            onRangeChange={applyUsageRange}
+            onTrendMetricChange={setTrendMetric}
             officialCost={officialCost}
             outputTokens={outputTokens}
             providers={appState.providers}
             requestCount={requestCount}
-            routeEnabledCount={routeEnabledCount}
+            stats={routeUsageStats}
             successRate={successRate}
+            timeRange={usageRange}
             totalTokens={totalTokens}
+            trendMetric={trendMetric}
             uncachedInput={uncachedInput}
+          />
+        )}
+
+        {screen === "route" && (
+          <RouteScreen
+            appState={appState}
+            busy={busy}
+            routerDraft={routerDraft}
+            routerOn={routerOn}
+            setRouterDraft={setRouterDraft}
+            onSaveRouter={saveRouter}
           />
         )}
 
@@ -666,35 +921,25 @@ function App() {
         )}
 
         {screen === "usage" && (
-          <section className="page-panel">
-            <div className="panel-head">
-              <div>
-                <h2>使用统计</h2>
-                <p>保留现有本机 Codex 统计能力，当前重构先聚焦网关 UI。</p>
-              </div>
-              <button className="ghost" onClick={() => refresh(true)} type="button">
-                重新统计
-              </button>
-            </div>
-            <div className="usage-table">
-              {(usageStats?.details ?? []).slice(0, 12).map((row) => (
-                <div className="usage-row" key={`${row.timestamp}-${row.session_id}`}>
-                  <span>{row.timestamp}</span>
-                  <strong>{row.model || "未知模型"}</strong>
-                  <span>{row.provider_name}</span>
-                  <span>{formatCompact(row.total_tokens)} Token</span>
-                  <b>{formatMoney(row.estimated_cost, row.currency)}</b>
-                </div>
-              ))}
-            </div>
-          </section>
+          <UsageScreen
+            filter={usageFilter}
+            onFilter={applyUsageFilter}
+            onRangeChange={applyUsageRange}
+            onRefresh={() => run(() => refreshRouteUsage(usageFilter))}
+            onTrendMetricChange={setTrendMetric}
+            stats={routeUsageStats}
+            timeRange={usageRange}
+            trendMetric={trendMetric}
+          />
         )}
 
         {screen === "requests" && (
-          <section className="page-panel empty-panel">
-            <h2>请求记录</h2>
-            <p>请求记录入口已按新 UI 保留；后续接入本地路由实时转发日志。</p>
-          </section>
+          <RequestLogsScreen
+            filter={requestFilter}
+            logs={routeLogs}
+            onFilter={applyRequestFilter}
+            onRefresh={() => run(() => refreshRouteLogs(requestFilter))}
+          />
         )}
 
         {screen === "settings" && (
@@ -702,50 +947,14 @@ function App() {
             <article className="page-panel">
               <div className="panel-head">
                 <div>
-                  <h2>本地网关</h2>
-                  <p>只控制 Codex 是否连接到本机路由，不修改其他 config.toml 内容。</p>
+                  <h2>设置</h2>
+                  <p>通用偏好设置入口。路由接管与本地代理配置已移动到路由页。</p>
                 </div>
-                <Toggle checked={routerDraft.enabled} onChange={(enabled) => setRouterDraft({ ...routerDraft, enabled })} />
               </div>
-              <label className="field">
-                <span>监听地址</span>
-                <input
-                  value={routerDraft.host}
-                  onChange={(event) => setRouterDraft({ ...routerDraft, host: event.currentTarget.value })}
-                />
-              </label>
-              <label className="field">
-                <span>端口</span>
-                <input
-                  inputMode="numeric"
-                  value={String(routerDraft.port)}
-                  onChange={(event) =>
-                    setRouterDraft({
-                      ...routerDraft,
-                      port: Number(event.currentTarget.value.replace(/\D/g, "")) || 0,
-                    })
-                  }
-                />
-              </label>
-              <label className="field">
-                <span>本地访问令牌</span>
-                <input
-                  value={routerDraft.local_token}
-                  onChange={(event) =>
-                    setRouterDraft({ ...routerDraft, local_token: event.currentTarget.value })
-                  }
-                />
-              </label>
-              <div className="route-preview">
-                <span>Codex 将连接</span>
-                <strong>{routeBaseUrl(routerDraft)}</strong>
-              </div>
-              <div className="button-row">
-                <button className="ghost" onClick={() => saveRouter(routerDraft)} type="button">
-                  保存设置
-                </button>
-                <button className="primary" onClick={() => saveRouter(routerDraft, true)} type="button">
-                  保存并接管
+              <div className="settings-placeholder">
+                <span>当前暂无额外设置</span>
+                <button className="ghost" onClick={() => setScreen("route")} type="button">
+                  打开路由配置
                 </button>
               </div>
             </article>
@@ -781,51 +990,514 @@ function App() {
   );
 }
 
+function RouteScreen({
+  appState,
+  busy,
+  onSaveRouter,
+  routerDraft,
+  routerOn,
+  setRouterDraft,
+}: {
+  appState: AppState;
+  busy: boolean;
+  onSaveRouter: (nextRouter: RouterConfig, apply?: boolean) => Promise<void>;
+  routerDraft: RouterConfig;
+  routerOn: boolean;
+  setRouterDraft: (router: RouterConfig) => void;
+}) {
+  return (
+    <section className="route-page">
+      <div className="section-title">
+        <h2>路由配置</h2>
+        <button className="ghost">测试完整链路</button>
+      </div>
+
+      <div className="route-config-grid">
+        <article className="route-card route-codex-card">
+          <div className="route-card-head">
+            <h3>Codex 接管</h3>
+            <span className={`state-pill ${routerOn ? "ok" : "warn"}`}>
+              <span />
+              {routerOn ? "已接管" : "未接管"}
+            </span>
+          </div>
+          <label className="compact-field">
+            <span>配置文件</span>
+            <div className="copy-field">
+              <strong>{appState.codex_config_path}</strong>
+              <button className="ghost small">打开文件</button>
+            </div>
+          </label>
+          <label className="compact-field">
+            <span>当前接管地址</span>
+            <div className="copy-field accent">
+              <strong>{routeBaseUrl(routerDraft)}</strong>
+              <button className="ghost small">复制</button>
+            </div>
+          </label>
+          <div className="route-diff-row">
+            <span>openai_base_url → 本地代理地址</span>
+            <button className="ghost small">查看变更</button>
+            <button className="ghost small warn-text">恢复原配置</button>
+          </div>
+        </article>
+
+        <article className="route-card">
+          <div className="route-card-head">
+            <h3>本地代理</h3>
+            <span className={`state-pill ${routerOn ? "ok" : "warn"}`}>
+              <span />
+              {routerOn ? "运行中" : "未运行"}
+            </span>
+          </div>
+          <div className="route-form-grid">
+            <label className="compact-field">
+              <span>监听地址</span>
+              <input
+                value={routerDraft.host}
+                onChange={(event) => setRouterDraft({ ...routerDraft, host: event.currentTarget.value })}
+              />
+            </label>
+            <label className="compact-field">
+              <span>监听端口</span>
+              <input
+                inputMode="numeric"
+                value={String(routerDraft.port)}
+                onChange={(event) =>
+                  setRouterDraft({
+                    ...routerDraft,
+                    port: Number(event.currentTarget.value.replace(/\D/g, "")) || 0,
+                  })
+                }
+              />
+            </label>
+          </div>
+          <div className="route-toggle-line">
+            <div>
+              <strong>启动程序后自动运行代理</strong>
+            </div>
+            <Toggle
+              checked={routerDraft.enabled}
+              disabled={busy}
+              onChange={(enabled) => setRouterDraft({ ...routerDraft, enabled })}
+            />
+          </div>
+          <div className="route-toggle-line">
+            <div>
+              <strong>允许局域网访问</strong>
+              <p>关闭时仅本机可以连接</p>
+            </div>
+            <Toggle checked={routerDraft.host !== "127.0.0.1"} onChange={() => undefined} />
+          </div>
+        </article>
+      </div>
+
+      <article className="route-card route-rules-card">
+        <div className="panel-head">
+          <div>
+            <h2>转发规则</h2>
+            <p>请求按照供应商列表中的顺序选择可用上游。</p>
+          </div>
+        </div>
+        <div className="routing-mode">
+          <span>当前路由方式</span>
+          <strong>按供应商顺序故障转移</strong>
+          <button className="ghost small">由供应商列表顺序决定</button>
+        </div>
+        <div className="route-rule-line">
+          <div>
+            <strong>会话固定</strong>
+            <p>同一 Codex 会话优先继续使用当前供应商</p>
+          </div>
+          <Toggle checked onChange={() => undefined} />
+        </div>
+        <div className="route-rule-line">
+          <div>
+            <strong>余额不足时自动跳过</strong>
+            <p>供应商余额低于其配置阈值时不再分配新请求</p>
+          </div>
+          <Toggle checked onChange={() => undefined} />
+        </div>
+        <button className="route-strategy-row" type="button">
+          <strong>故障转移策略</strong>
+          <span>网络错误、超时、429、5xx · 连续失败 3 次 · 冷却 60 秒</span>
+          <b>›</b>
+        </button>
+      </article>
+
+      <div className="route-footer-actions">
+        <button className="ghost" onClick={() => setRouterDraft(appState.router)} type="button">
+          恢复默认
+        </button>
+        <button className="primary" disabled={busy} onClick={() => onSaveRouter(routerDraft, true)} type="button">
+          保存修改
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function UsageScreen({
+  filter,
+  onFilter,
+  onRangeChange,
+  onRefresh,
+  onTrendMetricChange,
+  stats,
+  timeRange,
+  trendMetric,
+}: {
+  filter: RouteLogFilter;
+  onFilter: (patch: Partial<RouteLogFilter>) => Promise<void>;
+  onRangeChange: (range: TimeRange) => Promise<void>;
+  onRefresh: () => void;
+  onTrendMetricChange: (metric: TrendMetric) => void;
+  stats: RouteUsageStats | null;
+  timeRange: TimeRange;
+  trendMetric: TrendMetric;
+}) {
+  const summary = stats?.summary ?? {
+    request_count: 0,
+    input_tokens: 0,
+    uncached_input_tokens: 0,
+    cached_input_tokens: 0,
+    output_tokens: 0,
+    reasoning_output_tokens: 0,
+    total_tokens: 0,
+    estimated_cost: 0,
+    currency: "USD",
+  };
+  const trendBuckets = stats?.buckets.length
+    ? stats.buckets
+    : [{ label: "00:00", estimated_cost: 0, total_tokens: 0, request_count: 0 }];
+  const maxTrendValue = Math.max(...trendBuckets.map((bucket) => trendBucketValue(bucket, trendMetric)), 1);
+  const totalCost = summary.estimated_cost || 1;
+
+  return (
+    <section className="usage-page">
+      <div className="section-title">
+        <h2>统计概览</h2>
+        <button className="ghost" onClick={onRefresh} type="button">
+          重新统计
+        </button>
+      </div>
+
+      <div className="usage-filter-bar">
+        <div className="range-tabs">
+          {(["today", "week", "month", "all"] as TimeRange[]).map((range) => (
+            <button
+              className={timeRange === range ? "active" : ""}
+              key={range}
+              onClick={() => onRangeChange(range)}
+              type="button"
+            >
+              {rangeLabel(range)}
+            </button>
+          ))}
+        </div>
+        <select value={filter.provider_id ?? ""} onChange={(event) => onFilter({ provider_id: event.currentTarget.value })}>
+          <option value="">全部供应商</option>
+          {(stats?.available_providers ?? []).map((provider) => (
+            <option key={provider.id} value={provider.id}>{provider.name}</option>
+          ))}
+        </select>
+        <select value={filter.model ?? ""} onChange={(event) => onFilter({ model: event.currentTarget.value })}>
+          <option value="">全部模型</option>
+          {(stats?.available_models ?? []).map((model) => (
+            <option key={model} value={model}>{model}</option>
+          ))}
+        </select>
+        <button className="ghost">按小时聚合</button>
+        <small>本程序路由日志</small>
+      </div>
+
+      <div className="metric-grid">
+        <Metric title="官方估算成本" value={formatMoney(summary.estimated_cost, summary.currency)} tone="purple" sub="按官方 API 价格" />
+        <Metric title="非缓存输入" value={formatCompact(summary.uncached_input_tokens)} tone="cyan" sub={`${formatCompact(summary.input_tokens)} 输入`} />
+        <Metric title="缓存输入" value={formatCompact(summary.cached_input_tokens)} tone="blue" sub="路由后统计" />
+        <Metric title="输出 Token" value={formatCompact(summary.output_tokens)} tone="amber" sub="今日累计" />
+        <Metric title="请求数" value={String(summary.request_count)} tone="green" sub={`成功 ${(stats?.details ?? []).filter((log) => log.status === "success").length}`} />
+      </div>
+
+      <div className="usage-main-grid">
+        <article className="card route-trend-card">
+          <div className="card-head">
+            <div>
+              <h3>使用趋势</h3>
+              <p>{trendMetricLabel(trendMetric)} · {rangeLabel(timeRange)} · 按小时聚合</p>
+            </div>
+            <div className="mini-tabs">
+              {(["cost", "tokens", "requests"] as TrendMetric[]).map((metric) => (
+                <button
+                  className={trendMetric === metric ? "active" : ""}
+                  key={metric}
+                  onClick={() => onTrendMetricChange(metric)}
+                  type="button"
+                >
+                  {trendMetricLabel(metric)}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="line-chart">
+            {trendBuckets.map((bucket, index) => {
+              const value = trendBucketValue(bucket, trendMetric);
+              return (
+                <span
+                  key={`${bucket.label}-${index}`}
+                  style={{ height: `${Math.max(6, (value / maxTrendValue) * 100)}%` }}
+                  title={`${bucket.label} ${formatTrendValue(value, trendMetric)}`}
+                />
+              );
+            })}
+          </div>
+          <div className="chart-labels dense">
+            {(stats?.buckets ?? []).slice(0, 12).map((bucket) => <span key={bucket.label}>{bucket.label.replace(":00", "")}</span>)}
+          </div>
+        </article>
+
+        <article className="card cost-distribution">
+          <div className="card-head">
+            <div>
+              <h3>费用分布</h3>
+              <p>按模型与供应商</p>
+            </div>
+            <div className="mini-tabs">
+              <button className="active">按模型</button>
+              <button>按供应商</button>
+            </div>
+          </div>
+          {(stats?.models ?? []).slice(0, 4).map((row) => (
+            <div className="distribution-row" key={row.key}>
+              <div>
+                <strong>{row.label}</strong>
+                <b>{formatMoney(row.estimated_cost)}</b>
+              </div>
+              <span><i style={{ width: `${Math.max(3, (row.estimated_cost / totalCost) * 100)}%` }} /></span>
+              <small>{Math.round((row.estimated_cost / totalCost) * 100)}%</small>
+            </div>
+          ))}
+        </article>
+      </div>
+
+      <article className="route-table-card usage-detail-card">
+        <div className="panel-head">
+          <div>
+            <h2>用量明细</h2>
+            <p>按小时汇总经过 Codex Helper 转发并成功记录用量的请求。</p>
+          </div>
+        </div>
+        <div className="usage-detail-table">
+          <header>
+            <span>时间</span>
+            <span>模型</span>
+            <span>供应商</span>
+            <span>非缓存输入</span>
+            <span>缓存输入</span>
+            <span>输出</span>
+            <span>请求</span>
+            <span>官方估算</span>
+          </header>
+          {(stats?.details ?? []).slice(0, 8).map((log) => (
+            <div key={log.id}>
+              <span>{formatLogTime(log.started_at_ms)}</span>
+              <strong>{log.model}</strong>
+              <span>{log.provider_name}</span>
+              <span>{formatCompact(log.uncached_input_tokens)}</span>
+              <span>{formatCompact(log.cached_input_tokens)}</span>
+              <span>{formatCompact(log.output_tokens)}</span>
+              <b>{log.status === "success" ? 1 : 0}</b>
+              <b>{log.total_tokens ? formatMoney(log.estimated_cost, log.currency) : "-"}</b>
+            </div>
+          ))}
+        </div>
+      </article>
+    </section>
+  );
+}
+
+function RequestLogsScreen({
+  filter,
+  logs,
+  onFilter,
+  onRefresh,
+}: {
+  filter: RouteLogFilter;
+  logs: RouteLogsResponse | null;
+  onFilter: (patch: Partial<RouteLogFilter>) => Promise<void>;
+  onRefresh: () => void;
+}) {
+  const rows = logs?.logs ?? [];
+
+  return (
+    <section className="requests-page">
+      <div className="section-title">
+        <h2>请求列表</h2>
+        <button className="ghost" onClick={() => exportRouteLogsCsv(rows)} type="button">
+          导出 CSV
+        </button>
+      </div>
+      <div className="request-filter-bar">
+        <div className="search-box">
+          <span />
+          <input
+            placeholder="搜索请求 ID 或错误信息"
+            value={filter.query ?? ""}
+            onChange={(event) => onFilter({ query: event.currentTarget.value })}
+          />
+        </div>
+        <select value={filter.status ?? ""} onChange={(event) => onFilter({ status: event.currentTarget.value })}>
+          <option value="">全部状态</option>
+          <option value="success">成功</option>
+          <option value="failed">失败</option>
+        </select>
+        <select value={filter.provider_id ?? ""} onChange={(event) => onFilter({ provider_id: event.currentTarget.value })}>
+          <option value="">全部供应商</option>
+          {(logs?.available_providers ?? []).map((provider) => (
+            <option key={provider.id} value={provider.id}>{provider.name}</option>
+          ))}
+        </select>
+        <select value={filter.model ?? ""} onChange={(event) => onFilter({ model: event.currentTarget.value })}>
+          <option value="">全部模型</option>
+          {(logs?.available_models ?? []).map((model) => (
+            <option key={model} value={model}>{model}</option>
+          ))}
+        </select>
+        <button className="ghost">今日</button>
+        <span>实时刷新</span>
+        <Toggle checked onChange={onRefresh} />
+        <small>共 {logs?.total ?? 0} 条</small>
+      </div>
+
+      <article className="route-table-card request-log-card">
+        <div className="request-log-table">
+          <header>
+            <span>状态</span>
+            <span>时间</span>
+            <span>模型</span>
+            <span>供应商</span>
+            <span>Token（非缓存 / 缓存 / 输出）</span>
+            <span>首字延迟</span>
+            <span>总耗时</span>
+            <span>官方估算</span>
+            <span>路由结果</span>
+          </header>
+          {rows.map((log) => {
+            const status = statusMeta(log.status);
+            return (
+              <div className={log.route_attempts > 1 ? "selected" : ""} key={log.id}>
+                <div className="status-cell">
+                  <span className={`dot ${status.tone}`} />
+                  <b className={`${status.tone}-text`}>{status.label}</b>
+                </div>
+                <div>
+                  <strong>{formatLogTime(log.started_at_ms)}</strong>
+                  <small>今天</small>
+                </div>
+                <strong>{log.model}</strong>
+                <div>
+                  <strong>{log.provider_name}</strong>
+                  <small>{log.error ?? log.upstream_chain.join(" → ")}</small>
+                </div>
+                <span>{formatTokenTriplet(log)}</span>
+                <b>{formatMs(log.first_byte_ms)}</b>
+                <b>{formatDuration(log.total_ms)}</b>
+                <b>{log.total_tokens ? formatMoney(log.estimated_cost, log.currency) : "-"}</b>
+                <span className={`route-result ${routeResultTone(log.route_result)}`}>
+                  {log.route_result}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <footer className="table-pagination">
+          <span>点击任意记录查看路由时间线、Token 明细和错误详情。</span>
+          <div>
+            <button className="ghost small" disabled={(logs?.page ?? 1) <= 1} onClick={() => onFilter({ page: (logs?.page ?? 1) - 1 })}>‹</button>
+            <b>{logs?.page ?? 1}</b>
+            <button className="ghost small" disabled={(logs?.page ?? 1) >= (logs?.total_pages ?? 1)} onClick={() => onFilter({ page: (logs?.page ?? 1) + 1 })}>›</button>
+          </div>
+        </footer>
+      </article>
+    </section>
+  );
+}
+
 function Dashboard(props: {
   activeProvider: ProviderSummary | null;
   cachedInput: number;
   modelRows: Array<{ model: string; requests: number; tokens: number; cost: number }>;
+  onRangeChange: (range: TimeRange) => Promise<void>;
+  onTrendMetricChange: (metric: TrendMetric) => void;
   officialCost: number;
   outputTokens: number;
   providers: ProviderSummary[];
   requestCount: number;
-  routeEnabledCount: number;
+  stats: RouteUsageStats | null;
   successRate: number;
+  timeRange: TimeRange;
   totalTokens: number;
+  trendMetric: TrendMetric;
   uncachedInput: number;
 }) {
   const {
     cachedInput,
     modelRows,
+    onRangeChange,
+    onTrendMetricChange,
     officialCost,
     outputTokens,
     providers,
     requestCount,
-    routeEnabledCount,
+    stats,
     successRate,
+    timeRange,
     totalTokens,
+    trendMetric,
     uncachedInput,
   } = props;
   const healthyProviders = providers.filter((provider) => provider.enabled && !provider.balance_error).length;
+  const details = stats?.details ?? [];
+  const successCount = requestCount - (stats?.failed_count ?? 0);
+  const activeRequests = details.filter((log) => log.status === "running").length;
+  const logsWithFirstByte = details.filter((log) => log.first_byte_ms != null);
+  const avgFirstByte = logsWithFirstByte.length
+    ? logsWithFirstByte.reduce((sum, log) => sum + (log.first_byte_ms ?? 0), 0) / logsWithFirstByte.length
+    : null;
+  const avgTotalMs = details.length
+    ? details.reduce((sum, log) => sum + log.total_ms, 0) / details.length
+    : null;
+  const trendBuckets = stats?.buckets.length
+    ? stats.buckets
+    : [{ label: "暂无", estimated_cost: 0, total_tokens: 0, request_count: 0 }];
+  const maxTrendValue = Math.max(...trendBuckets.map((bucket) => trendBucketValue(bucket, trendMetric)), 1);
+  const inputShare = totalTokens ? Math.round((uncachedInput / totalTokens) * 100) : 0;
+  const cacheShare = totalTokens ? Math.round((cachedInput / totalTokens) * 100) : 0;
 
   return (
     <section className="dashboard">
       <div className="section-title">
         <h2>使用概览</h2>
         <div className="range-tabs">
-          <button className="active">今日</button>
-          <button>本周</button>
-          <button>本月</button>
-          <button>自定义</button>
+          {(["today", "week", "month", "all"] as TimeRange[]).map((range) => (
+            <button
+              className={timeRange === range ? "active" : ""}
+              key={range}
+              onClick={() => onRangeChange(range)}
+              type="button"
+            >
+              {rangeLabel(range)}
+            </button>
+          ))}
         </div>
       </div>
 
       <div className="metric-grid">
-        <Metric title="官方估算成本" value={formatMoney(officialCost)} tone="purple" sub="较昨日 +12.4%" />
-        <Metric title="非缓存输入" value={formatCompact(uncachedInput)} tone="cyan" sub="19.1% 输入" />
-        <Metric title="缓存输入" value={formatCompact(cachedInput)} tone="blue" sub="缓存占比 78.1%" />
-        <Metric title="输出 Token" value={formatCompact(outputTokens)} tone="amber" sub="今日累计" />
-        <Metric title="请求数" value={String(requestCount)} tone="green" sub={`成功 ${Math.max(requestCount - 1, 0)}`} />
+        <Metric title="官方估算成本" value={formatMoney(officialCost)} tone="purple" sub={rangeLabel(timeRange)} />
+        <Metric title="非缓存输入" value={formatCompact(uncachedInput)} tone="cyan" sub={`${inputShare}% Token`} />
+        <Metric title="缓存输入" value={formatCompact(cachedInput)} tone="blue" sub={`缓存占比 ${cacheShare}%`} />
+        <Metric title="输出 Token" value={formatCompact(outputTokens)} tone="amber" sub={rangeLabel(timeRange)} />
+        <Metric title="请求数" value={String(requestCount)} tone="green" sub={`成功 ${Math.max(successCount, 0)}`} />
       </div>
 
       <div className="dashboard-grid">
@@ -833,22 +1505,36 @@ function Dashboard(props: {
           <div className="card-head">
             <div>
               <h3>使用趋势</h3>
-              <p>官方估算成本 · 最近 7 天</p>
+              <p>{trendMetricLabel(trendMetric)} · {rangeLabel(timeRange)} · 按小时聚合</p>
             </div>
             <div className="mini-tabs">
-              <button className="active">费用</button>
-              <button>Token</button>
-              <button>请求</button>
+              {(["cost", "tokens", "requests"] as TrendMetric[]).map((metric) => (
+                <button
+                  className={trendMetric === metric ? "active" : ""}
+                  key={metric}
+                  onClick={() => onTrendMetricChange(metric)}
+                  type="button"
+                >
+                  {trendMetricLabel(metric)}
+                </button>
+              ))}
             </div>
           </div>
           <div className="chart">
-            {[32, 39, 36, 52, 50, 71, 96].map((height, index) => (
-              <span key={index} style={{ height: `${height}%` }} />
-            ))}
+            {trendBuckets.map((bucket, index) => {
+              const value = trendBucketValue(bucket, trendMetric);
+              return (
+                <span
+                  key={`${bucket.label}-${index}`}
+                  style={{ height: `${Math.max(6, (value / maxTrendValue) * 100)}%` }}
+                  title={`${bucket.label} ${formatTrendValue(value, trendMetric)}`}
+                />
+              );
+            })}
           </div>
           <div className="chart-labels">
-            {["周一", "周二", "周三", "周四", "周五", "周六", "今天"].map((label) => (
-              <span key={label}>{label}</span>
+            {trendBuckets.slice(0, 8).map((bucket, index) => (
+              <span key={`${bucket.label}-${index}`}>{bucket.label.replace(":00", "")}</span>
             ))}
           </div>
         </article>
@@ -882,7 +1568,7 @@ function Dashboard(props: {
 
         <article className="card donut-card">
           <h3>Token 构成</h3>
-          <p>今日共计 {formatCompact(totalTokens)} Token</p>
+          <p>{rangeLabel(timeRange)}共计 {formatCompact(totalTokens)} Token</p>
           <div className="donut-area">
             <div className="donut">
               <strong>{formatCompact(totalTokens)}</strong>
@@ -919,11 +1605,11 @@ function Dashboard(props: {
 
         <article className="card quality-card">
           <h3>请求质量</h3>
-          <p>今日通过本地网关的请求</p>
+          <p>{rangeLabel(timeRange)}通过本地网关的请求</p>
           <Quality label="成功率" value={`${successRate.toFixed(1)}%`} tone="green" />
-          <Quality label="平均首字延迟" value="842 ms" tone="cyan" />
-          <Quality label="平均总耗时" value="18.4 s" tone="purple" />
-          <Quality label="当前活跃请求" value={String(routeEnabledCount ? 2 : 0)} tone="amber" />
+          <Quality label="平均首字延迟" value={formatMs(avgFirstByte)} tone="cyan" />
+          <Quality label="平均总耗时" value={avgTotalMs == null ? "-" : formatDuration(avgTotalMs)} tone="purple" />
+          <Quality label="当前活跃请求" value={String(activeRequests)} tone="amber" />
         </article>
       </div>
     </section>
