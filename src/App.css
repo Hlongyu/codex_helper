@@ -1120,6 +1120,41 @@ button:disabled {
   gap: 14px;
 }
 
+.test-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.test-model-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: 84px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid #26394f;
+  margin-top: 2px;
+  padding-top: 12px;
+}
+
+.test-model-row span {
+  color: #9ca8bb;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.test-model-row select {
+  width: 100%;
+  height: 38px;
+  min-width: 0;
+  border: 1px solid #24364a;
+  border-radius: 10px;
+  background: #0e151f;
+  color: #f7f9fd;
+  outline: none;
+  padding: 0 12px;
+}
+
 .test-box ul {
   grid-column: 1 / -1;
   display: grid;

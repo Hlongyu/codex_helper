@@ -45,6 +45,10 @@ type ProviderConnectionTestResult = {
   steps: ProviderConnectionTestStep[];
 };
 
+type ProviderModelsResponse = {
+  models: string[];
+};
+
 type RouterConfig = {
   enabled: boolean;
   host: string;
@@ -63,6 +67,7 @@ type ProviderConfig = {
   name: string;
   enabled: boolean;
   config: JsonValue;
+  connection_test_model: string;
   balance_query: BalanceQueryConfig;
   balance_status?: BalanceStatus | null;
   connection_status?: unknown;
@@ -725,6 +730,8 @@ function App() {
   const [providerApiKeyDirty, setProviderApiKeyDirty] = useState(false);
   const [providerEnabled, setProviderEnabled] = useState(true);
   const [connectionTestResult, setConnectionTestResult] = useState<ProviderConnectionTestResult | null>(null);
+  const [providerTestModel, setProviderTestModel] = useState("");
+  const [providerModels, setProviderModels] = useState<string[]>([]);
   const [balanceQuery, setBalanceQuery] = useState<BalanceQueryConfig>(() =>
     defaultBalanceQuery(),
   );
@@ -851,6 +858,8 @@ function App() {
     setProviderApiKey(fields.apiKey);
     setProviderApiKeyDirty(false);
     setProviderEnabled(summary?.enabled ?? targetFull.enabled ?? true);
+    setProviderTestModel(targetFull.connection_test_model ?? "");
+    setProviderModels(targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
     setBalanceQuery(
       normalizeBalanceQuery(
         targetFull.balance_query,
@@ -907,6 +916,7 @@ function App() {
         enabled: providerEnabled,
         balance_query: nextBalance,
         balance_status: balanceTestStatus,
+        connection_test_model: providerTestModel,
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
@@ -961,6 +971,7 @@ function App() {
         provider_id: editingId,
         base_url: providerBaseUrl,
         api_key: null,
+        test_model: providerTestModel,
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
@@ -969,6 +980,27 @@ function App() {
         payload,
       });
       setConnectionTestResult(result);
+    });
+  }
+
+  async function loadProviderModels() {
+    if (!editingId) return;
+    await run(async () => {
+      const payload: Record<string, unknown> = {
+        provider_id: editingId,
+        base_url: providerBaseUrl,
+        api_key: null,
+      };
+      if (providerApiKeyDirty) {
+        payload.api_key = providerApiKey;
+      }
+      const result = await callCommand<ProviderModelsResponse>("load_provider_models", {
+        payload,
+      });
+      setProviderModels(result.models);
+      if (!providerTestModel && result.models[0]) {
+        setProviderTestModel(result.models[0]);
+      }
     });
   }
 
@@ -1266,6 +1298,7 @@ function App() {
           connectionTestResult={connectionTestResult}
           onBalanceTokenVisible={setBalanceTokenVisible}
           onClose={() => setEditorOpen(false)}
+          onLoadProviderModels={loadProviderModels}
           onSave={saveProvider}
           onTab={setEditorTab}
           onTestBalance={testBalance}
@@ -1274,21 +1307,28 @@ function App() {
           providerApiKey={providerApiKey}
           providerBaseUrl={providerBaseUrl}
           providerEnabled={providerEnabled}
+          providerModels={providerModels}
           providerName={providerName}
+          providerTestModel={providerTestModel}
           secretVisible={secretVisible}
           setProviderApiKey={(value) => {
             setProviderApiKey(value);
             setBalanceTestStatus(null);
             setConnectionTestResult(null);
+            setProviderModels([]);
+            setProviderTestModel("");
           }}
           setProviderApiKeyDirty={setProviderApiKeyDirty}
           setProviderBaseUrl={(value) => {
             setProviderBaseUrl(value);
             setBalanceTestStatus(null);
             setConnectionTestResult(null);
+            setProviderModels([]);
+            setProviderTestModel("");
           }}
           setProviderEnabled={setProviderEnabled}
           setProviderName={setProviderName}
+          setProviderTestModel={setProviderTestModel}
           setSecretVisible={setSecretVisible}
           tab={editorTab}
         />
@@ -2269,6 +2309,7 @@ function ProviderEditor(props: {
   connectionTestResult: ProviderConnectionTestResult | null;
   onBalanceTokenVisible: (visible: boolean) => void;
   onClose: () => void;
+  onLoadProviderModels: () => void;
   onSave: () => void;
   onTab: (tab: EditorTab) => void;
   onTestBalance: () => void;
@@ -2277,13 +2318,16 @@ function ProviderEditor(props: {
   providerApiKey: string;
   providerBaseUrl: string;
   providerEnabled: boolean;
+  providerModels: string[];
   providerName: string;
+  providerTestModel: string;
   secretVisible: boolean;
   setProviderApiKey: (value: string) => void;
   setProviderApiKeyDirty: (dirty: boolean) => void;
   setProviderBaseUrl: (value: string) => void;
   setProviderEnabled: (value: boolean) => void;
   setProviderName: (value: string) => void;
+  setProviderTestModel: (value: string) => void;
   setSecretVisible: (value: boolean) => void;
   tab: EditorTab;
 }) {
@@ -2295,6 +2339,7 @@ function ProviderEditor(props: {
     connectionTestResult,
     onBalanceTokenVisible,
     onClose,
+    onLoadProviderModels,
     onSave,
     onTab,
     onTestBalance,
@@ -2303,16 +2348,22 @@ function ProviderEditor(props: {
     providerApiKey,
     providerBaseUrl,
     providerEnabled,
+    providerModels,
     providerName,
+    providerTestModel,
     secretVisible,
     setProviderApiKey,
     setProviderApiKeyDirty,
     setProviderBaseUrl,
     setProviderEnabled,
     setProviderName,
+    setProviderTestModel,
     setSecretVisible,
     tab,
   } = props;
+  const modelOptions = providerTestModel && !providerModels.includes(providerTestModel)
+    ? [providerTestModel, ...providerModels]
+    : providerModels;
 
   return (
     <div className="drawer-backdrop">
@@ -2375,9 +2426,31 @@ function ProviderEditor(props: {
                   <strong>连接测试</strong>
                   <p>保存前验证上游接口是否可用</p>
                 </div>
-                <button className="ghost" disabled={busy} onClick={onTestConnection} type="button">
-                  {busy ? "测试中" : "重新测试"}
-                </button>
+                <div className="test-actions">
+                  <button className="ghost small" disabled={busy} onClick={onLoadProviderModels} type="button">
+                    刷新模型
+                  </button>
+                  <button className="ghost small" disabled={busy} onClick={onTestConnection} type="button">
+                    {busy ? "测试中" : "重新测试"}
+                  </button>
+                </div>
+                <label className="test-model-row">
+                  <span>测试模型</span>
+                  <select
+                    disabled={busy}
+                    value={providerTestModel}
+                    onChange={(event) => {
+                      setProviderTestModel(event.currentTarget.value);
+                    }}
+                  >
+                    {!modelOptions.length && <option value="">先刷新模型列表</option>}
+                    {modelOptions.map((model) => (
+                      <option key={model} value={model}>
+                        {model}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <ul>
                   {(connectionTestResult?.steps.length
                     ? connectionTestResult.steps

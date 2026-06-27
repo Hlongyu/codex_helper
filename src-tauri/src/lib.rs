@@ -41,6 +41,8 @@ struct ProviderConfig {
     enabled: bool,
     config: Value,
     #[serde(default)]
+    connection_test_model: String,
+    #[serde(default)]
     balance_query: BalanceQueryConfig,
     #[serde(default)]
     balance_status: Option<BalanceStatus>,
@@ -429,6 +431,7 @@ struct SaveProviderPayload {
     config_toml: String,
     balance_query: Option<BalanceQueryConfig>,
     balance_status: Option<BalanceStatus>,
+    connection_test_model: Option<String>,
     enabled: Option<bool>,
     base_url: Option<String>,
     api_key: Option<String>,
@@ -466,6 +469,19 @@ struct TestProviderConnectionPayload {
     provider_id: String,
     base_url: Option<String>,
     api_key: Option<String>,
+    test_model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadProviderModelsPayload {
+    provider_id: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderModelsResponse {
+    models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1358,7 +1374,39 @@ fn test_model_unavailable_response(status: reqwest::StatusCode, body: &str) -> b
     false
 }
 
-async fn run_provider_connection_test(provider: &ProviderConfig) -> ProviderConnectionTestResult {
+fn model_id_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(model) => Some(model.trim().to_string()).filter(|model| !model.is_empty()),
+        Value::Object(_) => value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn models_from_response_value(value: &Value) -> Vec<String> {
+    let model_values = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .unwrap_or(value);
+    let mut models = model_values
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(model_id_from_value)
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    models
+}
+
+async fn run_provider_connection_test(
+    provider: &ProviderConfig,
+    requested_model: Option<&str>,
+) -> ProviderConnectionTestResult {
     let mut steps = Vec::new();
     let Some(base_url) =
         custom_provider_base_url(provider).filter(|value| !value.trim().is_empty())
@@ -1411,11 +1459,14 @@ async fn run_provider_connection_test(provider: &ProviderConfig) -> ProviderConn
         .send()
         .await;
     let models_latency = started.elapsed().as_millis() as u64;
+    let mut available_models = Vec::new();
 
     match models_response {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {
+                let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+                available_models = models_from_response_value(&body);
                 steps.push(status_step(
                     "base",
                     "基础连接",
@@ -1477,6 +1528,25 @@ async fn run_provider_connection_test(provider: &ProviderConfig) -> ProviderConn
         }
     }
 
+    let selected_model = requested_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .or_else(|| {
+            let saved = provider.connection_test_model.trim();
+            (!saved.is_empty()).then_some(saved)
+        })
+        .or_else(|| available_models.first().map(String::as_str));
+    let Some(test_model) = selected_model else {
+        steps.push(status_step(
+            "responses",
+            "Responses API",
+            "failed",
+            None,
+            "没有可用于测试的模型",
+        ));
+        return ProviderConnectionTestResult { ok: false, steps };
+    };
+
     let responses_url = join_url(&base_url, "responses");
     let started = Instant::now();
     let response = client
@@ -1484,7 +1554,7 @@ async fn run_provider_connection_test(provider: &ProviderConfig) -> ProviderConn
         .bearer_auth(token.trim())
         .header("accept", "application/json")
         .json(&json!({
-            "model": "codex-helper-connectivity-probe",
+            "model": test_model,
             "input": "ping",
             "max_output_tokens": 1,
             "stream": false,
@@ -1497,17 +1567,21 @@ async fn run_provider_connection_test(provider: &ProviderConfig) -> ProviderConn
         Ok(response) => {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            if status.is_success() || test_model_unavailable_response(status, &body) {
+            if status.is_success() {
                 steps.push(status_step(
                     "responses",
                     "Responses API",
                     "ok",
                     Some(responses_latency),
-                    if status.is_success() {
-                        "端点可用"
-                    } else {
-                        "端点可达，测试模型被拒绝"
-                    },
+                    format!("测试模型: {test_model}"),
+                ));
+            } else if test_model_unavailable_response(status, &body) {
+                steps.push(status_step(
+                    "responses",
+                    "Responses API",
+                    "failed",
+                    Some(responses_latency),
+                    format!("测试模型不可用: {test_model}"),
                 ));
             } else {
                 steps.push(status_step(
@@ -1515,7 +1589,7 @@ async fn run_provider_connection_test(provider: &ProviderConfig) -> ProviderConn
                     "Responses API",
                     "failed",
                     Some(responses_latency),
-                    format!("接口返回 HTTP {}", status.as_u16()),
+                    format!("接口返回 HTTP {}，模型 {test_model}", status.as_u16()),
                 ));
             }
         }
@@ -1532,6 +1606,44 @@ async fn run_provider_connection_test(provider: &ProviderConfig) -> ProviderConn
 
     let ok = steps.iter().all(|step| step.status != "failed");
     ProviderConnectionTestResult { ok, steps }
+}
+
+async fn fetch_provider_models(provider: &ProviderConfig) -> Result<(Vec<String>, u64), String> {
+    let base_url = custom_provider_base_url(provider)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Base URL 为空".to_string())?;
+    let token = custom_provider_token(provider)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "API Key 为空".to_string())?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|err| format!("创建 HTTP 客户端失败: {err}"))?;
+
+    let models_url = join_url(&base_url, "models");
+    let started = Instant::now();
+    let response = client
+        .get(&models_url)
+        .bearer_auth(token.trim())
+        .header("accept", "application/json")
+        .send()
+        .await
+        .map_err(|err| format!("请求 /models 失败: {err}"))?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(format!("鉴权失败 HTTP {}", status.as_u16()));
+    }
+    if !status.is_success() {
+        return Err(format!("/models 返回 HTTP {}", status.as_u16()));
+    }
+
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|err| format!("/models 响应不是有效 JSON: {err}"))?;
+    Ok((models_from_response_value(&value), latency_ms))
 }
 
 fn connection_status_from_test(result: &ProviderConnectionTestResult) -> ConnectionStatus {
@@ -4183,6 +4295,9 @@ fn save_provider(
     if let Some(enabled) = payload.enabled {
         provider.enabled = enabled;
     }
+    if let Some(connection_test_model) = payload.connection_test_model {
+        provider.connection_test_model = connection_test_model.trim().to_string();
+    }
     if payload.base_url.is_some() || payload.api_key.is_some() {
         apply_provider_connection_draft(
             provider,
@@ -4317,6 +4432,7 @@ fn add_provider(
         id: id.clone(),
         name: trimmed.to_string(),
         enabled: true,
+        connection_test_model: String::new(),
         balance_query: BalanceQueryConfig::default(),
         balance_status: None,
         connection_status: None,
@@ -4476,6 +4592,27 @@ fn load_route_usage_stats(
 }
 
 #[tauri::command]
+async fn load_provider_models(
+    payload: LoadProviderModelsPayload,
+) -> Result<ProviderModelsResponse, String> {
+    let state = load_state_file()?;
+    let provider = state
+        .providers
+        .iter()
+        .find(|provider| provider.id == payload.provider_id)
+        .cloned()
+        .ok_or_else(|| "供应商不存在".to_string())?;
+    let mut test_provider = provider.clone();
+    apply_provider_connection_draft(
+        &mut test_provider,
+        payload.base_url.as_deref(),
+        payload.api_key.as_deref(),
+    )?;
+    let (models, _) = fetch_provider_models(&test_provider).await?;
+    Ok(ProviderModelsResponse { models })
+}
+
+#[tauri::command]
 async fn query_provider_balance(
     payload: QueryBalancePayload,
     router_runtime: tauri::State<'_, RouterRuntime>,
@@ -4528,7 +4665,7 @@ async fn test_provider_connection(
         payload.api_key.as_deref(),
     )?;
 
-    let result = run_provider_connection_test(&test_provider).await;
+    let result = run_provider_connection_test(&test_provider, payload.test_model.as_deref()).await;
     if payload.base_url.is_none() && payload.api_key.is_none() {
         if let Some(provider) = state
             .providers
@@ -4562,7 +4699,7 @@ async fn test_provider_connection_state(
         payload.api_key.as_deref(),
     )?;
 
-    let result = run_provider_connection_test(&test_provider).await;
+    let result = run_provider_connection_test(&test_provider, payload.test_model.as_deref()).await;
     if let Some(provider) = state
         .providers
         .iter_mut()
@@ -4602,6 +4739,7 @@ pub fn run() {
             load_usage_stats,
             load_route_logs,
             load_route_usage_stats,
+            load_provider_models,
             query_provider_balance,
             test_provider_connection,
             test_provider_connection_state
@@ -4743,6 +4881,7 @@ mod tests {
                     }
                 }
             }),
+            connection_test_model: String::new(),
             balance_query: BalanceQueryConfig {
                 enabled: true,
                 query_type: BalanceQueryType::NewApi,
@@ -4782,5 +4921,28 @@ mod tests {
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"invalid api key"}}"#,
         ));
+    }
+
+    #[test]
+    fn parses_model_ids_from_models_response() {
+        let models = models_from_response_value(&json!({
+            "data": [
+                { "id": "gpt-5" },
+                { "id": " gpt-5-mini " },
+                { "id": "gpt-5" },
+                { "object": "model" }
+            ]
+        }));
+
+        assert_eq!(models, vec!["gpt-5", "gpt-5-mini"]);
+    }
+
+    #[test]
+    fn parses_model_ids_from_compat_models_response() {
+        let models = models_from_response_value(&json!({
+            "models": ["doubao-seed-1-6", " doubao-seed-1-6-thinking ", ""]
+        }));
+
+        assert_eq!(models, vec!["doubao-seed-1-6", "doubao-seed-1-6-thinking"]);
     }
 }
