@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { type DragEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -73,8 +73,6 @@ type ProviderSummary = {
   enabled: boolean;
   pending_changes: number;
   base_url: string;
-  provider_type: string;
-  route_order: number;
   balance_label: string;
   balance_error?: string | null;
   latency_label: string;
@@ -932,6 +930,15 @@ function App() {
     });
   }
 
+  async function reorderProviders(providerIds: string[]) {
+    await run(async () => {
+      const state = await callCommand<AppState>("reorder_providers", {
+        payload: { provider_ids: providerIds },
+      });
+      setAppState(state);
+    });
+  }
+
   async function saveRouter(nextRouter: RouterConfig, apply = false) {
     await run(async () => {
       const saved = await callCommand<AppState>("save_router_config", {
@@ -1122,6 +1129,7 @@ function App() {
             onEdit={(provider, tab) => {
               void openProviderEditor(provider, tab);
             }}
+            onReorder={reorderProviders}
             onToggle={toggleProvider}
             providers={appState.providers}
           />
@@ -1762,7 +1770,7 @@ function Dashboard(props: {
                   <span className={`dot ${status.tone}`} />
                   <div>
                     <strong>{provider.name}</strong>
-                    <small>{provider.provider_type}</small>
+                    <small>{provider.enabled ? "已启用" : "已停用"}</small>
                   </div>
                   <b>{formatBalanceForCard(provider.balance_label)}</b>
                   <small className={status.tone}>{provider.latency_label}</small>
@@ -2005,15 +2013,62 @@ function ProvidersScreen({
   busy,
   onAdd,
   onEdit,
+  onReorder,
   onToggle,
   providers,
 }: {
   busy: boolean;
   onAdd: () => void;
   onEdit: (provider: ProviderSummary, tab: EditorTab) => void;
+  onReorder: (providerIds: string[]) => Promise<void>;
   onToggle: (provider: ProviderSummary, enabled: boolean) => void;
   providers: ProviderSummary[];
 }) {
+  const [draggingProviderId, setDraggingProviderId] = useState<string | null>(null);
+
+  function moveProvider(draggedId: string, targetId: string, placement: "before" | "after") {
+    if (draggedId === targetId || busy) return;
+    const providerIds = providers.map((provider) => provider.id);
+    const draggedIndex = providerIds.indexOf(draggedId);
+    const targetIndex = providerIds.indexOf(targetId);
+    if (draggedIndex < 0 || targetIndex < 0) return;
+
+    const nextIds = [...providerIds];
+    const [movedId] = nextIds.splice(draggedIndex, 1);
+    const nextTargetIndex = nextIds.indexOf(targetId);
+    nextIds.splice(nextTargetIndex + (placement === "after" ? 1 : 0), 0, movedId);
+    if (nextIds.join("\u0000") !== providerIds.join("\u0000")) {
+      void onReorder(nextIds);
+    }
+  }
+
+  function handleDragStart(event: DragEvent<HTMLElement>, providerId: string) {
+    if (busy) {
+      event.preventDefault();
+      return;
+    }
+    setDraggingProviderId(providerId);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", providerId);
+  }
+
+  function handleDragOver(event: DragEvent<HTMLDivElement>) {
+    if (busy) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+  }
+
+  function handleDrop(event: DragEvent<HTMLDivElement>, targetId: string) {
+    event.preventDefault();
+    const draggedId = event.dataTransfer.getData("text/plain") || draggingProviderId;
+    if (draggedId) {
+      const bounds = event.currentTarget.getBoundingClientRect();
+      const placement = event.clientY > bounds.top + bounds.height / 2 ? "after" : "before";
+      moveProvider(draggedId, targetId, placement);
+    }
+    setDraggingProviderId(null);
+  }
+
   return (
     <section className="providers-page">
       <div className="provider-toolbar">
@@ -2022,8 +2077,6 @@ function ProvidersScreen({
           <input placeholder="搜索名称或 Base URL" />
         </div>
         <button>全部状态</button>
-        <button>全部类型</button>
-        <button>按路由顺序排序</button>
         <div className="auto-check">
           <span>自动检查</span>
           <button>每 5 分钟</button>
@@ -2038,10 +2091,9 @@ function ProvidersScreen({
 
       <article className="provider-table">
         <header>
+          <span />
           <span>状态</span>
           <span>供应商</span>
-          <span>类型</span>
-          <span>路由顺序</span>
           <span>余额</span>
           <span>延迟</span>
           <span>最近检查</span>
@@ -2052,9 +2104,20 @@ function ProvidersScreen({
           const status = providerStatus(provider);
           return (
             <div
-              className={`provider-line ${provider.enabled ? "selected" : ""}`}
+              className={`provider-line ${provider.enabled ? "selected" : ""} ${draggingProviderId === provider.id ? "dragging" : ""}`}
               key={provider.id}
+              onDragEnd={() => setDraggingProviderId(null)}
+              onDragOver={handleDragOver}
+              onDrop={(event) => handleDrop(event, provider.id)}
             >
+              <span
+                className="drag-handle"
+                draggable={!busy}
+                onDragStart={(event) => handleDragStart(event, provider.id)}
+                title="拖动调整优先级"
+              >
+                ⋮⋮
+              </span>
               <div className="provider-status">
                 <span className={`dot ${status.tone}`} />
                 <b>{status.label}</b>
@@ -2063,13 +2126,13 @@ function ProvidersScreen({
                 <strong>{provider.name}</strong>
                 <small>{provider.base_url || "未配置 Base URL"}</small>
               </div>
-              <span className="type-pill">{provider.provider_type}</span>
-              <span className="order-pill">{provider.route_order}</span>
               <div className="balance-cell">
-                <strong>{formatBalanceForCard(provider.balance_label)}</strong>
-                <small className={provider.balance_error ? "warn" : "ok"}>
-                  {provider.balance_error ? "查询异常" : "余额正常"}
-                </small>
+                <strong
+                  className={provider.balance_error ? "warn-text" : ""}
+                  title={provider.balance_error ?? undefined}
+                >
+                  {formatBalanceForCard(provider.balance_label)}
+                </strong>
               </div>
               <b className={provider.balance_error ? "danger-text" : "ok-text"}>
                 {provider.latency_label}
@@ -2080,7 +2143,7 @@ function ProvidersScreen({
             </div>
           );
         })}
-        <footer>拖动左侧图标可调整故障转移顺序；列表越靠上，路由优先级越高。</footer>
+        <footer>拖动左侧图标可调整优先级；列表越靠上越优先。</footer>
       </article>
     </section>
   );

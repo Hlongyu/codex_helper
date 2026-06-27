@@ -13,7 +13,7 @@ use reqwest::header::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -421,6 +421,11 @@ struct SaveProviderPayload {
     enabled: Option<bool>,
     base_url: Option<String>,
     api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReorderProvidersPayload {
+    provider_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4195,6 +4200,49 @@ fn save_provider(
 }
 
 #[tauri::command]
+fn reorder_providers(
+    payload: ReorderProvidersPayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
+    if payload.provider_ids.len() != state.providers.len() {
+        return Err("供应商顺序与当前列表不匹配".to_string());
+    }
+
+    let current_ids = state
+        .providers
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect::<BTreeSet<_>>();
+    let requested_ids = payload
+        .provider_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if current_ids != requested_ids || requested_ids.len() != payload.provider_ids.len() {
+        return Err("供应商顺序包含未知或重复项".to_string());
+    }
+
+    let mut providers_by_id = state
+        .providers
+        .into_iter()
+        .map(|provider| (provider.id.clone(), provider))
+        .collect::<BTreeMap<_, _>>();
+    state.providers = payload
+        .provider_ids
+        .into_iter()
+        .map(|provider_id| {
+            providers_by_id
+                .remove(&provider_id)
+                .ok_or_else(|| "供应商不存在".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    save_state(&state)?;
+    build_app_state(state, &router_runtime)
+}
+
+#[tauri::command]
 fn preview_provider(
     payload: SaveProviderPayload,
     router_runtime: tauri::State<RouterRuntime>,
@@ -4492,6 +4540,7 @@ pub fn run() {
             select_provider,
             get_provider,
             save_provider,
+            reorder_providers,
             preview_provider,
             add_provider,
             save_base_template,

@@ -723,7 +723,7 @@ button:disabled {
 
 .provider-toolbar {
   display: grid;
-  grid-template-columns: minmax(280px, 1fr) auto auto auto 1fr auto;
+  grid-template-columns: minmax(280px, 1fr) auto minmax(180px, 0.5fr) auto;
   align-items: center;
   gap: 14px;
   min-height: 70px;
@@ -793,39 +793,69 @@ button:disabled {
 .provider-table > header,
 .provider-line {
   display: grid;
-  grid-template-columns: 84px 1.45fr 120px 96px 120px 100px 110px 84px 88px;
+  grid-template-columns: 36px 84px minmax(240px, 1.6fr) 130px 92px 108px 72px 78px;
   align-items: center;
-  gap: 16px;
+  gap: 14px;
 }
 
 .provider-table > header {
   color: #617087;
   font-size: 12px;
-  padding: 0 26px 16px;
+  padding: 0 20px 12px;
 }
 
 .provider-line {
-  min-height: 136px;
+  min-height: 88px;
   border-top: 1px solid #202d3d;
-  padding: 22px 26px;
+  padding: 16px 20px;
+  transition: border-color 0.16s ease, background 0.16s ease, opacity 0.16s ease;
 }
 
 .provider-line.selected {
   border: 1px solid #314f88;
-  border-radius: 14px;
+  border-radius: 12px;
   background: #19243a;
+}
+
+.provider-line.dragging {
+  border-color: #6974ff;
+  opacity: 0.56;
+}
+
+.drag-handle {
+  display: inline-flex;
+  width: 28px;
+  height: 38px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #223247;
+  border-radius: 8px;
+  color: #6f7d91;
+  cursor: grab;
+  font-size: 14px;
+  letter-spacing: 0;
+  user-select: none;
+}
+
+.provider-line:active .drag-handle {
+  cursor: grabbing;
 }
 
 .provider-status {
   display: grid;
-  gap: 8px;
+  gap: 6px;
   color: #56e0aa;
   font-size: 12px;
 }
 
+.provider-status .dot {
+  width: 8px;
+  height: 8px;
+}
+
 .provider-name-cell strong {
   display: block;
-  margin-bottom: 9px;
+  margin-bottom: 6px;
 }
 
 .provider-name-cell small,
@@ -833,30 +863,11 @@ button:disabled {
   color: #758397;
 }
 
-.type-pill,
-.order-pill {
-  display: inline-flex;
-  width: fit-content;
-  min-width: 72px;
-  height: 30px;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid #253951;
-  border-radius: 999px;
-  background: #0d1520;
-  color: #8f9caf;
-  font-size: 12px;
-}
-
-.order-pill {
-  min-width: 38px;
-  background: #182235;
-  color: #c5cedb;
-}
-
 .balance-cell strong {
   display: block;
-  margin-bottom: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ghost.small {
@@ -1618,7 +1629,8 @@ button.danger {
 
   .provider-table > header,
   .provider-line {
-    grid-template-columns: 80px 1.2fr 90px 70px 100px 80px 90px 70px 70px;
+    grid-template-columns: 32px 76px minmax(180px, 1.3fr) 110px 78px 86px 66px 66px;
+    gap: 10px;
   }
 
   .route-config-grid,
