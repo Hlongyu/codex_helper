@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -261,13 +261,17 @@ function normalizeBalanceQuery(config?: BalanceQueryConfig | null, endpoint = ""
 
 function formatMoney(value: number, currency = "USD") {
   const prefix = currency.toUpperCase() === "USD" ? "$" : `${currency} `;
-  return `${prefix}${(value || 0).toFixed(2)}`;
+  return `${prefix}${(value || 0).toFixed(6)}`;
 }
 
 function formatCompact(value: number) {
   const abs = Math.abs(value || 0);
   if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(abs >= 10_000_000 ? 1 : 2)}M`;
   if (abs >= 1_000) return `${(value / 1_000).toFixed(abs >= 100_000 ? 0 : 1)}K`;
+  return Math.round(value || 0).toLocaleString("zh-CN");
+}
+
+function formatTokenCount(value: number) {
   return Math.round(value || 0).toLocaleString("zh-CN");
 }
 
@@ -320,7 +324,7 @@ function formatTrendValue(value: number, metric: TrendMetric) {
 
 function formatTokenTriplet(log: RouteRequestLog) {
   if (!log.total_tokens) return "-";
-  return `${formatCompact(log.uncached_input_tokens)} / ${formatCompact(log.cached_input_tokens)} / ${formatCompact(log.output_tokens)}`;
+  return `${formatTokenCount(log.uncached_input_tokens)} / ${formatTokenCount(log.cached_input_tokens)} / ${formatTokenCount(log.output_tokens)}`;
 }
 
 function formatMs(value?: number | null) {
@@ -371,7 +375,7 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
     "Token",
     "首字延迟",
     "总耗时",
-    "官方估算",
+    "消费",
     "路由结果",
     "错误",
   ];
@@ -581,6 +585,7 @@ function App() {
   const [secretVisible, setSecretVisible] = useState(false);
   const [balanceTokenVisible, setBalanceTokenVisible] = useState(false);
   const [newProviderCount, setNewProviderCount] = useState(1);
+  const didInitialRefresh = useRef(false);
 
   async function run(action: () => Promise<void>) {
     setBusy(true);
@@ -608,10 +613,14 @@ function App() {
     setRouteLogs(logs);
   }
 
-  async function refresh() {
+  async function refreshAppState() {
     const state = await callCommand<AppState>("load_app_state");
     setAppState(state);
     setRouterDraft(state.router ?? defaultRouterConfig());
+  }
+
+  async function refresh() {
+    await refreshAppState();
     try {
       await Promise.all([refreshRouteUsage(), refreshRouteLogs()]);
     } catch {
@@ -623,6 +632,33 @@ function App() {
   useEffect(() => {
     refresh().catch((err) => setError(String(err)));
   }, []);
+
+  useEffect(() => {
+    if (!didInitialRefresh.current) {
+      didInitialRefresh.current = true;
+      return;
+    }
+
+    let cancelled = false;
+    async function refreshActiveScreen() {
+      try {
+        if (screen === "dashboard" || screen === "usage") {
+          await refreshRouteUsage(usageFilter);
+        } else if (screen === "requests") {
+          await refreshRouteLogs(requestFilter);
+        } else if (screen === "route" || screen === "providers") {
+          await refreshAppState();
+        }
+      } catch (err) {
+        if (!cancelled) setError(String(err));
+      }
+    }
+
+    refreshActiveScreen();
+    return () => {
+      cancelled = true;
+    };
+  }, [screen]);
 
   useEffect(() => {
     if (screen !== "requests" || !requestAutoRefresh) return;
@@ -641,7 +677,7 @@ function App() {
     );
   }, [appState]);
 
-  const requestCount = routeUsageStats?.summary.request_count ?? 0;
+  const requestCount = routeUsageStats?.success_count ?? routeUsageStats?.summary.request_count ?? 0;
   const officialCost = routeUsageStats?.summary.estimated_cost ?? 0;
   const uncachedInput = routeUsageStats?.summary.uncached_input_tokens ?? 0;
   const cachedInput = routeUsageStats?.summary.cached_input_tokens ?? 0;
@@ -656,7 +692,8 @@ function App() {
     }))
     .slice(0, 3);
   const failedCount = routeUsageStats?.failed_count ?? 0;
-  const successRate = requestCount ? ((requestCount - failedCount) / requestCount) * 100 : 0;
+  const totalFinishedCount = requestCount + failedCount;
+  const successRate = totalFinishedCount ? (requestCount / totalFinishedCount) * 100 : 0;
 
   function fillProviderEditor(targetFull: ProviderConfig, summary: ProviderSummary | null, tab: EditorTab) {
     const fields = providerFields(targetFull);
@@ -1251,11 +1288,11 @@ function UsageScreen({
       </div>
 
       <div className="metric-grid">
-        <Metric title="官方估算成本" value={formatMoney(summary.estimated_cost, summary.currency)} tone="purple" sub="按官方 API 价格" />
+        <Metric title="消费" value={formatMoney(summary.estimated_cost, summary.currency)} tone="purple" />
         <Metric title="非缓存输入" value={formatCompact(summary.uncached_input_tokens)} tone="cyan" sub={`${formatCompact(summary.input_tokens)} 输入`} />
         <Metric title="缓存输入" value={formatCompact(summary.cached_input_tokens)} tone="blue" sub="路由后统计" />
         <Metric title="输出 Token" value={formatCompact(summary.output_tokens)} tone="amber" sub={rangeLabel(timeRange)} />
-        <Metric title="请求数" value={String(summary.request_count)} tone="green" sub={`成功 ${stats?.success_count ?? 0}`} />
+        <Metric title="请求数" value={String(stats?.success_count ?? summary.request_count)} tone="green" />
       </div>
 
       <div className="usage-main-grid">
@@ -1335,16 +1372,16 @@ function UsageScreen({
             <span>缓存输入</span>
             <span>输出</span>
             <span>请求</span>
-            <span>官方估算</span>
+            <span>消费</span>
           </header>
           {(stats?.details ?? []).slice(0, 8).map((log) => (
             <div key={log.id}>
               <span>{formatLogTime(log.started_at_ms)}</span>
               <strong>{log.model}</strong>
               <span>{log.provider_name}</span>
-              <span>{formatCompact(log.uncached_input_tokens)}</span>
-              <span>{formatCompact(log.cached_input_tokens)}</span>
-              <span>{formatCompact(log.output_tokens)}</span>
+              <span>{formatTokenCount(log.uncached_input_tokens)}</span>
+              <span>{formatTokenCount(log.cached_input_tokens)}</span>
+              <span>{formatTokenCount(log.output_tokens)}</span>
               <b>{log.status === "success" ? 1 : 0}</b>
               <b>{log.total_tokens ? formatMoney(log.estimated_cost, log.currency) : "-"}</b>
             </div>
@@ -1430,7 +1467,7 @@ function RequestLogsScreen({
             <span>Token（非缓存 / 缓存 / 输出）</span>
             <span>首字延迟</span>
             <span>总耗时</span>
-            <span>官方估算</span>
+            <span>消费</span>
             <span>路由结果</span>
           </header>
           {rows.map((log) => {
@@ -1516,8 +1553,11 @@ function Dashboard(props: {
     ? stats.buckets
     : [{ label: "暂无", estimated_cost: 0, total_tokens: 0, request_count: 0 }];
   const maxTrendValue = Math.max(...trendBuckets.map((bucket) => trendBucketValue(bucket, trendMetric)), 1);
-  const inputShare = totalTokens ? Math.round((uncachedInput / totalTokens) * 100) : 0;
-  const cacheShare = totalTokens ? Math.round((cachedInput / totalTokens) * 100) : 0;
+  const tokenTooltip = [
+    `非缓存输入: ${formatTokenCount(uncachedInput)}`,
+    `缓存输入: ${formatTokenCount(cachedInput)}`,
+    `输出: ${formatTokenCount(outputTokens)}`,
+  ].join("\n");
 
   return (
     <section className="dashboard">
@@ -1538,11 +1578,9 @@ function Dashboard(props: {
       </div>
 
       <div className="metric-grid">
-        <Metric title="官方估算成本" value={formatMoney(officialCost)} tone="purple" sub={rangeLabel(timeRange)} />
-        <Metric title="非缓存输入" value={formatCompact(uncachedInput)} tone="cyan" sub={`${inputShare}% Token`} />
-        <Metric title="缓存输入" value={formatCompact(cachedInput)} tone="blue" sub={`缓存占比 ${cacheShare}%`} />
-        <Metric title="输出 Token" value={formatCompact(outputTokens)} tone="amber" sub={rangeLabel(timeRange)} />
-        <Metric title="请求数" value={String(requestCount)} tone="green" sub={`成功 ${Math.max(successCount, 0)}`} />
+        <Metric title="消费" value={formatMoney(officialCost)} tone="purple" />
+        <Metric title="总 Token" value={formatCompact(totalTokens)} tone="cyan" tooltip={tokenTooltip} />
+        <Metric title="请求数" value={String(Math.max(successCount, 0))} tone="green" />
       </div>
 
       <div className="dashboard-grid">
@@ -1666,18 +1704,20 @@ function Metric({
   value,
   tone,
   sub,
+  tooltip,
 }: {
   title: string;
   value: string;
   tone: "purple" | "cyan" | "blue" | "amber" | "green";
-  sub: string;
+  sub?: string;
+  tooltip?: string;
 }) {
   return (
-    <article className="metric">
+    <article className="metric" title={tooltip}>
       <span className={`dot ${tone}`} />
       <p>{title}</p>
       <strong>{value}</strong>
-      <small>{sub}</small>
+      {sub && <small>{sub}</small>}
     </article>
   );
 }

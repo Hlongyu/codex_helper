@@ -2724,6 +2724,10 @@ fn add_route_log_usage(summary: &mut UsageSummary, log: &RouteRequestLog) {
     add_usage(summary, &usage_from_route_log(log), log.estimated_cost);
 }
 
+fn is_success_route_log(log: &RouteRequestLog) -> bool {
+    log.status == "success"
+}
+
 fn route_available_providers(logs: &[RouteRequestLog]) -> Vec<RouteLogFilterOption> {
     let mut map = BTreeMap::<String, RouteLogFilterOption>::new();
     for log in logs {
@@ -2859,6 +2863,11 @@ fn build_route_usage_stats(
         .iter()
         .filter(|log| route_log_matches_filter(log, &filter))
         .collect::<Vec<_>>();
+    let successful = filtered
+        .iter()
+        .copied()
+        .filter(|log| is_success_route_log(log))
+        .collect::<Vec<_>>();
     let now = Local::now();
     let today_key = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
     let mut summary = UsageSummary::default();
@@ -2887,6 +2896,9 @@ fn build_route_usage_stats(
         }
         total_ms_total = total_ms_total.saturating_add(log.total_ms);
         total_ms_count += 1;
+        if !is_success_route_log(log) {
+            continue;
+        }
         add_route_log_usage(&mut summary, log);
         if log.day == today_key {
             add_route_log_usage(&mut today, log);
@@ -2958,10 +2970,10 @@ fn build_route_usage_stats(
         },
         bucket_granularity,
         buckets: bucket_map.into_values().collect(),
-        providers: route_breakdown_by(&filtered, |log| {
+        providers: route_breakdown_by(&successful, |log| {
             (log.provider_id.clone(), log.provider_name.clone())
         }),
-        models: route_breakdown_by(&filtered, |log| {
+        models: route_breakdown_by(&successful, |log| {
             let model = if log.model.trim().is_empty() {
                 "未知模型".to_string()
             } else {
@@ -4230,5 +4242,77 @@ mod tests {
         assert_eq!(usage.output_tokens, 20);
         assert_eq!(usage.reasoning_output_tokens, 5);
         assert_eq!(usage.total_tokens, 50);
+    }
+
+    fn route_log_for_stats_test(status: &str, provider_id: &str, cost: f64) -> RouteRequestLog {
+        RouteRequestLog {
+            id: format!("test-{status}-{provider_id}"),
+            started_at_ms: 1_782_470_400_000,
+            day: "2026-06-27".to_string(),
+            hour: "10:00".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            model: "test-model".to_string(),
+            provider_id: provider_id.to_string(),
+            provider_name: provider_id.to_string(),
+            provider_order: 1,
+            upstream_chain: vec![provider_id.to_string()],
+            status: status.to_string(),
+            status_code: if status == "success" {
+                Some(200)
+            } else {
+                Some(500)
+            },
+            error: if status == "success" {
+                None
+            } else {
+                Some("upstream failed".to_string())
+            },
+            route_result: status.to_string(),
+            route_attempts: 1,
+            input_tokens: 7,
+            uncached_input_tokens: 5,
+            cached_input_tokens: 2,
+            output_tokens: 3,
+            reasoning_output_tokens: 1,
+            total_tokens: 10,
+            estimated_cost: cost,
+            currency: "USD".to_string(),
+            cost_breakdown: String::new(),
+            pricing_model_match: "test-model".to_string(),
+            pricing_source: "test".to_string(),
+            first_byte_ms: Some(100),
+            total_ms: 200,
+        }
+    }
+
+    #[test]
+    fn route_usage_counts_and_cost_only_successful_requests() {
+        let stats = build_route_usage_stats(
+            vec![
+                route_log_for_stats_test("success", "provider-a", 0.000123),
+                route_log_for_stats_test("failed", "provider-b", 9.0),
+            ],
+            RouteLogFilter {
+                start_day: Some("2026-06-27".to_string()),
+                end_day: Some("2026-06-27".to_string()),
+                page_size: Some(50),
+                ..Default::default()
+            },
+        )
+        .expect("route usage stats should build");
+
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.details.len(), 2);
+        assert_eq!(stats.success_count, 1);
+        assert_eq!(stats.failed_count, 1);
+        assert_eq!(stats.summary.request_count, 1);
+        assert_eq!(stats.summary.total_tokens, 10);
+        assert!((stats.summary.estimated_cost - 0.000123).abs() < f64::EPSILON);
+        assert_eq!(stats.buckets.len(), 1);
+        assert_eq!(stats.buckets[0].request_count, 1);
+        assert_eq!(stats.providers.len(), 1);
+        assert_eq!(stats.providers[0].key, "provider-a");
+        assert_eq!(stats.models[0].request_count, 1);
     }
 }
