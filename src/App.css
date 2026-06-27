@@ -322,9 +322,9 @@ button:disabled {
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 14px;
-  margin-bottom: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
 }
 
 .metric,
@@ -339,21 +339,22 @@ button:disabled {
 }
 
 .metric {
-  min-height: 122px;
-  padding: 22px 22px 14px;
+  min-height: 86px;
+  padding: 14px 16px 12px;
 }
 
 .metric p {
   display: inline-block;
-  margin: 0 0 14px 8px;
+  margin: 0 0 8px 8px;
   color: #8996aa;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .metric strong {
   display: block;
-  margin-top: 8px;
-  font-size: 30px;
+  margin-top: 2px;
+  font-size: 24px;
+  line-height: 1.1;
 }
 
 .metric small {
@@ -1023,7 +1024,7 @@ button:disabled {
   padding: 14px 30px 16px;
 }
 
-.danger {
+button.danger {
   height: 34px;
   border: 1px solid #8c3146;
   border-radius: 999px;
@@ -1391,10 +1392,16 @@ button:disabled {
 }
 
 .status-cell {
-  display: grid;
-  gap: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   color: #56e0aa;
   font-size: 12px;
+}
+
+.status-cell .dot {
+  width: 8px;
+  height: 8px;
 }
 
 .route-result {
