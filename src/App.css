@@ -793,7 +793,7 @@ button:disabled {
 .provider-table > header,
 .provider-line {
   display: grid;
-  grid-template-columns: 36px 84px minmax(240px, 1.6fr) 130px 92px 108px 72px 78px;
+  grid-template-columns: 36px 84px minmax(240px, 1.6fr) 130px 92px 72px 124px;
   align-items: center;
   gap: 14px;
 }
@@ -828,16 +828,19 @@ button:disabled {
   height: 38px;
   align-items: center;
   justify-content: center;
+  padding: 0;
   border: 1px solid #223247;
   border-radius: 8px;
+  background: #0d1520;
   color: #6f7d91;
   cursor: grab;
   font-size: 14px;
   letter-spacing: 0;
+  touch-action: none;
   user-select: none;
 }
 
-.provider-line:active .drag-handle {
+.drag-handle:active {
   cursor: grabbing;
 }
 
@@ -868,6 +871,40 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.muted-text {
+  color: #6d7a8d;
+}
+
+.provider-toolbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.icon-button {
+  display: inline-flex;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #24364a;
+  border-radius: 8px;
+  background: #0d1520;
+  color: #a8b3c5;
+  padding: 0;
+}
+
+.icon-button svg {
+  width: 17px;
+  height: 17px;
+}
+
+.icon-button:hover:not(:disabled),
+.drag-handle:hover:not(:disabled) {
+  border-color: #6974ff;
+  color: #f5f7fb;
 }
 
 .ghost.small {
@@ -1629,7 +1666,7 @@ button.danger {
 
   .provider-table > header,
   .provider-line {
-    grid-template-columns: 32px 76px minmax(180px, 1.3fr) 110px 78px 86px 66px 66px;
+    grid-template-columns: 32px 76px minmax(180px, 1.3fr) 110px 78px 66px 112px;
     gap: 10px;
   }
 

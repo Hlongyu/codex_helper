@@ -44,6 +44,8 @@ struct ProviderConfig {
     balance_query: BalanceQueryConfig,
     #[serde(default)]
     balance_status: Option<BalanceStatus>,
+    #[serde(default)]
+    connection_status: Option<ConnectionStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,6 +127,14 @@ impl Default for BalanceQueryConfig {
 struct BalanceStatus {
     amount: Option<String>,
     label: String,
+    checked_at: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConnectionStatus {
+    ok: bool,
+    latency_ms: Option<u64>,
     checked_at: Option<u64>,
     error: Option<String>,
 }
@@ -369,7 +379,7 @@ struct ProviderSummary {
     balance_label: String,
     balance_error: Option<String>,
     latency_label: String,
-    last_checked_label: String,
+    latency_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1207,25 +1217,6 @@ fn redacted_diff(mut diff: DiffEntry) -> DiffEntry {
     diff
 }
 
-fn elapsed_label(checked_at: Option<u64>) -> String {
-    let Some(checked_at) = checked_at else {
-        return "未检查".to_string();
-    };
-    let Ok(now) = now_epoch_seconds() else {
-        return "刚刚".to_string();
-    };
-    let elapsed = now.saturating_sub(checked_at);
-    if elapsed < 60 {
-        "刚刚".to_string()
-    } else if elapsed < 3600 {
-        format!("{} 分钟前", elapsed / 60)
-    } else if elapsed < 86_400 {
-        format!("{} 小时前", elapsed / 3600)
-    } else {
-        format!("{} 天前", elapsed / 86_400)
-    }
-}
-
 fn current_epoch_ms() -> Result<i64, String> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1535,6 +1526,22 @@ async fn run_provider_connection_test(provider: &ProviderConfig) -> ProviderConn
 
     let ok = steps.iter().all(|step| step.status != "failed");
     ProviderConnectionTestResult { ok, steps }
+}
+
+fn connection_status_from_test(result: &ProviderConnectionTestResult) -> ConnectionStatus {
+    let latency_ms = result.steps.iter().filter_map(|step| step.latency_ms).max();
+    let error = result
+        .steps
+        .iter()
+        .find(|step| step.status == "failed")
+        .map(|step| step.message.clone());
+
+    ConnectionStatus {
+        ok: result.ok,
+        latency_ms,
+        checked_at: now_epoch_seconds().ok(),
+        error,
+    }
 }
 
 fn flatten(value: &Value) -> BTreeMap<String, Value> {
@@ -4064,6 +4071,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
             let pending_changes =
                 compute_diffs(&state, Some(provider), &current_json, &provider_desired).len();
             let balance_status = provider.balance_status.as_ref();
+            let connection_status = provider.connection_status.as_ref();
             ProviderSummary {
                 id: provider.id.clone(),
                 name: provider.name.clone(),
@@ -4076,18 +4084,11 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                     .map(|status| status.label.clone())
                     .unwrap_or_else(|| "未配置".to_string()),
                 balance_error: balance_status.and_then(|status| status.error.clone()),
-                latency_label: balance_status
-                    .map(|status| {
-                        if status.error.is_some() {
-                            "超时".to_string()
-                        } else {
-                            "正常".to_string()
-                        }
-                    })
-                    .unwrap_or_else(|| "未检查".to_string()),
-                last_checked_label: balance_status
-                    .map(|status| elapsed_label(status.checked_at))
-                    .unwrap_or_else(|| "未检查".to_string()),
+                latency_label: connection_status
+                    .and_then(|status| status.latency_ms)
+                    .map(|latency_ms| format!("{latency_ms} ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+                latency_error: connection_status.and_then(|status| status.error.clone()),
             }
         })
         .collect();
@@ -4311,6 +4312,7 @@ fn add_provider(
         enabled: true,
         balance_query: BalanceQueryConfig::default(),
         balance_status: None,
+        connection_status: None,
         config: toml_text_to_json(
             "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"\"\nexperimental_bearer_token = \"\"\n",
         )?,
@@ -4505,7 +4507,7 @@ async fn query_provider_balance(
 async fn test_provider_connection(
     payload: TestProviderConnectionPayload,
 ) -> Result<ProviderConnectionTestResult, String> {
-    let state = load_state_file()?;
+    let mut state = load_state_file()?;
     let provider = state
         .providers
         .iter()
@@ -4519,7 +4521,51 @@ async fn test_provider_connection(
         payload.api_key.as_deref(),
     )?;
 
-    Ok(run_provider_connection_test(&test_provider).await)
+    let result = run_provider_connection_test(&test_provider).await;
+    if payload.base_url.is_none() && payload.api_key.is_none() {
+        if let Some(provider) = state
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == payload.provider_id)
+        {
+            provider.connection_status = Some(connection_status_from_test(&result));
+        }
+        save_state(&state)?;
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn test_provider_connection_state(
+    payload: TestProviderConnectionPayload,
+    router_runtime: tauri::State<'_, RouterRuntime>,
+) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
+    let provider = state
+        .providers
+        .iter()
+        .find(|provider| provider.id == payload.provider_id)
+        .cloned()
+        .ok_or_else(|| "供应商不存在".to_string())?;
+    let mut test_provider = provider.clone();
+    apply_provider_connection_draft(
+        &mut test_provider,
+        payload.base_url.as_deref(),
+        payload.api_key.as_deref(),
+    )?;
+
+    let result = run_provider_connection_test(&test_provider).await;
+    if let Some(provider) = state
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == payload.provider_id)
+    {
+        provider.connection_status = Some(connection_status_from_test(&result));
+    }
+
+    save_state(&state)?;
+    build_app_state(state, &router_runtime)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -4550,7 +4596,8 @@ pub fn run() {
             load_route_logs,
             load_route_usage_stats,
             query_provider_balance,
-            test_provider_connection
+            test_provider_connection,
+            test_provider_connection_state
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -4700,6 +4747,7 @@ mod tests {
                 new_api_user_id: String::new(),
             },
             balance_status: None,
+            connection_status: None,
         };
         let mut draft = provider.balance_query.clone();
         draft.query_token.clear();

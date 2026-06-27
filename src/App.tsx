@@ -1,4 +1,4 @@
-import { type DragEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import { type PointerEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -65,6 +65,7 @@ type ProviderConfig = {
   config: JsonValue;
   balance_query: BalanceQueryConfig;
   balance_status?: BalanceStatus | null;
+  connection_status?: unknown;
 };
 
 type ProviderSummary = {
@@ -76,7 +77,7 @@ type ProviderSummary = {
   balance_label: string;
   balance_error?: string | null;
   latency_label: string;
-  last_checked_label: string;
+  latency_error?: string | null;
 };
 
 type UsageSummary = {
@@ -497,7 +498,7 @@ function formatBalanceForCard(label: string) {
 
 function providerStatus(provider: ProviderSummary) {
   if (!provider.enabled) return { label: "不可用", tone: "danger" };
-  if (provider.balance_error) return { label: "高延迟", tone: "warn" };
+  if (provider.balance_error || provider.latency_error) return { label: "异常", tone: "warn" };
   return { label: "正常", tone: "ok" };
 }
 
@@ -641,6 +642,50 @@ function StatusPill({ ok }: { ok: boolean }) {
       <span />
       {ok ? "服务正常" : "服务未接管"}
     </div>
+  );
+}
+
+function ToolIcon({ type }: { type: "settings" | "latency" | "balance" }) {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth={2}
+      viewBox="0 0 24 24"
+    >
+      {type === "settings" && (
+        <>
+          <circle cx="12" cy="12" r="3" />
+          <path d="M12 3v3" />
+          <path d="M12 18v3" />
+          <path d="m5.6 5.6 2.1 2.1" />
+          <path d="m16.3 16.3 2.1 2.1" />
+          <path d="M3 12h3" />
+          <path d="M18 12h3" />
+          <path d="m5.6 18.4 2.1-2.1" />
+          <path d="m16.3 7.7 2.1-2.1" />
+        </>
+      )}
+      {type === "latency" && (
+        <>
+          <path d="M4 13a8 8 0 1 1 16 0" />
+          <path d="M12 13l4-4" />
+          <path d="M8 20h8" />
+          <path d="M12 17v3" />
+        </>
+      )}
+      {type === "balance" && (
+        <>
+          <path d="M20 7h-9a4 4 0 0 0 0 8h9" />
+          <path d="M16 11h4v8H6a4 4 0 0 1-4-4V7a4 4 0 0 1 4-4h12" />
+          <path d="M17 15h.01" />
+          <path d="M7 7h.01" />
+        </>
+      )}
+    </svg>
   );
 }
 
@@ -904,6 +949,7 @@ function App() {
       const payload: Record<string, unknown> = {
         provider_id: editingId,
         base_url: providerBaseUrl,
+        api_key: null,
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
@@ -934,6 +980,24 @@ function App() {
     await run(async () => {
       const state = await callCommand<AppState>("reorder_providers", {
         payload: { provider_ids: providerIds },
+      });
+      setAppState(state);
+    });
+  }
+
+  async function testProviderLatency(provider: ProviderSummary) {
+    await run(async () => {
+      const state = await callCommand<AppState>("test_provider_connection_state", {
+        payload: { provider_id: provider.id },
+      });
+      setAppState(state);
+    });
+  }
+
+  async function refreshProviderBalance(provider: ProviderSummary) {
+    await run(async () => {
+      const state = await callCommand<AppState>("query_provider_balance", {
+        payload: { provider_id: provider.id, base_url: null, api_key: null },
       });
       setAppState(state);
     });
@@ -1129,7 +1193,9 @@ function App() {
             onEdit={(provider, tab) => {
               void openProviderEditor(provider, tab);
             }}
+            onRefreshBalance={refreshProviderBalance}
             onReorder={reorderProviders}
+            onTestLatency={testProviderLatency}
             onToggle={toggleProvider}
             providers={appState.providers}
           />
@@ -2013,60 +2079,79 @@ function ProvidersScreen({
   busy,
   onAdd,
   onEdit,
+  onRefreshBalance,
   onReorder,
+  onTestLatency,
   onToggle,
   providers,
 }: {
   busy: boolean;
   onAdd: () => void;
   onEdit: (provider: ProviderSummary, tab: EditorTab) => void;
+  onRefreshBalance: (provider: ProviderSummary) => Promise<void>;
   onReorder: (providerIds: string[]) => Promise<void>;
+  onTestLatency: (provider: ProviderSummary) => Promise<void>;
   onToggle: (provider: ProviderSummary, enabled: boolean) => void;
   providers: ProviderSummary[];
 }) {
   const [draggingProviderId, setDraggingProviderId] = useState<string | null>(null);
+  const draggingProviderIdRef = useRef<string | null>(null);
+  const dragStartY = useRef(0);
 
-  function moveProvider(draggedId: string, targetId: string, placement: "before" | "after") {
-    if (draggedId === targetId || busy) return;
+  function nextProviderOrder(draggedId: string, clientY: number) {
     const providerIds = providers.map((provider) => provider.id);
     const draggedIndex = providerIds.indexOf(draggedId);
-    const targetIndex = providerIds.indexOf(targetId);
-    if (draggedIndex < 0 || targetIndex < 0) return;
+    if (draggedIndex < 0 || providerIds.length < 2) return providerIds;
+
+    const rows = Array.from(document.querySelectorAll<HTMLElement>("[data-provider-row-id]"));
+    let insertIndex = providerIds.length;
+    for (const row of rows) {
+      const rowId = row.dataset.providerRowId;
+      if (!rowId || rowId === draggedId) continue;
+      const bounds = row.getBoundingClientRect();
+      if (clientY < bounds.top + bounds.height / 2) {
+        insertIndex = providerIds.indexOf(rowId);
+        break;
+      }
+    }
 
     const nextIds = [...providerIds];
     const [movedId] = nextIds.splice(draggedIndex, 1);
-    const nextTargetIndex = nextIds.indexOf(targetId);
-    nextIds.splice(nextTargetIndex + (placement === "after" ? 1 : 0), 0, movedId);
-    if (nextIds.join("\u0000") !== providerIds.join("\u0000")) {
+    if (insertIndex > draggedIndex) {
+      insertIndex -= 1;
+    }
+    nextIds.splice(Math.max(0, Math.min(insertIndex, nextIds.length)), 0, movedId);
+    return nextIds;
+  }
+
+  function finishPointerReorder(providerId: string, clientY: number) {
+    if (draggingProviderIdRef.current !== providerId) return;
+    draggingProviderIdRef.current = null;
+    setDraggingProviderId(null);
+    if (Math.abs(clientY - dragStartY.current) < 4) return;
+
+    const currentIds = providers.map((provider) => provider.id);
+    const nextIds = nextProviderOrder(providerId, clientY);
+    if (nextIds.join("\u0000") !== currentIds.join("\u0000")) {
       void onReorder(nextIds);
     }
   }
 
-  function handleDragStart(event: DragEvent<HTMLElement>, providerId: string) {
-    if (busy) {
-      event.preventDefault();
-      return;
-    }
-    setDraggingProviderId(providerId);
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", providerId);
-  }
-
-  function handleDragOver(event: DragEvent<HTMLDivElement>) {
+  function handlePointerDown(event: PointerEvent<HTMLButtonElement>, providerId: string) {
     if (busy) return;
     event.preventDefault();
-    event.dataTransfer.dropEffect = "move";
+    dragStartY.current = event.clientY;
+    draggingProviderIdRef.current = providerId;
+    setDraggingProviderId(providerId);
+    event.currentTarget.setPointerCapture(event.pointerId);
   }
 
-  function handleDrop(event: DragEvent<HTMLDivElement>, targetId: string) {
+  function handlePointerUp(event: PointerEvent<HTMLButtonElement>, providerId: string) {
     event.preventDefault();
-    const draggedId = event.dataTransfer.getData("text/plain") || draggingProviderId;
-    if (draggedId) {
-      const bounds = event.currentTarget.getBoundingClientRect();
-      const placement = event.clientY > bounds.top + bounds.height / 2 ? "after" : "before";
-      moveProvider(draggedId, targetId, placement);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
     }
-    setDraggingProviderId(null);
+    finishPointerReorder(providerId, event.clientY);
   }
 
   return (
@@ -2096,7 +2181,6 @@ function ProvidersScreen({
           <span>供应商</span>
           <span>余额</span>
           <span>延迟</span>
-          <span>最近检查</span>
           <span>启用</span>
           <span>操作</span>
         </header>
@@ -2105,19 +2189,24 @@ function ProvidersScreen({
           return (
             <div
               className={`provider-line ${provider.enabled ? "selected" : ""} ${draggingProviderId === provider.id ? "dragging" : ""}`}
+              data-provider-row-id={provider.id}
               key={provider.id}
-              onDragEnd={() => setDraggingProviderId(null)}
-              onDragOver={handleDragOver}
-              onDrop={(event) => handleDrop(event, provider.id)}
             >
-              <span
+              <button
+                aria-label="拖动调整优先级"
                 className="drag-handle"
-                draggable={!busy}
-                onDragStart={(event) => handleDragStart(event, provider.id)}
+                disabled={busy}
+                onPointerCancel={() => {
+                  draggingProviderIdRef.current = null;
+                  setDraggingProviderId(null);
+                }}
+                onPointerDown={(event) => handlePointerDown(event, provider.id)}
+                onPointerUp={(event) => handlePointerUp(event, provider.id)}
                 title="拖动调整优先级"
+                type="button"
               >
                 ⋮⋮
-              </span>
+              </button>
               <div className="provider-status">
                 <span className={`dot ${status.tone}`} />
                 <b>{status.label}</b>
@@ -2134,12 +2223,24 @@ function ProvidersScreen({
                   {formatBalanceForCard(provider.balance_label)}
                 </strong>
               </div>
-              <b className={provider.balance_error ? "danger-text" : "ok-text"}>
+              <b
+                className={provider.latency_error ? "danger-text" : provider.latency_label === "-" ? "muted-text" : "ok-text"}
+                title={provider.latency_error ?? undefined}
+              >
                 {provider.latency_label}
               </b>
-              <span>{provider.last_checked_label}</span>
               <Toggle checked={provider.enabled} disabled={busy} onChange={(checked) => onToggle(provider, checked)} />
-              <button className="ghost small" onClick={() => onEdit(provider, "base")}>编辑</button>
+              <div className="provider-toolbox">
+                <button aria-label="设置" className="icon-button" disabled={busy} onClick={() => onEdit(provider, "base")} title="设置" type="button">
+                  <ToolIcon type="settings" />
+                </button>
+                <button aria-label="测试延迟" className="icon-button" disabled={busy} onClick={() => void onTestLatency(provider)} title="测试延迟" type="button">
+                  <ToolIcon type="latency" />
+                </button>
+                <button aria-label="刷新余额" className="icon-button" disabled={busy} onClick={() => void onRefreshBalance(provider)} title="刷新余额" type="button">
+                  <ToolIcon type="balance" />
+                </button>
+              </div>
             </div>
           );
         })}
