@@ -76,6 +76,7 @@ type ProviderSummary = {
   base_url: string;
   balance_label: string;
   balance_error?: string | null;
+  latency_ms?: number | null;
   latency_label: string;
   latency_error?: string | null;
 };
@@ -498,8 +499,18 @@ function formatBalanceForCard(label: string) {
 
 function providerStatus(provider: ProviderSummary) {
   if (!provider.enabled) return { label: "不可用", tone: "danger" };
-  if (provider.balance_error || provider.latency_error) return { label: "异常", tone: "warn" };
+  if (provider.latency_error) return { label: "异常", tone: "warn" };
+  if (provider.latency_ms == null) return { label: "未测试", tone: "warn" };
+  if (provider.latency_ms != null && provider.latency_ms > 500) {
+    return { label: "高延迟", tone: "warn" };
+  }
   return { label: "正常", tone: "ok" };
+}
+
+function providerLatencyTone(provider: ProviderSummary) {
+  if (provider.latency_error) return "danger-text";
+  if (provider.latency_ms == null) return "muted-text";
+  return provider.latency_ms > 500 ? "warn-text" : "ok-text";
 }
 
 function routeBaseUrl(router: RouterConfig | RouterStatus) {
@@ -2224,7 +2235,7 @@ function ProvidersScreen({
                 </strong>
               </div>
               <b
-                className={provider.latency_error ? "danger-text" : provider.latency_label === "-" ? "muted-text" : "ok-text"}
+                className={providerLatencyTone(provider)}
                 title={provider.latency_error ?? undefined}
               >
                 {provider.latency_label}

@@ -378,6 +378,7 @@ struct ProviderSummary {
     route_order: usize,
     balance_label: String,
     balance_error: Option<String>,
+    latency_ms: Option<u64>,
     latency_label: String,
     latency_error: Option<String>,
 }
@@ -4084,6 +4085,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                     .map(|status| status.label.clone())
                     .unwrap_or_else(|| "未配置".to_string()),
                 balance_error: balance_status.and_then(|status| status.error.clone()),
+                latency_ms: connection_status.and_then(|status| status.latency_ms),
                 latency_label: connection_status
                     .and_then(|status| status.latency_ms)
                     .map(|latency_ms| format!("{latency_ms} ms"))
