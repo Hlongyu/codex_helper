@@ -483,11 +483,58 @@ button:disabled {
   fill: #101824;
   stroke: #8d95ff;
   stroke-width: 2;
+  cursor: pointer;
+  outline: none;
+}
+
+.trend-point:hover,
+.trend-point:focus {
+  fill: #6974ff;
+  stroke: #e4e7ff;
 }
 
 .trend-x-tick {
   fill: #8390a4;
   font-size: 12px;
+}
+
+.trend-tooltip {
+  position: absolute;
+  z-index: 2;
+  min-width: 156px;
+  border: 1px solid #38465b;
+  border-radius: 10px;
+  background: #0a111b;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.36);
+  color: #dce5f4;
+  padding: 10px 12px;
+  pointer-events: none;
+  transform: translate(-50%, calc(-100% - 12px));
+}
+
+.trend-tooltip strong,
+.trend-tooltip span,
+.trend-tooltip small {
+  display: block;
+  line-height: 1.35;
+}
+
+.trend-tooltip strong {
+  color: #ffffff;
+  font-size: 12px;
+}
+
+.trend-tooltip span {
+  margin-top: 4px;
+  color: #dfe4ff;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.trend-tooltip small {
+  margin-top: 3px;
+  color: #8390a4;
+  font-size: 11px;
 }
 
 .provider-health-list {

@@ -316,12 +316,6 @@ function trendBucketValue(bucket: Pick<RouteUsageBucket, "estimated_cost" | "tot
   return bucket.request_count;
 }
 
-function formatTrendValue(value: number, metric: TrendMetric) {
-  if (metric === "cost") return formatMoney(value);
-  if (metric === "tokens") return `${formatTokenCount(value)} Token`;
-  return `${Math.round(value)} 次`;
-}
-
 function emptyTrendBucket(label: string): RouteUsageBucket {
   return {
     label,
@@ -1797,6 +1791,11 @@ function TrendLineChart({
   range: TimeRange;
 }) {
   const gradientId = `${useId().replace(/:/g, "")}-${metric}`;
+  const [hoveredPoint, setHoveredPoint] = useState<{
+    bucket: RouteUsageBucket;
+    x: number;
+    y: number;
+  } | null>(null);
   const effectiveGranularity = granularity ?? (range === "all" ? "month" : range === "today" ? "hour" : "day");
   const completedBuckets = completeTrendBuckets(buckets, range, granularity);
   const values = completedBuckets.map((bucket) => trendBucketValue(bucket, metric));
@@ -1860,9 +1859,18 @@ function TrendLineChart({
         <polygon className="trend-area" fill={`url(#${gradientId})`} points={areaPoints} />
         <polyline className="trend-line" points={linePoints} />
         {points.map((point, index) => (
-          <circle className="trend-point" cx={point.x} cy={point.y} key={`${point.bucket.label}-${index}`} r="3.6">
-            <title>{`${point.bucket.label} ${formatTrendValue(point.value, metric)}`}</title>
-          </circle>
+          <circle
+            className="trend-point"
+            cx={point.x}
+            cy={point.y}
+            key={`${point.bucket.label}-${index}`}
+            onBlur={() => setHoveredPoint(null)}
+            onFocus={() => setHoveredPoint({ bucket: point.bucket, x: point.x, y: point.y })}
+            onMouseEnter={() => setHoveredPoint({ bucket: point.bucket, x: point.x, y: point.y })}
+            onMouseLeave={() => setHoveredPoint(null)}
+            r="5"
+            tabIndex={0}
+          />
         ))}
         {xTickIndexes.map((index) => {
           const point = points[index];
@@ -1881,6 +1889,19 @@ function TrendLineChart({
           );
         })}
       </svg>
+      {hoveredPoint && (
+        <div
+          className="trend-tooltip"
+          style={{
+            left: `${(hoveredPoint.x / chartWidth) * 100}%`,
+            top: `${(hoveredPoint.y / chartHeight) * 100}%`,
+          }}
+        >
+          <strong>{formatTrendXAxisLabel(hoveredPoint.bucket.label, effectiveGranularity)}</strong>
+          <span>消费 {formatMoney(hoveredPoint.bucket.estimated_cost)}</span>
+          <small>{formatTokenCount(hoveredPoint.bucket.total_tokens)} Token · {hoveredPoint.bucket.request_count} 次</small>
+        </div>
+      )}
     </div>
   );
 }
