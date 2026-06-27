@@ -1548,20 +1548,18 @@ async fn run_provider_connection_test(
     };
 
     let responses_url = join_url(&base_url, "responses");
-    let started = Instant::now();
     let response = client
         .post(responses_url)
         .bearer_auth(token.trim())
         .header("accept", "application/json")
         .json(&json!({
             "model": test_model,
-            "input": "ping",
+            "input": "你好",
             "max_output_tokens": 1,
             "stream": false,
         }))
         .send()
         .await;
-    let responses_latency = started.elapsed().as_millis() as u64;
 
     match response {
         Ok(response) => {
@@ -1572,15 +1570,15 @@ async fn run_provider_connection_test(
                     "responses",
                     "Responses API",
                     "ok",
-                    Some(responses_latency),
-                    format!("测试模型: {test_model}"),
+                    None,
+                    format!("测试模型可用: {test_model}"),
                 ));
             } else if test_model_unavailable_response(status, &body) {
                 steps.push(status_step(
                     "responses",
                     "Responses API",
                     "failed",
-                    Some(responses_latency),
+                    None,
                     format!("测试模型不可用: {test_model}"),
                 ));
             } else {
@@ -1588,7 +1586,7 @@ async fn run_provider_connection_test(
                     "responses",
                     "Responses API",
                     "failed",
-                    Some(responses_latency),
+                    None,
                     format!("接口返回 HTTP {}，模型 {test_model}", status.as_u16()),
                 ));
             }
@@ -1598,7 +1596,7 @@ async fn run_provider_connection_test(
                 "responses",
                 "Responses API",
                 "failed",
-                Some(responses_latency),
+                None,
                 format!("请求失败: {err}"),
             ));
         }
@@ -1646,8 +1644,23 @@ async fn fetch_provider_models(provider: &ProviderConfig) -> Result<(Vec<String>
     Ok((models_from_response_value(&value), latency_ms))
 }
 
+fn connection_latency_from_test(result: &ProviderConnectionTestResult) -> Option<u64> {
+    result
+        .steps
+        .iter()
+        .find(|step| step.key == "models")
+        .and_then(|step| step.latency_ms)
+        .or_else(|| {
+            result
+                .steps
+                .iter()
+                .find(|step| step.key == "base")
+                .and_then(|step| step.latency_ms)
+        })
+}
+
 fn connection_status_from_test(result: &ProviderConnectionTestResult) -> ConnectionStatus {
-    let latency_ms = result.steps.iter().filter_map(|step| step.latency_ms).max();
+    let latency_ms = connection_latency_from_test(result);
     let error = result
         .steps
         .iter()
@@ -4921,6 +4934,29 @@ mod tests {
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"invalid api key"}}"#,
         ));
+    }
+
+    #[test]
+    fn connection_status_latency_uses_remote_access_latency() {
+        let result = ProviderConnectionTestResult {
+            ok: false,
+            steps: vec![
+                status_step("base", "基础连接", "ok", Some(180), "上游可访问"),
+                status_step("models", "模型接口", "ok", Some(180), "鉴权通过"),
+                status_step(
+                    "responses",
+                    "Responses API",
+                    "failed",
+                    None,
+                    "测试模型不可用: test-model",
+                ),
+            ],
+        };
+
+        let status = connection_status_from_test(&result);
+
+        assert_eq!(status.latency_ms, Some(180));
+        assert_eq!(status.error.as_deref(), Some("测试模型不可用: test-model"));
     }
 
     #[test]
