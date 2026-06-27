@@ -1033,7 +1033,7 @@ button:disabled {
 
 .secret-field button,
 .quota-box button,
-.success-box button {
+.balance-test-box button {
   border: 1px solid #24364a;
   border-radius: 999px;
   background: #172235;
@@ -1043,7 +1043,7 @@ button:disabled {
 .switch-row-card,
 .test-box,
 .quota-box,
-.success-box,
+.balance-test-box,
 .route-box {
   border: 1px solid #203b3c;
   border-radius: 14px;
@@ -1060,7 +1060,7 @@ button:disabled {
 
 .switch-row-card p,
 .test-box p,
-.success-box p {
+.balance-test-box p {
   margin: 5px 0 0;
   color: #8390a4;
   font-size: 13px;
@@ -1118,12 +1118,27 @@ button:disabled {
   color: #f5f7fb;
 }
 
-.success-box {
+.balance-test-box {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 14px;
+  border-color: #26394f;
+  background: #151f2d;
+}
+
+.balance-test-box.ok {
   border-color: #1d7a52;
   background: #123325;
+}
+
+.balance-test-box.failed {
+  border-color: #733041;
+  background: #331620;
+}
+
+.balance-test-box.failed p {
+  color: #ff95a5;
 }
 
 .route-box {

@@ -439,6 +439,9 @@ struct SaveRouterPayload {
 #[derive(Debug, Deserialize)]
 struct QueryBalancePayload {
     provider_id: String,
+    balance_query: Option<BalanceQueryConfig>,
+    base_url: Option<String>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1234,6 +1237,48 @@ fn normalize_balance_config(
         config.auth_mode = BalanceAuthMode::SeparateToken;
     }
     config
+}
+
+fn apply_provider_connection_draft(
+    provider: &mut ProviderConfig,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    if base_url.is_none() && api_key.is_none() {
+        return Ok(());
+    }
+
+    let mut config = provider.config.clone();
+    if let Some(base_url) = base_url {
+        let base_url = base_url.trim();
+        if base_url.is_empty() {
+            return Err("Base URL 不能为空".to_string());
+        }
+        set_json_path(
+            &mut config,
+            &["model_provider"],
+            Value::String("custom".to_string()),
+        )?;
+        set_json_path(
+            &mut config,
+            &["model_providers", "custom", "base_url"],
+            Value::String(base_url.to_string()),
+        )?;
+    }
+    if let Some(api_key) = api_key {
+        set_json_path(
+            &mut config,
+            &["model_provider"],
+            Value::String("custom".to_string()),
+        )?;
+        set_json_path(
+            &mut config,
+            &["model_providers", "custom", "experimental_bearer_token"],
+            Value::String(api_key.trim().to_string()),
+        )?;
+    }
+    provider.config = config;
+    Ok(())
 }
 
 fn flatten(value: &Value) -> BTreeMap<String, Value> {
@@ -3875,36 +3920,11 @@ fn save_provider(
         provider.enabled = enabled;
     }
     if payload.base_url.is_some() || payload.api_key.is_some() {
-        let mut config = provider.config.clone();
-        if let Some(base_url) = payload.base_url.as_deref() {
-            let base_url = base_url.trim();
-            if base_url.is_empty() {
-                return Err("Base URL 不能为空".to_string());
-            }
-            set_json_path(
-                &mut config,
-                &["model_provider"],
-                Value::String("custom".to_string()),
-            )?;
-            set_json_path(
-                &mut config,
-                &["model_providers", "custom", "base_url"],
-                Value::String(base_url.to_string()),
-            )?;
-        }
-        if let Some(api_key) = payload.api_key.as_deref() {
-            set_json_path(
-                &mut config,
-                &["model_provider"],
-                Value::String("custom".to_string()),
-            )?;
-            set_json_path(
-                &mut config,
-                &["model_providers", "custom", "experimental_bearer_token"],
-                Value::String(api_key.trim().to_string()),
-            )?;
-        }
-        provider.config = config;
+        apply_provider_connection_draft(
+            provider,
+            payload.base_url.as_deref(),
+            payload.api_key.as_deref(),
+        )?;
     } else if !payload.config_toml.trim().is_empty() {
         provider.config = toml_text_to_json(&payload.config_toml)?;
     }
@@ -4152,8 +4172,17 @@ async fn query_provider_balance(
         .find(|provider| provider.id == payload.provider_id)
         .cloned()
         .ok_or_else(|| "供应商不存在".to_string())?;
+    let mut test_provider = provider.clone();
+    apply_provider_connection_draft(
+        &mut test_provider,
+        payload.base_url.as_deref(),
+        payload.api_key.as_deref(),
+    )?;
+    if let Some(balance_query) = payload.balance_query {
+        test_provider.balance_query = normalize_balance_config(balance_query, &test_provider);
+    }
 
-    let status = fetch_balance(&provider).await;
+    let status = fetch_balance(&test_provider).await;
     if let Some(provider) = state
         .providers
         .iter_mut()

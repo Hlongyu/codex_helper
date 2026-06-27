@@ -660,6 +660,7 @@ function App() {
   const [balanceQuery, setBalanceQuery] = useState<BalanceQueryConfig>(() =>
     defaultBalanceQuery(),
   );
+  const [balanceTestStatus, setBalanceTestStatus] = useState<BalanceStatus | null>(null);
   const [routerDraft, setRouterDraft] = useState<RouterConfig>(() => defaultRouterConfig());
   const [secretVisible, setSecretVisible] = useState(false);
   const [balanceTokenVisible, setBalanceTokenVisible] = useState(false);
@@ -791,6 +792,7 @@ function App() {
     setEditorTab(tab);
     setSecretVisible(false);
     setBalanceTokenVisible(false);
+    setBalanceTestStatus(targetFull.balance_status ?? null);
     setEditorOpen(true);
   }
 
@@ -850,10 +852,35 @@ function App() {
   async function testBalance() {
     if (!editingId) return;
     await run(async () => {
+      const nextBalance = {
+        ...balanceQuery,
+        endpoint: balanceQuery.endpoint || endpointFromBaseUrl(providerBaseUrl),
+      };
+      const payload: Record<string, unknown> = {
+        provider_id: editingId,
+        base_url: providerBaseUrl,
+        balance_query: nextBalance,
+      };
+      if (providerApiKeyDirty) {
+        payload.api_key = providerApiKey;
+      }
       const state = await callCommand<AppState>("query_provider_balance", {
-        payload: { provider_id: editingId },
+        payload,
       });
       setAppState(state);
+      if (state.active_provider?.id === editingId) {
+        setBalanceTestStatus(state.active_provider.balance_status ?? null);
+      } else {
+        const summary = state.providers.find((provider) => provider.id === editingId);
+        setBalanceTestStatus(summary
+          ? {
+              amount: null,
+              label: summary.balance_label,
+              checked_at: null,
+              error: summary.balance_error ?? null,
+            }
+          : null);
+      }
     });
   }
 
@@ -918,6 +945,7 @@ function App() {
   }
 
   function updateBalanceQuery(patch: Partial<BalanceQueryConfig>) {
+    setBalanceTestStatus(null);
     setBalanceQuery((current) => {
       const next = { ...current, ...patch };
       if (patch.query_type) {
@@ -1114,6 +1142,7 @@ function App() {
       {editorOpen && (
         <ProviderEditor
           balanceQuery={balanceQuery}
+          balanceTestStatus={balanceTestStatus}
           balanceTokenVisible={balanceTokenVisible}
           busy={busy}
           onBalanceTokenVisible={setBalanceTokenVisible}
@@ -2016,6 +2045,7 @@ function ProvidersScreen({
 
 function ProviderEditor(props: {
   balanceQuery: BalanceQueryConfig;
+  balanceTestStatus: BalanceStatus | null;
   balanceTokenVisible: boolean;
   busy: boolean;
   onBalanceTokenVisible: (visible: boolean) => void;
@@ -2039,6 +2069,7 @@ function ProviderEditor(props: {
 }) {
   const {
     balanceQuery,
+    balanceTestStatus,
     balanceTokenVisible,
     busy,
     onBalanceTokenVisible,
@@ -2220,12 +2251,26 @@ function ProviderEditor(props: {
                 <b>1 USD</b>
                 <button>编辑比例</button>
               </div>
-              <div className="success-box">
+              <div className={`balance-test-box ${balanceTestStatus?.error ? "failed" : balanceTestStatus ? "ok" : ""}`}>
                 <div>
-                  <strong>查询成功</strong>
-                  <p>9,310,000 quota → $18.62</p>
+                  <strong>
+                    {balanceTestStatus?.error
+                      ? "查询失败"
+                      : balanceTestStatus
+                        ? "查询成功"
+                        : "等待测试"}
+                  </strong>
+                  <p>
+                    {balanceTestStatus?.error
+                      ? balanceTestStatus.error
+                      : balanceTestStatus
+                        ? balanceTestStatus.label
+                        : "使用当前表单配置发起一次余额查询，不会保存草稿。"}
+                  </p>
                 </div>
-                <button onClick={onTestBalance} type="button">测试查询</button>
+                <button disabled={busy} onClick={onTestBalance} type="button">
+                  {busy ? "查询中" : "测试查询"}
+                </button>
               </div>
             </>
           )}
