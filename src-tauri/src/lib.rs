@@ -1331,10 +1331,15 @@ fn test_model_unavailable_response(status: reqwest::StatusCode, body: &str) -> b
     if status == reqwest::StatusCode::NOT_FOUND {
         return true;
     }
+    let lower = body.to_lowercase();
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return lower.contains("model_not_found")
+            || lower.contains("no available channel")
+            || lower.contains("codex-helper-connectivity-probe");
+    }
     if status == reqwest::StatusCode::BAD_REQUEST
         || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
     {
-        let lower = body.to_lowercase();
         if lower.contains("api key")
             || lower.contains("apikey")
             || lower.contains("token")
@@ -4764,6 +4769,14 @@ mod tests {
         assert!(test_model_unavailable_response(
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"model not found"}}"#,
+        ));
+        assert!(test_model_unavailable_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"code":"model_not_found","message":"No available channel for model codex-helper-connectivity-probe"}}"#,
+        ));
+        assert!(!test_model_unavailable_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"message":"upstream temporarily unavailable"}}"#,
         ));
         assert!(!test_model_unavailable_response(
             reqwest::StatusCode::BAD_REQUEST,
