@@ -445,6 +445,28 @@ struct QueryBalancePayload {
     api_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TestProviderConnectionPayload {
+    provider_id: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderConnectionTestStep {
+    key: String,
+    label: String,
+    status: String,
+    latency_ms: Option<u64>,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderConnectionTestResult {
+    ok: bool,
+    steps: Vec<ProviderConnectionTestStep>,
+}
+
 #[derive(Debug, Clone)]
 struct UsageEvent {
     timestamp: DateTime<Utc>,
@@ -1290,6 +1312,224 @@ fn apply_provider_connection_draft(
     }
     provider.config = config;
     Ok(())
+}
+
+fn status_step(
+    key: &str,
+    label: &str,
+    status: &str,
+    latency_ms: Option<u64>,
+    message: impl Into<String>,
+) -> ProviderConnectionTestStep {
+    ProviderConnectionTestStep {
+        key: key.to_string(),
+        label: label.to_string(),
+        status: status.to_string(),
+        latency_ms,
+        message: message.into(),
+    }
+}
+
+fn test_model_unavailable_response(status: reqwest::StatusCode, body: &str) -> bool {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return true;
+    }
+    if status == reqwest::StatusCode::BAD_REQUEST
+        || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    {
+        let lower = body.to_lowercase();
+        if lower.contains("api key")
+            || lower.contains("apikey")
+            || lower.contains("token")
+            || lower.contains("unauthorized")
+            || lower.contains("forbidden")
+            || lower.contains("permission")
+        {
+            return false;
+        }
+        return lower.contains("model")
+            || lower.contains("not found")
+            || lower.contains("not exist")
+            || lower.contains("unknown")
+            || lower.contains("invalid");
+    }
+    false
+}
+
+async fn run_provider_connection_test(provider: &ProviderConfig) -> ProviderConnectionTestResult {
+    let mut steps = Vec::new();
+    let Some(base_url) =
+        custom_provider_base_url(provider).filter(|value| !value.trim().is_empty())
+    else {
+        steps.push(status_step(
+            "base",
+            "基础连接",
+            "failed",
+            None,
+            "Base URL 为空",
+        ));
+        return ProviderConnectionTestResult { ok: false, steps };
+    };
+    let Some(token) = custom_provider_token(provider).filter(|value| !value.trim().is_empty())
+    else {
+        steps.push(status_step(
+            "base",
+            "基础连接",
+            "failed",
+            None,
+            "API Key 为空",
+        ));
+        return ProviderConnectionTestResult { ok: false, steps };
+    };
+
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            steps.push(status_step(
+                "base",
+                "基础连接",
+                "failed",
+                None,
+                format!("创建 HTTP 客户端失败: {err}"),
+            ));
+            return ProviderConnectionTestResult { ok: false, steps };
+        }
+    };
+
+    let models_url = join_url(&base_url, "models");
+    let started = Instant::now();
+    let models_response = client
+        .get(&models_url)
+        .bearer_auth(token.trim())
+        .header("accept", "application/json")
+        .send()
+        .await;
+    let models_latency = started.elapsed().as_millis() as u64;
+
+    match models_response {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                steps.push(status_step(
+                    "base",
+                    "基础连接",
+                    "ok",
+                    Some(models_latency),
+                    "上游可访问",
+                ));
+                steps.push(status_step(
+                    "models",
+                    "模型接口",
+                    "ok",
+                    Some(models_latency),
+                    "鉴权通过",
+                ));
+            } else if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                steps.push(status_step(
+                    "base",
+                    "基础连接",
+                    "ok",
+                    Some(models_latency),
+                    "上游可访问",
+                ));
+                steps.push(status_step(
+                    "models",
+                    "模型接口",
+                    "failed",
+                    Some(models_latency),
+                    format!("鉴权失败 HTTP {}", status.as_u16()),
+                ));
+                return ProviderConnectionTestResult { ok: false, steps };
+            } else {
+                steps.push(status_step(
+                    "base",
+                    "基础连接",
+                    "warn",
+                    Some(models_latency),
+                    format!("/models 返回 HTTP {}", status.as_u16()),
+                ));
+                steps.push(status_step(
+                    "models",
+                    "模型接口",
+                    "warn",
+                    Some(models_latency),
+                    "模型列表不可用，继续探测 Responses",
+                ));
+            }
+        }
+        Err(err) => {
+            steps.push(status_step(
+                "base",
+                "基础连接",
+                "failed",
+                Some(models_latency),
+                format!("请求 /models 失败: {err}"),
+            ));
+            return ProviderConnectionTestResult { ok: false, steps };
+        }
+    }
+
+    let responses_url = join_url(&base_url, "responses");
+    let started = Instant::now();
+    let response = client
+        .post(responses_url)
+        .bearer_auth(token.trim())
+        .header("accept", "application/json")
+        .json(&json!({
+            "model": "codex-helper-connectivity-probe",
+            "input": "ping",
+            "max_output_tokens": 1,
+            "stream": false,
+        }))
+        .send()
+        .await;
+    let responses_latency = started.elapsed().as_millis() as u64;
+
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if status.is_success() || test_model_unavailable_response(status, &body) {
+                steps.push(status_step(
+                    "responses",
+                    "Responses API",
+                    "ok",
+                    Some(responses_latency),
+                    if status.is_success() {
+                        "端点可用"
+                    } else {
+                        "端点可达，测试模型被拒绝"
+                    },
+                ));
+            } else {
+                steps.push(status_step(
+                    "responses",
+                    "Responses API",
+                    "failed",
+                    Some(responses_latency),
+                    format!("接口返回 HTTP {}", status.as_u16()),
+                ));
+            }
+        }
+        Err(err) => {
+            steps.push(status_step(
+                "responses",
+                "Responses API",
+                "failed",
+                Some(responses_latency),
+                format!("请求失败: {err}"),
+            ));
+        }
+    }
+
+    let ok = steps.iter().all(|step| step.status != "failed");
+    ProviderConnectionTestResult { ok, steps }
 }
 
 fn flatten(value: &Value) -> BTreeMap<String, Value> {
@@ -4213,6 +4453,27 @@ async fn query_provider_balance(
     build_app_state(state, &router_runtime)
 }
 
+#[tauri::command]
+async fn test_provider_connection(
+    payload: TestProviderConnectionPayload,
+) -> Result<ProviderConnectionTestResult, String> {
+    let state = load_state_file()?;
+    let provider = state
+        .providers
+        .iter()
+        .find(|provider| provider.id == payload.provider_id)
+        .cloned()
+        .ok_or_else(|| "供应商不存在".to_string())?;
+    let mut test_provider = provider.clone();
+    apply_provider_connection_draft(
+        &mut test_provider,
+        payload.base_url.as_deref(),
+        payload.api_key.as_deref(),
+    )?;
+
+    Ok(run_provider_connection_test(&test_provider).await)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -4239,7 +4500,8 @@ pub fn run() {
             load_usage_stats,
             load_route_logs,
             load_route_usage_stats,
-            query_provider_balance
+            query_provider_balance,
+            test_provider_connection
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -4396,5 +4658,17 @@ mod tests {
         let merged = merge_balance_config_draft(&provider, draft);
 
         assert_eq!(merged.query_token, "saved-balance-token");
+    }
+
+    #[test]
+    fn connection_probe_distinguishes_model_and_auth_errors() {
+        assert!(test_model_unavailable_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"model not found"}}"#,
+        ));
+        assert!(!test_model_unavailable_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"invalid api key"}}"#,
+        ));
     }
 }

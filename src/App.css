@@ -1090,8 +1090,14 @@ button:disabled {
   padding-top: 12px;
 }
 
-.test-box b {
-  color: #56e0aa;
+.test-box li small {
+  grid-column: 2 / -1;
+  overflow: hidden;
+  color: #748299;
+  font-size: 12px;
+  margin-top: 4px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .test-box em {

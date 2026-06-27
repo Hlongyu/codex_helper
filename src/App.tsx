@@ -32,6 +32,19 @@ type BalanceStatus = {
   error?: string | null;
 };
 
+type ProviderConnectionTestStep = {
+  key: string;
+  label: string;
+  status: "ok" | "warn" | "failed" | string;
+  latency_ms?: number | null;
+  message: string;
+};
+
+type ProviderConnectionTestResult = {
+  ok: boolean;
+  steps: ProviderConnectionTestStep[];
+};
+
 type RouterConfig = {
   enabled: boolean;
   host: string;
@@ -657,6 +670,7 @@ function App() {
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerApiKeyDirty, setProviderApiKeyDirty] = useState(false);
   const [providerEnabled, setProviderEnabled] = useState(true);
+  const [connectionTestResult, setConnectionTestResult] = useState<ProviderConnectionTestResult | null>(null);
   const [balanceQuery, setBalanceQuery] = useState<BalanceQueryConfig>(() =>
     defaultBalanceQuery(),
   );
@@ -792,6 +806,7 @@ function App() {
     setEditorTab(tab);
     setSecretVisible(false);
     setBalanceTokenVisible(false);
+    setConnectionTestResult(null);
     setBalanceTestStatus(targetFull.balance_status ?? null);
     setEditorOpen(true);
   }
@@ -882,6 +897,23 @@ function App() {
             }
           : null);
       }
+    });
+  }
+
+  async function testConnection() {
+    if (!editingId) return;
+    await run(async () => {
+      const payload: Record<string, unknown> = {
+        provider_id: editingId,
+        base_url: providerBaseUrl,
+      };
+      if (providerApiKeyDirty) {
+        payload.api_key = providerApiKey;
+      }
+      const result = await callCommand<ProviderConnectionTestResult>("test_provider_connection", {
+        payload,
+      });
+      setConnectionTestResult(result);
     });
   }
 
@@ -1146,11 +1178,13 @@ function App() {
           balanceTestStatus={balanceTestStatus}
           balanceTokenVisible={balanceTokenVisible}
           busy={busy}
+          connectionTestResult={connectionTestResult}
           onBalanceTokenVisible={setBalanceTokenVisible}
           onClose={() => setEditorOpen(false)}
           onSave={saveProvider}
           onTab={setEditorTab}
           onTestBalance={testBalance}
+          onTestConnection={testConnection}
           onUpdateBalance={updateBalanceQuery}
           providerApiKey={providerApiKey}
           providerBaseUrl={providerBaseUrl}
@@ -1160,11 +1194,13 @@ function App() {
           setProviderApiKey={(value) => {
             setProviderApiKey(value);
             setBalanceTestStatus(null);
+            setConnectionTestResult(null);
           }}
           setProviderApiKeyDirty={setProviderApiKeyDirty}
           setProviderBaseUrl={(value) => {
             setProviderBaseUrl(value);
             setBalanceTestStatus(null);
+            setConnectionTestResult(null);
           }}
           setProviderEnabled={setProviderEnabled}
           setProviderName={setProviderName}
@@ -2055,11 +2091,13 @@ function ProviderEditor(props: {
   balanceTestStatus: BalanceStatus | null;
   balanceTokenVisible: boolean;
   busy: boolean;
+  connectionTestResult: ProviderConnectionTestResult | null;
   onBalanceTokenVisible: (visible: boolean) => void;
   onClose: () => void;
   onSave: () => void;
   onTab: (tab: EditorTab) => void;
   onTestBalance: () => void;
+  onTestConnection: () => void;
   onUpdateBalance: (patch: Partial<BalanceQueryConfig>) => void;
   providerApiKey: string;
   providerBaseUrl: string;
@@ -2079,11 +2117,13 @@ function ProviderEditor(props: {
     balanceTestStatus,
     balanceTokenVisible,
     busy,
+    connectionTestResult,
     onBalanceTokenVisible,
     onClose,
     onSave,
     onTab,
     onTestBalance,
+    onTestConnection,
     onUpdateBalance,
     providerApiKey,
     providerBaseUrl,
@@ -2160,11 +2200,31 @@ function ProviderEditor(props: {
                   <strong>连接测试</strong>
                   <p>保存前验证上游接口是否可用</p>
                 </div>
-                <button className="ghost">重新测试</button>
+                <button className="ghost" disabled={busy} onClick={onTestConnection} type="button">
+                  {busy ? "测试中" : "重新测试"}
+                </button>
                 <ul>
-                  <li><span className="dot green" />基础连接 <b>正常</b> <em>213 ms</em></li>
-                  <li><span className="dot green" />Responses API <b>正常</b> <em>721 ms</em></li>
-                  <li><span className="dot green" />流式输出 <b>支持</b> <em>已验证</em></li>
+                  {(connectionTestResult?.steps.length
+                    ? connectionTestResult.steps
+                    : [
+                        {
+                          key: "pending",
+                          label: "等待测试",
+                          status: "warn",
+                          latency_ms: null,
+                          message: "使用当前 Base URL 与 API Key 发起测试",
+                        },
+                      ]).map((step) => (
+                    <li key={step.key}>
+                      <span className={`dot ${step.status === "failed" ? "danger" : step.status === "warn" ? "amber" : "green"}`} />
+                      <span>{step.label}</span>
+                      <b className={step.status === "failed" ? "danger-text" : step.status === "warn" ? "warn-text" : "ok-text"}>
+                        {step.status === "failed" ? "失败" : step.status === "warn" ? "注意" : "正常"}
+                      </b>
+                      <em>{step.latency_ms == null ? "-" : `${step.latency_ms} ms`}</em>
+                      <small>{step.message}</small>
+                    </li>
+                  ))}
                 </ul>
               </div>
             </>
