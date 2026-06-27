@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -299,9 +299,9 @@ function rangeLabel(range: TimeRange) {
 }
 
 function trendMetricLabel(metric: TrendMetric) {
-  if (metric === "cost") return "费用";
-  if (metric === "tokens") return "Token";
-  return "请求";
+  if (metric === "cost") return "消费";
+  if (metric === "tokens") return "总 Token";
+  return "成功请求";
 }
 
 function bucketGranularityLabel(value?: string) {
@@ -318,8 +318,93 @@ function trendBucketValue(bucket: Pick<RouteUsageBucket, "estimated_cost" | "tot
 
 function formatTrendValue(value: number, metric: TrendMetric) {
   if (metric === "cost") return formatMoney(value);
-  if (metric === "tokens") return `${formatCompact(value)} Token`;
+  if (metric === "tokens") return `${formatTokenCount(value)} Token`;
   return `${Math.round(value)} 次`;
+}
+
+function emptyTrendBucket(label: string): RouteUsageBucket {
+  return {
+    label,
+    request_count: 0,
+    input_tokens: 0,
+    uncached_input_tokens: 0,
+    cached_input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    estimated_cost: 0,
+  };
+}
+
+function parseDateKey(value: string) {
+  const [year, month, day] = value.split("-").map(Number);
+  return new Date(year, (month || 1) - 1, day || 1);
+}
+
+function completeTrendBuckets(
+  buckets: RouteUsageBucket[],
+  range: TimeRange,
+  granularity?: string,
+): RouteUsageBucket[] {
+  const effectiveGranularity = granularity ?? (range === "all" ? "month" : range === "today" ? "hour" : "day");
+  const bucketByLabel = new Map(buckets.map((bucket) => [bucket.label, bucket]));
+
+  if (effectiveGranularity === "hour") {
+    return Array.from({ length: 24 }, (_, hour) => {
+      const label = `${String(hour).padStart(2, "0")}:00`;
+      return bucketByLabel.get(label) ?? emptyTrendBucket(label);
+    });
+  }
+
+  if (effectiveGranularity === "day" || range === "week" || range === "month") {
+    const { start_day, end_day } = filterForRange(range);
+    if (start_day && end_day) {
+      const rows: RouteUsageBucket[] = [];
+      const cursor = parseDateKey(start_day);
+      const end = parseDateKey(end_day);
+      while (cursor <= end && rows.length < 370) {
+        const label = dateKey(cursor);
+        rows.push(bucketByLabel.get(label) ?? emptyTrendBucket(label));
+        cursor.setDate(cursor.getDate() + 1);
+      }
+      return rows;
+    }
+  }
+
+  const sorted = [...buckets].sort((left, right) => left.label.localeCompare(right.label));
+  return sorted.length ? sorted : [emptyTrendBucket("暂无")];
+}
+
+function niceTrendMax(value: number, metric: TrendMetric) {
+  if (value <= 0) return metric === "cost" ? 0.000001 : 1;
+  const exponent = Math.floor(Math.log10(value));
+  const base = Math.pow(10, exponent);
+  const fraction = value / base;
+  const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+  return niceFraction * base;
+}
+
+function trendTickIndexes(count: number, maxTicks = 6) {
+  if (count <= maxTicks) return Array.from({ length: count }, (_, index) => index);
+  const indexes = new Set<number>();
+  for (let index = 0; index < maxTicks; index += 1) {
+    indexes.add(Math.round((index * (count - 1)) / (maxTicks - 1)));
+  }
+  return [...indexes].sort((left, right) => left - right);
+}
+
+function formatTrendAxisValue(value: number, metric: TrendMetric) {
+  if (metric === "cost") return formatMoney(value);
+  if (metric === "tokens") return formatTokenCount(value);
+  return String(Math.round(value));
+}
+
+function formatTrendXAxisLabel(label: string, granularity?: string) {
+  if (label === "暂无") return label;
+  if (granularity === "hour") return label;
+  if (granularity === "month") return label;
+  const [, month, day] = label.split("-");
+  if (month && day) return `${month}-${day}`;
+  return label;
 }
 
 function formatTokenTriplet(log: RouteRequestLog) {
@@ -1245,8 +1330,7 @@ function UsageScreen({
   };
   const trendBuckets = stats?.buckets.length
     ? stats.buckets
-    : [{ label: "00:00", estimated_cost: 0, total_tokens: 0, request_count: 0 }];
-  const maxTrendValue = Math.max(...trendBuckets.map((bucket) => trendBucketValue(bucket, trendMetric)), 1);
+    : [emptyTrendBucket("00:00")];
   const totalCost = summary.estimated_cost || 1;
 
   return (
@@ -1300,7 +1384,7 @@ function UsageScreen({
           <div className="card-head">
             <div>
               <h3>使用趋势</h3>
-              <p>{trendMetricLabel(trendMetric)} · {rangeLabel(timeRange)} · {bucketGranularityLabel(stats?.bucket_granularity)}</p>
+              <p>{rangeLabel(timeRange)} {bucketGranularityLabel(stats?.bucket_granularity)}的{trendMetricLabel(trendMetric)}</p>
             </div>
             <div className="mini-tabs">
               {(["cost", "tokens", "requests"] as TrendMetric[]).map((metric) => (
@@ -1315,21 +1399,12 @@ function UsageScreen({
               ))}
             </div>
           </div>
-          <div className="line-chart">
-            {trendBuckets.map((bucket, index) => {
-              const value = trendBucketValue(bucket, trendMetric);
-              return (
-                <span
-                  key={`${bucket.label}-${index}`}
-                  style={{ height: `${Math.max(6, (value / maxTrendValue) * 100)}%` }}
-                  title={`${bucket.label} ${formatTrendValue(value, trendMetric)}`}
-                />
-              );
-            })}
-          </div>
-          <div className="chart-labels dense">
-            {(stats?.buckets ?? []).slice(0, 12).map((bucket) => <span key={bucket.label}>{bucket.label.replace(":00", "")}</span>)}
-          </div>
+          <TrendLineChart
+            buckets={trendBuckets}
+            granularity={stats?.bucket_granularity}
+            metric={trendMetric}
+            range={timeRange}
+          />
         </article>
 
         <article className="card cost-distribution">
@@ -1551,8 +1626,7 @@ function Dashboard(props: {
   const avgTotalMs = stats?.average_total_ms ?? null;
   const trendBuckets = stats?.buckets.length
     ? stats.buckets
-    : [{ label: "暂无", estimated_cost: 0, total_tokens: 0, request_count: 0 }];
-  const maxTrendValue = Math.max(...trendBuckets.map((bucket) => trendBucketValue(bucket, trendMetric)), 1);
+    : [emptyTrendBucket("暂无")];
   const tokenTooltip = [
     `非缓存输入: ${formatTokenCount(uncachedInput)}`,
     `缓存输入: ${formatTokenCount(cachedInput)}`,
@@ -1588,7 +1662,7 @@ function Dashboard(props: {
           <div className="card-head">
             <div>
               <h3>使用趋势</h3>
-              <p>{trendMetricLabel(trendMetric)} · {rangeLabel(timeRange)} · {bucketGranularityLabel(stats?.bucket_granularity)}</p>
+              <p>{rangeLabel(timeRange)} {bucketGranularityLabel(stats?.bucket_granularity)}的{trendMetricLabel(trendMetric)}</p>
             </div>
             <div className="mini-tabs">
               {(["cost", "tokens", "requests"] as TrendMetric[]).map((metric) => (
@@ -1603,23 +1677,12 @@ function Dashboard(props: {
               ))}
             </div>
           </div>
-          <div className="chart">
-            {trendBuckets.map((bucket, index) => {
-              const value = trendBucketValue(bucket, trendMetric);
-              return (
-                <span
-                  key={`${bucket.label}-${index}`}
-                  style={{ height: `${Math.max(6, (value / maxTrendValue) * 100)}%` }}
-                  title={`${bucket.label} ${formatTrendValue(value, trendMetric)}`}
-                />
-              );
-            })}
-          </div>
-          <div className="chart-labels">
-            {trendBuckets.slice(0, 8).map((bucket, index) => (
-              <span key={`${bucket.label}-${index}`}>{bucket.label.replace(":00", "")}</span>
-            ))}
-          </div>
+          <TrendLineChart
+            buckets={trendBuckets}
+            granularity={stats?.bucket_granularity}
+            metric={trendMetric}
+            range={timeRange}
+          />
         </article>
 
         <article className="card provider-card">
@@ -1719,6 +1782,106 @@ function Metric({
       <strong>{value}</strong>
       {sub && <small>{sub}</small>}
     </article>
+  );
+}
+
+function TrendLineChart({
+  buckets,
+  granularity,
+  metric,
+  range,
+}: {
+  buckets: RouteUsageBucket[];
+  granularity?: string;
+  metric: TrendMetric;
+  range: TimeRange;
+}) {
+  const gradientId = `${useId().replace(/:/g, "")}-${metric}`;
+  const effectiveGranularity = granularity ?? (range === "all" ? "month" : range === "today" ? "hour" : "day");
+  const completedBuckets = completeTrendBuckets(buckets, range, granularity);
+  const values = completedBuckets.map((bucket) => trendBucketValue(bucket, metric));
+  const rawMax = Math.max(...values, 0);
+  const yMax = niceTrendMax(rawMax, metric);
+  const chartWidth = 640;
+  const chartHeight = 210;
+  const padding = { top: 12, right: 16, bottom: 24, left: 72 };
+  const plotWidth = chartWidth - padding.left - padding.right;
+  const plotHeight = chartHeight - padding.top - padding.bottom;
+  const xFor = (index: number) =>
+    padding.left + (completedBuckets.length <= 1 ? plotWidth / 2 : (index / (completedBuckets.length - 1)) * plotWidth);
+  const yFor = (value: number) => padding.top + plotHeight - (yMax ? (value / yMax) * plotHeight : 0);
+  const points = completedBuckets.map((bucket, index) => ({
+    bucket,
+    value: values[index] ?? 0,
+    x: xFor(index),
+    y: yFor(values[index] ?? 0),
+  }));
+  const linePoints = points.map((point) => `${point.x},${point.y}`).join(" ");
+  const areaPoints = [
+    `${padding.left},${padding.top + plotHeight}`,
+    ...points.map((point) => `${point.x},${point.y}`),
+    `${padding.left + plotWidth},${padding.top + plotHeight}`,
+  ].join(" ");
+  const yTicks = [1, 0.75, 0.5, 0.25, 0].map((ratio) => ({
+    ratio,
+    value: yMax * ratio,
+    y: padding.top + plotHeight - ratio * plotHeight,
+  }));
+  const xTickIndexes = trendTickIndexes(completedBuckets.length);
+
+  return (
+    <div className="trend-line-chart">
+      <div className="trend-y-axis">
+        {yTicks.map((tick) => (
+          <span key={tick.ratio} style={{ top: `${(tick.y / chartHeight) * 100}%` }}>
+            {formatTrendAxisValue(tick.value, metric)}
+          </span>
+        ))}
+      </div>
+      <svg className="trend-svg" viewBox={`0 0 ${chartWidth} ${chartHeight}`} role="img" aria-label={`${trendMetricLabel(metric)}趋势`}>
+        <defs>
+          <linearGradient id={gradientId} x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="#6974ff" stopOpacity="0.22" />
+            <stop offset="100%" stopColor="#6974ff" stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+        {yTicks.map((tick) => (
+          <line
+            className="trend-grid-line"
+            key={tick.ratio}
+            x1={padding.left}
+            x2={padding.left + plotWidth}
+            y1={tick.y}
+            y2={tick.y}
+          />
+        ))}
+        <line className="trend-axis-line" x1={padding.left} x2={padding.left} y1={padding.top} y2={padding.top + plotHeight} />
+        <line className="trend-axis-line" x1={padding.left} x2={padding.left + plotWidth} y1={padding.top + plotHeight} y2={padding.top + plotHeight} />
+        <polygon className="trend-area" fill={`url(#${gradientId})`} points={areaPoints} />
+        <polyline className="trend-line" points={linePoints} />
+        {points.map((point, index) => (
+          <circle className="trend-point" cx={point.x} cy={point.y} key={`${point.bucket.label}-${index}`} r="3.6">
+            <title>{`${point.bucket.label} ${formatTrendValue(point.value, metric)}`}</title>
+          </circle>
+        ))}
+        {xTickIndexes.map((index) => {
+          const point = points[index];
+          const isFirst = index === 0;
+          const isLast = index === completedBuckets.length - 1;
+          return (
+            <text
+              className="trend-x-tick"
+              key={`${point.bucket.label}-${index}`}
+              textAnchor={isFirst ? "start" : isLast ? "end" : "middle"}
+              x={point.x}
+              y={chartHeight - 4}
+            >
+              {formatTrendXAxisLabel(point.bucket.label, effectiveGranularity)}
+            </text>
+          );
+        })}
+      </svg>
+    </div>
   );
 }
 

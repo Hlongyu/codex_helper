@@ -426,30 +426,68 @@ button:disabled {
   gap: 16px;
 }
 
-.chart {
-  display: flex;
-  height: 198px;
-  align-items: flex-end;
-  gap: 1px;
-  margin-top: 22px;
-  border-bottom: 1px solid #314051;
-  background:
-    linear-gradient(#253244 1px, transparent 1px) 0 0 / 100% 49px;
-  padding: 0 22px;
-}
-
-.chart span {
-  flex: 1;
-  border-top: 3px solid #6b73ff;
-  background: linear-gradient(180deg, rgba(105, 116, 255, 0.32), rgba(105, 116, 255, 0.1));
-}
-
-.chart-labels {
+.trend-line-chart {
+  position: relative;
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
-  color: #8390a4;
-  font-size: 13px;
-  padding: 16px 10px 0;
+  grid-template-columns: 72px minmax(0, 1fr);
+  grid-template-rows: 210px;
+  margin-top: 18px;
+}
+
+.trend-y-axis {
+  position: relative;
+  grid-column: 1;
+  grid-row: 1;
+  color: #748299;
+  font-size: 11px;
+}
+
+.trend-y-axis span {
+  position: absolute;
+  right: 12px;
+  transform: translateY(-50%);
+  white-space: nowrap;
+}
+
+.trend-svg {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  width: 100%;
+  height: 210px;
+  overflow: visible;
+}
+
+.trend-grid-line {
+  stroke: #26364b;
+  stroke-width: 1;
+}
+
+.trend-axis-line {
+  stroke: #3a4a60;
+  stroke-width: 1.2;
+}
+
+.trend-area {
+  pointer-events: none;
+}
+
+.trend-line {
+  fill: none;
+  stroke: #7d86ff;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 3;
+}
+
+.trend-point {
+  fill: #101824;
+  stroke: #8d95ff;
+  stroke-width: 2;
+}
+
+.trend-x-tick {
+  fill: #8390a4;
+  font-size: 12px;
 }
 
 .provider-health-list {
@@ -1267,32 +1305,6 @@ button.danger {
 
 .route-trend-card {
   min-height: 312px;
-}
-
-.line-chart {
-  display: flex;
-  height: 176px;
-  align-items: flex-end;
-  gap: 6px;
-  margin-top: 22px;
-  border-bottom: 1px solid #314051;
-  background:
-    linear-gradient(#253244 1px, transparent 1px) 0 0 / 100% 39px;
-  padding: 0 24px;
-}
-
-.line-chart span {
-  width: 100%;
-  min-width: 12px;
-  border-radius: 999px 999px 0 0;
-  background: linear-gradient(180deg, #6974ff, rgba(105, 116, 255, 0.2));
-}
-
-.chart-labels.dense {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  overflow: hidden;
 }
 
 .cost-distribution {
