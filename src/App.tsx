@@ -1673,6 +1673,7 @@ function Dashboard(props: {
           </div>
           <TrendLineChart
             buckets={trendBuckets}
+            compact
             granularity={stats?.bucket_granularity}
             metric={trendMetric}
             range={timeRange}
@@ -1781,11 +1782,13 @@ function Metric({
 
 function TrendLineChart({
   buckets,
+  compact,
   granularity,
   metric,
   range,
 }: {
   buckets: RouteUsageBucket[];
+  compact?: boolean;
   granularity?: string;
   metric: TrendMetric;
   range: TimeRange;
@@ -1802,7 +1805,7 @@ function TrendLineChart({
   const rawMax = Math.max(...values, 0);
   const yMax = niceTrendMax(rawMax, metric);
   const chartWidth = 640;
-  const chartHeight = 210;
+  const chartHeight = compact ? 172 : 210;
   const padding = { top: 12, right: 16, bottom: 24, left: 72 };
   const plotWidth = chartWidth - padding.left - padding.right;
   const plotHeight = chartHeight - padding.top - padding.bottom;

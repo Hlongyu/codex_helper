@@ -404,7 +404,7 @@ button:disabled {
 
 .dashboard-grid {
   display: grid;
-  grid-template-columns: 1.15fr 0.7fr 0.6fr;
+  grid-template-columns: minmax(0, 1.2fr) minmax(380px, 0.9fr);
   gap: 18px;
 }
 
@@ -414,7 +414,8 @@ button:disabled {
 }
 
 .trend-card {
-  grid-column: span 2;
+  grid-column: auto;
+  min-height: 238px;
 }
 
 .card-head,
@@ -427,11 +428,17 @@ button:disabled {
 }
 
 .trend-line-chart {
+  --trend-chart-height: 210px;
   position: relative;
   display: grid;
   grid-template-columns: 72px minmax(0, 1fr);
-  grid-template-rows: 210px;
+  grid-template-rows: var(--trend-chart-height);
   margin-top: 18px;
+}
+
+.trend-card .trend-line-chart {
+  --trend-chart-height: 172px;
+  margin-top: 12px;
 }
 
 .trend-y-axis {
@@ -453,7 +460,7 @@ button:disabled {
   grid-column: 1 / -1;
   grid-row: 1;
   width: 100%;
-  height: 210px;
+  height: var(--trend-chart-height);
   overflow: visible;
 }
 
@@ -539,17 +546,36 @@ button:disabled {
 
 .provider-health-list {
   display: grid;
-  gap: 18px;
-  margin-top: 28px;
+  gap: 10px;
+  margin-top: 18px;
 }
 
 .provider-health {
   display: grid;
-  grid-template-columns: 18px 1fr auto;
-  gap: 12px;
+  grid-template-columns: 10px minmax(0, 1fr) max-content max-content;
+  gap: 10px;
   align-items: center;
   border-bottom: 1px solid #202d3d;
-  padding-bottom: 14px;
+  min-height: 32px;
+  padding-bottom: 10px;
+}
+
+.provider-health .dot {
+  width: 8px;
+  height: 8px;
+}
+
+.provider-health > div {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.provider-health > b,
+.provider-health > small {
+  justify-self: end;
+  white-space: nowrap;
 }
 
 .provider-health strong,
@@ -558,11 +584,24 @@ button:disabled {
   color: #f5f7fb;
 }
 
+.provider-health strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .provider-health small,
 .quality-row em,
 .legend-row em {
   color: #8996aa;
   font-style: normal;
+}
+
+.provider-health > div small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .provider-health small.ok,
