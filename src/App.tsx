@@ -837,6 +837,7 @@ function App() {
         base_url: providerBaseUrl,
         enabled: providerEnabled,
         balance_query: nextBalance,
+        balance_status: balanceTestStatus,
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
@@ -1156,9 +1157,15 @@ function App() {
           providerEnabled={providerEnabled}
           providerName={providerName}
           secretVisible={secretVisible}
-          setProviderApiKey={setProviderApiKey}
+          setProviderApiKey={(value) => {
+            setProviderApiKey(value);
+            setBalanceTestStatus(null);
+          }}
           setProviderApiKeyDirty={setProviderApiKeyDirty}
-          setProviderBaseUrl={setProviderBaseUrl}
+          setProviderBaseUrl={(value) => {
+            setProviderBaseUrl(value);
+            setBalanceTestStatus(null);
+          }}
           setProviderEnabled={setProviderEnabled}
           setProviderName={setProviderName}
           setSecretVisible={setSecretVisible}

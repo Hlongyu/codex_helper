@@ -46,7 +46,7 @@ struct ProviderConfig {
     balance_status: Option<BalanceStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BalanceQueryType {
     Disabled,
@@ -60,7 +60,7 @@ impl Default for BalanceQueryType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum NewApiBalanceTarget {
     TokenQuota,
@@ -73,7 +73,7 @@ impl Default for NewApiBalanceTarget {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BalanceAuthMode {
     ProviderToken,
@@ -86,7 +86,7 @@ impl Default for BalanceAuthMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct BalanceQueryConfig {
     #[serde(default)]
     enabled: bool,
@@ -417,6 +417,7 @@ struct SaveProviderPayload {
     provider_name: Option<String>,
     config_toml: String,
     balance_query: Option<BalanceQueryConfig>,
+    balance_status: Option<BalanceStatus>,
     enabled: Option<bool>,
     base_url: Option<String>,
     api_key: Option<String>,
@@ -1237,6 +1238,16 @@ fn normalize_balance_config(
         config.auth_mode = BalanceAuthMode::SeparateToken;
     }
     config
+}
+
+fn merge_balance_config_draft(
+    provider: &ProviderConfig,
+    mut draft: BalanceQueryConfig,
+) -> BalanceQueryConfig {
+    if draft.auth_mode == BalanceAuthMode::SeparateToken && draft.query_token.trim().is_empty() {
+        draft.query_token = provider.balance_query.query_token.clone();
+    }
+    normalize_balance_config(draft, provider)
 }
 
 fn apply_provider_connection_draft(
@@ -3929,8 +3940,15 @@ fn save_provider(
         provider.config = toml_text_to_json(&payload.config_toml)?;
     }
     if let Some(balance_query) = payload.balance_query {
-        provider.balance_query = normalize_balance_config(balance_query, provider);
-        provider.balance_status = None;
+        let previous_balance_query = provider.balance_query.clone();
+        let next_balance_query = merge_balance_config_draft(provider, balance_query);
+        let balance_changed = next_balance_query != previous_balance_query;
+        provider.balance_query = next_balance_query;
+        provider.balance_status = payload.balance_status.or_else(|| {
+            (!balance_changed)
+                .then(|| provider.balance_status.clone())
+                .flatten()
+        });
     }
     save_state(&state)?;
     build_app_state(state, &router_runtime)
@@ -3959,7 +3977,7 @@ fn preview_provider(
 
     provider.config = toml_text_to_json(&payload.config_toml)?;
     if let Some(balance_query) = payload.balance_query {
-        provider.balance_query = normalize_balance_config(balance_query, provider);
+        provider.balance_query = merge_balance_config_draft(provider, balance_query);
         provider.balance_status = None;
     }
     state.active_provider_id = active_provider_id;
@@ -4179,7 +4197,7 @@ async fn query_provider_balance(
         payload.api_key.as_deref(),
     )?;
     if let Some(balance_query) = payload.balance_query {
-        test_provider.balance_query = normalize_balance_config(balance_query, &test_provider);
+        test_provider.balance_query = merge_balance_config_draft(&test_provider, balance_query);
     }
 
     let status = fetch_balance(&test_provider).await;
@@ -4343,5 +4361,40 @@ mod tests {
         assert_eq!(stats.providers.len(), 1);
         assert_eq!(stats.providers[0].key, "provider-a");
         assert_eq!(stats.models[0].request_count, 1);
+    }
+
+    #[test]
+    fn empty_balance_token_draft_preserves_saved_token() {
+        let provider = ProviderConfig {
+            id: "provider-a".to_string(),
+            name: "Provider A".to_string(),
+            enabled: true,
+            config: json!({
+                "model_provider": "custom",
+                "model_providers": {
+                    "custom": {
+                        "base_url": "https://example.com",
+                        "experimental_bearer_token": "provider-token"
+                    }
+                }
+            }),
+            balance_query: BalanceQueryConfig {
+                enabled: true,
+                query_type: BalanceQueryType::NewApi,
+                new_api_target: NewApiBalanceTarget::TokenQuota,
+                endpoint: "https://example.com".to_string(),
+                path: "/api/usage/token/".to_string(),
+                auth_mode: BalanceAuthMode::SeparateToken,
+                query_token: "saved-balance-token".to_string(),
+                new_api_user_id: String::new(),
+            },
+            balance_status: None,
+        };
+        let mut draft = provider.balance_query.clone();
+        draft.query_token.clear();
+
+        let merged = merge_balance_config_draft(&provider, draft);
+
+        assert_eq!(merged.query_token, "saved-balance-token");
     }
 }
