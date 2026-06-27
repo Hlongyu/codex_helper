@@ -1343,37 +1343,6 @@ fn status_step(
     }
 }
 
-fn test_model_unavailable_response(status: reqwest::StatusCode, body: &str) -> bool {
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return true;
-    }
-    let lower = body.to_lowercase();
-    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        return lower.contains("model_not_found")
-            || lower.contains("no available channel")
-            || lower.contains("codex-helper-connectivity-probe");
-    }
-    if status == reqwest::StatusCode::BAD_REQUEST
-        || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
-    {
-        if lower.contains("api key")
-            || lower.contains("apikey")
-            || lower.contains("token")
-            || lower.contains("unauthorized")
-            || lower.contains("forbidden")
-            || lower.contains("permission")
-        {
-            return false;
-        }
-        return lower.contains("model")
-            || lower.contains("not found")
-            || lower.contains("not exist")
-            || lower.contains("unknown")
-            || lower.contains("invalid");
-    }
-    false
-}
-
 fn model_id_from_value(value: &Value) -> Option<String> {
     match value {
         Value::String(model) => Some(model.trim().to_string()).filter(|model| !model.is_empty()),
@@ -1459,14 +1428,12 @@ async fn run_provider_connection_test(
         .send()
         .await;
     let models_latency = started.elapsed().as_millis() as u64;
-    let mut available_models = Vec::new();
-
-    match models_response {
+    let available_models = match models_response {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {
                 let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-                available_models = models_from_response_value(&body);
+                let models = models_from_response_value(&body);
                 steps.push(status_step(
                     "base",
                     "基础连接",
@@ -1481,6 +1448,7 @@ async fn run_provider_connection_test(
                     Some(models_latency),
                     "鉴权通过",
                 ));
+                models
             } else if status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
             {
@@ -1503,17 +1471,18 @@ async fn run_provider_connection_test(
                 steps.push(status_step(
                     "base",
                     "基础连接",
-                    "warn",
+                    "ok",
                     Some(models_latency),
-                    format!("/models 返回 HTTP {}", status.as_u16()),
+                    "上游可访问",
                 ));
                 steps.push(status_step(
                     "models",
                     "模型接口",
-                    "warn",
+                    "failed",
                     Some(models_latency),
-                    "模型列表不可用，继续探测 Responses",
+                    format!("/models 返回 HTTP {}，无法验证模型", status.as_u16()),
                 ));
+                return ProviderConnectionTestResult { ok: false, steps };
             }
         }
         Err(err) => {
@@ -1526,7 +1495,7 @@ async fn run_provider_connection_test(
             ));
             return ProviderConnectionTestResult { ok: false, steps };
         }
-    }
+    };
 
     let selected_model = requested_model
         .map(str::trim)
@@ -1538,8 +1507,8 @@ async fn run_provider_connection_test(
         .or_else(|| available_models.first().map(String::as_str));
     let Some(test_model) = selected_model else {
         steps.push(status_step(
-            "responses",
-            "Responses API",
+            "model",
+            "模型可用性",
             "failed",
             None,
             "没有可用于测试的模型",
@@ -1547,59 +1516,22 @@ async fn run_provider_connection_test(
         return ProviderConnectionTestResult { ok: false, steps };
     };
 
-    let responses_url = join_url(&base_url, "responses");
-    let response = client
-        .post(responses_url)
-        .bearer_auth(token.trim())
-        .header("accept", "application/json")
-        .json(&json!({
-            "model": test_model,
-            "input": "你好",
-            "max_output_tokens": 1,
-            "stream": false,
-        }))
-        .send()
-        .await;
-
-    match response {
-        Ok(response) => {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            if status.is_success() {
-                steps.push(status_step(
-                    "responses",
-                    "Responses API",
-                    "ok",
-                    None,
-                    format!("测试模型可用: {test_model}"),
-                ));
-            } else if test_model_unavailable_response(status, &body) {
-                steps.push(status_step(
-                    "responses",
-                    "Responses API",
-                    "failed",
-                    None,
-                    format!("测试模型不可用: {test_model}"),
-                ));
-            } else {
-                steps.push(status_step(
-                    "responses",
-                    "Responses API",
-                    "failed",
-                    None,
-                    format!("接口返回 HTTP {}，模型 {test_model}", status.as_u16()),
-                ));
-            }
-        }
-        Err(err) => {
-            steps.push(status_step(
-                "responses",
-                "Responses API",
-                "failed",
-                None,
-                format!("请求失败: {err}"),
-            ));
-        }
+    if available_models.iter().any(|model| model == test_model) {
+        steps.push(status_step(
+            "model",
+            "模型可用性",
+            "ok",
+            None,
+            format!("模型在列表中: {test_model}"),
+        ));
+    } else {
+        steps.push(status_step(
+            "model",
+            "模型可用性",
+            "failed",
+            None,
+            format!("模型不在 /models 列表中: {test_model}"),
+        ));
     }
 
     let ok = steps.iter().all(|step| step.status != "failed");
@@ -4917,26 +4849,6 @@ mod tests {
     }
 
     #[test]
-    fn connection_probe_distinguishes_model_and_auth_errors() {
-        assert!(test_model_unavailable_response(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"model not found"}}"#,
-        ));
-        assert!(test_model_unavailable_response(
-            reqwest::StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":{"code":"model_not_found","message":"No available channel for model codex-helper-connectivity-probe"}}"#,
-        ));
-        assert!(!test_model_unavailable_response(
-            reqwest::StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":{"message":"upstream temporarily unavailable"}}"#,
-        ));
-        assert!(!test_model_unavailable_response(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"invalid api key"}}"#,
-        ));
-    }
-
-    #[test]
     fn connection_status_latency_uses_remote_access_latency() {
         let result = ProviderConnectionTestResult {
             ok: false,
@@ -4944,11 +4856,11 @@ mod tests {
                 status_step("base", "基础连接", "ok", Some(180), "上游可访问"),
                 status_step("models", "模型接口", "ok", Some(180), "鉴权通过"),
                 status_step(
-                    "responses",
-                    "Responses API",
+                    "model",
+                    "模型可用性",
                     "failed",
                     None,
-                    "测试模型不可用: test-model",
+                    "模型不在 /models 列表中: test-model",
                 ),
             ],
         };
@@ -4956,7 +4868,10 @@ mod tests {
         let status = connection_status_from_test(&result);
 
         assert_eq!(status.latency_ms, Some(180));
-        assert_eq!(status.error.as_deref(), Some("测试模型不可用: test-model"));
+        assert_eq!(
+            status.error.as_deref(),
+            Some("模型不在 /models 列表中: test-model")
+        );
     }
 
     #[test]

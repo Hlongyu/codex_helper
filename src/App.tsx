@@ -2424,7 +2424,7 @@ function ProviderEditor(props: {
               <div className="test-box">
                 <div>
                   <strong>连接测试</strong>
-                  <p>保存前验证上游接口是否可用</p>
+                  <p>保存前验证鉴权与模型列表</p>
                 </div>
                 <div className="test-actions">
                   <button className="ghost small" disabled={busy} onClick={onLoadProviderModels} type="button">
@@ -2460,7 +2460,7 @@ function ProviderEditor(props: {
                           label: "等待测试",
                           status: "warn",
                           latency_ms: null,
-                          message: "使用当前 Base URL 与 API Key 发起测试",
+                          message: "使用当前 Base URL 与 API Key 读取模型列表",
                         },
                       ]).map((step) => (
                     <li key={step.key}>
