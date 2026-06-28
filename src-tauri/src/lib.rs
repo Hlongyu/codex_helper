@@ -43,6 +43,8 @@ struct ProviderConfig {
     #[serde(default)]
     connection_test_model: String,
     #[serde(default)]
+    model_mappings: Vec<ModelMapping>,
+    #[serde(default)]
     balance_query: BalanceQueryConfig,
     #[serde(default)]
     balance_status: Option<BalanceStatus>,
@@ -131,6 +133,12 @@ struct BalanceStatus {
     label: String,
     checked_at: Option<u64>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ModelMapping {
+    source: String,
+    target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +440,7 @@ struct SaveProviderPayload {
     balance_query: Option<BalanceQueryConfig>,
     balance_status: Option<BalanceStatus>,
     connection_test_model: Option<String>,
+    model_mappings: Option<Vec<ModelMapping>>,
     enabled: Option<bool>,
     base_url: Option<String>,
     api_key: Option<String>,
@@ -614,6 +623,8 @@ struct RouteRequestLog {
     method: String,
     path: String,
     model: String,
+    #[serde(default)]
+    upstream_model: Option<String>,
     provider_id: String,
     provider_name: String,
     provider_order: usize,
@@ -742,6 +753,7 @@ struct PendingRouteLog {
     method: String,
     path: String,
     model: String,
+    upstream_model: Option<String>,
     provider_id: String,
     provider_name: String,
     provider_order: usize,
@@ -1169,6 +1181,40 @@ fn model_provider_name(provider: &ProviderConfig) -> String {
         .and_then(Value::as_str)
         .unwrap_or("custom")
         .to_string()
+}
+
+fn normalize_model_mappings(mappings: Vec<ModelMapping>) -> Vec<ModelMapping> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for mapping in mappings {
+        let source = mapping.source.trim();
+        let target = mapping.target.trim();
+        if source.is_empty() || target.is_empty() {
+            continue;
+        }
+        let key = source.to_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        normalized.push(ModelMapping {
+            source: source.to_string(),
+            target: target.to_string(),
+        });
+    }
+    normalized
+}
+
+fn mapped_model_for_provider(provider: &ProviderConfig, requested_model: &str) -> Option<String> {
+    let requested = requested_model.trim();
+    if requested.is_empty() || requested == "未知模型" {
+        return None;
+    }
+    provider
+        .model_mappings
+        .iter()
+        .find(|mapping| mapping.source.trim() == requested)
+        .map(|mapping| mapping.target.trim().to_string())
+        .filter(|target| !target.is_empty() && target != requested)
 }
 
 fn redacted_provider(mut provider: ProviderConfig) -> ProviderConfig {
@@ -2060,6 +2106,28 @@ fn model_from_request_body(body: &[u8]) -> String {
         .unwrap_or_else(|| "未知模型".to_string())
 }
 
+fn body_with_mapped_model(body: &[u8], mapped_model: Option<&str>) -> Bytes {
+    let Some(mapped_model) = mapped_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return Bytes::copy_from_slice(body);
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return Bytes::copy_from_slice(body);
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Bytes::copy_from_slice(body);
+    };
+    if !object.get("model").is_some_and(Value::is_string) {
+        return Bytes::copy_from_slice(body);
+    }
+    object.insert("model".to_string(), Value::String(mapped_model.to_string()));
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| Bytes::copy_from_slice(body))
+}
+
 fn usage_from_response_value(value: &Value) -> TokenUsage {
     value
         .get("usage")
@@ -2210,11 +2278,15 @@ fn finish_route_log(
 ) {
     let total_ms = pending.start.elapsed().as_millis() as u64;
     let (day, hour) = timestamp_to_route_parts(pending.started_at_ms);
+    let pricing_model = pending
+        .upstream_model
+        .as_deref()
+        .unwrap_or(pending.model.as_str());
     let cost = estimate_cost(
         &default_pricing_rules(),
         &pending.provider_id,
         &pending.provider_name,
-        &pending.model,
+        pricing_model,
         &usage,
     );
     let status = if pending.error.is_some() || !status_success {
@@ -2230,6 +2302,7 @@ fn finish_route_log(
         method: pending.method,
         path: pending.path,
         model: pending.model,
+        upstream_model: pending.upstream_model,
         provider_id: pending.provider_id,
         provider_name: pending.provider_name,
         provider_order: pending.provider_order,
@@ -2268,6 +2341,7 @@ fn build_pending_route_log(
     method: &Method,
     path: &str,
     model: &str,
+    upstream_model: Option<&str>,
     upstream_chain: &[String],
     status_code: Option<u16>,
     route_attempts: usize,
@@ -2279,12 +2353,22 @@ fn build_pending_route_log(
         method: method.as_str().to_string(),
         path: format!("/v1/{path}"),
         model: model.to_string(),
+        upstream_model: upstream_model.map(str::to_string),
         provider_id: candidate.provider.id.clone(),
         provider_name: candidate.provider.name.clone(),
         provider_order: candidate.route_order,
         upstream_chain: upstream_chain.to_vec(),
         status_code,
-        route_result: if route_attempts > 1 {
+        route_result: if let Some(upstream_model) = upstream_model {
+            let prefix = if route_attempts > 1 {
+                format!("切换 {} 次", route_attempts - 1)
+            } else if error.is_some() {
+                "未完成".to_string()
+            } else {
+                "直连".to_string()
+            };
+            format!("{prefix} · {model} → {upstream_model}")
+        } else if route_attempts > 1 {
             format!("切换 {} 次", route_attempts - 1)
         } else if error.is_some() {
             "未完成".to_string()
@@ -2376,10 +2460,12 @@ async fn proxy_request(
     for (attempt_index, candidate) in candidates.iter().enumerate() {
         upstream_chain.push(candidate.provider.name.clone());
         let upstream_url = join_url(&candidate.base_url, &path) + &query;
+        let upstream_model = mapped_model_for_provider(&candidate.provider, &model);
+        let upstream_body = body_with_mapped_model(&body_bytes, upstream_model.as_deref());
         let mut request = proxy_state
             .client
             .request(reqwest_method.clone(), upstream_url)
-            .body(body_bytes.clone());
+            .body(upstream_body);
 
         for (name, value) in headers.iter() {
             if name == AUTHORIZATION
@@ -2407,6 +2493,7 @@ async fn proxy_request(
                     &method,
                     &path,
                     &model,
+                    upstream_model.as_deref(),
                     &upstream_chain,
                     None,
                     attempt_index + 1,
@@ -2433,6 +2520,7 @@ async fn proxy_request(
             &method,
             &path,
             &model,
+            upstream_model.as_deref(),
             &upstream_chain,
             Some(status.as_u16()),
             attempt_index + 1,
@@ -4243,6 +4331,9 @@ fn save_provider(
     if let Some(connection_test_model) = payload.connection_test_model {
         provider.connection_test_model = connection_test_model.trim().to_string();
     }
+    if let Some(model_mappings) = payload.model_mappings {
+        provider.model_mappings = normalize_model_mappings(model_mappings);
+    }
     if payload.base_url.is_some() || payload.api_key.is_some() {
         apply_provider_connection_draft(
             provider,
@@ -4332,6 +4423,9 @@ fn preview_provider(
     }
 
     provider.config = toml_text_to_json(&payload.config_toml)?;
+    if let Some(model_mappings) = payload.model_mappings {
+        provider.model_mappings = normalize_model_mappings(model_mappings);
+    }
     if let Some(balance_query) = payload.balance_query {
         provider.balance_query = merge_balance_config_draft(provider, balance_query);
         provider.balance_status = None;
@@ -4378,6 +4472,7 @@ fn add_provider(
         name: trimmed.to_string(),
         enabled: true,
         connection_test_model: String::new(),
+        model_mappings: Vec::new(),
         balance_query: BalanceQueryConfig::default(),
         balance_status: None,
         connection_status: None,
@@ -4748,6 +4843,7 @@ mod tests {
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
             model: "test-model".to_string(),
+            upstream_model: None,
             provider_id: provider_id.to_string(),
             provider_name: provider_id.to_string(),
             provider_order: 1,
@@ -4827,6 +4923,7 @@ mod tests {
                 }
             }),
             connection_test_model: String::new(),
+            model_mappings: Vec::new(),
             balance_query: BalanceQueryConfig {
                 enabled: true,
                 query_type: BalanceQueryType::NewApi,
@@ -4846,6 +4943,67 @@ mod tests {
         let merged = merge_balance_config_draft(&provider, draft);
 
         assert_eq!(merged.query_token, "saved-balance-token");
+    }
+
+    #[test]
+    fn maps_request_model_for_provider_body() {
+        let provider = ProviderConfig {
+            id: "provider-a".to_string(),
+            name: "Provider A".to_string(),
+            enabled: true,
+            config: json!({}),
+            connection_test_model: String::new(),
+            model_mappings: vec![
+                ModelMapping {
+                    source: "gpt-5.5".to_string(),
+                    target: "deepseek-v4-pro".to_string(),
+                },
+                ModelMapping {
+                    source: "gpt-5.4".to_string(),
+                    target: "deepseek-flash".to_string(),
+                },
+            ],
+            balance_query: BalanceQueryConfig::default(),
+            balance_status: None,
+            connection_status: None,
+        };
+        let body = br#"{"model":"gpt-5.5","input":"hello"}"#;
+        let mapped = mapped_model_for_provider(&provider, "gpt-5.5");
+        let rewritten = body_with_mapped_model(body, mapped.as_deref());
+        let value = serde_json::from_slice::<Value>(&rewritten).expect("mapped body is json");
+
+        assert_eq!(mapped.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(
+            value.get("model").and_then(Value::as_str),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(model_from_request_body(body), "gpt-5.5");
+    }
+
+    #[test]
+    fn normalizes_model_mapping_drafts() {
+        let mappings = normalize_model_mappings(vec![
+            ModelMapping {
+                source: " gpt-5.5 ".to_string(),
+                target: " deepseek-v4-pro ".to_string(),
+            },
+            ModelMapping {
+                source: "GPT-5.5".to_string(),
+                target: "duplicate".to_string(),
+            },
+            ModelMapping {
+                source: "gpt-5.4".to_string(),
+                target: String::new(),
+            },
+        ]);
+
+        assert_eq!(
+            mappings,
+            vec![ModelMapping {
+                source: "gpt-5.5".to_string(),
+                target: "deepseek-v4-pro".to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -1235,6 +1235,63 @@ button:disabled {
   background: #151f2d;
 }
 
+.mapping-box {
+  border: 1px solid #26394f;
+  border-radius: 14px;
+  background: #151f2d;
+  margin-top: 24px;
+  padding: 18px;
+}
+
+.mapping-box-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.mapping-box-head p {
+  margin: 5px 0 0;
+  color: #8390a4;
+  font-size: 13px;
+}
+
+.mapping-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 34px;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.mapping-grid > span {
+  color: #8390a4;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.mapping-row {
+  display: contents;
+}
+
+.mapping-row input {
+  width: 100%;
+  height: 38px;
+  min-width: 0;
+  border: 1px solid #24364a;
+  border-radius: 10px;
+  background: #0e151f;
+  color: #f7f9fd;
+  outline: none;
+  padding: 0 12px;
+}
+
+.mapping-empty {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #68758a;
+  font-size: 13px;
+}
+
 .mini-toggle-line {
   display: flex;
   align-items: center;

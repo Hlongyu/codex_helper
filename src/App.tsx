@@ -49,6 +49,11 @@ type ProviderModelsResponse = {
   models: string[];
 };
 
+type ModelMapping = {
+  source: string;
+  target: string;
+};
+
 type RouterConfig = {
   enabled: boolean;
   host: string;
@@ -68,6 +73,7 @@ type ProviderConfig = {
   enabled: boolean;
   config: JsonValue;
   connection_test_model: string;
+  model_mappings: ModelMapping[];
   balance_query: BalanceQueryConfig;
   balance_status?: BalanceStatus | null;
   connection_status?: unknown;
@@ -106,6 +112,7 @@ type RouteRequestLog = {
   method: string;
   path: string;
   model: string;
+  upstream_model?: string | null;
   provider_id: string;
   provider_name: string;
   provider_order: number;
@@ -732,6 +739,7 @@ function App() {
   const [connectionTestResult, setConnectionTestResult] = useState<ProviderConnectionTestResult | null>(null);
   const [providerTestModel, setProviderTestModel] = useState("");
   const [providerModels, setProviderModels] = useState<string[]>([]);
+  const [modelMappings, setModelMappings] = useState<ModelMapping[]>([]);
   const [balanceQuery, setBalanceQuery] = useState<BalanceQueryConfig>(() =>
     defaultBalanceQuery(),
   );
@@ -860,6 +868,7 @@ function App() {
     setProviderEnabled(summary?.enabled ?? targetFull.enabled ?? true);
     setProviderTestModel(targetFull.connection_test_model ?? "");
     setProviderModels(targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
+    setModelMappings(targetFull.model_mappings ?? []);
     setBalanceQuery(
       normalizeBalanceQuery(
         targetFull.balance_query,
@@ -917,6 +926,7 @@ function App() {
         balance_query: nextBalance,
         balance_status: balanceTestStatus,
         connection_test_model: providerTestModel,
+        model_mappings: modelMappings,
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
@@ -1296,6 +1306,7 @@ function App() {
           balanceTokenVisible={balanceTokenVisible}
           busy={busy}
           connectionTestResult={connectionTestResult}
+          modelMappings={modelMappings}
           onBalanceTokenVisible={setBalanceTokenVisible}
           onClose={() => setEditorOpen(false)}
           onLoadProviderModels={loadProviderModels}
@@ -1327,6 +1338,7 @@ function App() {
             setProviderTestModel("");
           }}
           setProviderEnabled={setProviderEnabled}
+          setModelMappings={setModelMappings}
           setProviderName={setProviderName}
           setProviderTestModel={setProviderTestModel}
           setSecretVisible={setSecretVisible}
@@ -2307,6 +2319,7 @@ function ProviderEditor(props: {
   balanceTokenVisible: boolean;
   busy: boolean;
   connectionTestResult: ProviderConnectionTestResult | null;
+  modelMappings: ModelMapping[];
   onBalanceTokenVisible: (visible: boolean) => void;
   onClose: () => void;
   onLoadProviderModels: () => void;
@@ -2326,6 +2339,7 @@ function ProviderEditor(props: {
   setProviderApiKeyDirty: (dirty: boolean) => void;
   setProviderBaseUrl: (value: string) => void;
   setProviderEnabled: (value: boolean) => void;
+  setModelMappings: (mappings: ModelMapping[]) => void;
   setProviderName: (value: string) => void;
   setProviderTestModel: (value: string) => void;
   setSecretVisible: (value: boolean) => void;
@@ -2337,6 +2351,7 @@ function ProviderEditor(props: {
     balanceTokenVisible,
     busy,
     connectionTestResult,
+    modelMappings,
     onBalanceTokenVisible,
     onClose,
     onLoadProviderModels,
@@ -2356,6 +2371,7 @@ function ProviderEditor(props: {
     setProviderApiKeyDirty,
     setProviderBaseUrl,
     setProviderEnabled,
+    setModelMappings,
     setProviderName,
     setProviderTestModel,
     setSecretVisible,
@@ -2639,17 +2655,59 @@ function ProviderEditor(props: {
                   <Toggle checked={false} disabled onChange={() => undefined} />
                 </div>
               </div>
-              <div className="form-row">
-                <label className="field">
-                  <span>低余额阈值</span>
-                  <input defaultValue="$2.00" />
-                </label>
-                <label className="field">
-                  <span>模型映射</span>
-                  <select defaultValue="off">
-                    <option value="off">未启用</option>
-                  </select>
-                </label>
+              <div className="mapping-box">
+                <div className="mapping-box-head">
+                  <div>
+                    <strong>模型映射</strong>
+                    <p>客户端模型匹配后转发为此供应商支持的模型</p>
+                  </div>
+                  <button
+                    className="ghost small"
+                    onClick={() => setModelMappings([...modelMappings, { source: "", target: "" }])}
+                    type="button"
+                  >
+                    添加映射
+                  </button>
+                </div>
+                <div className="mapping-grid">
+                  <span>客户端模型</span>
+                  <span>上游模型</span>
+                  <span />
+                  {modelMappings.length === 0 && (
+                    <p className="mapping-empty">未配置映射时，请求模型将原样转发。</p>
+                  )}
+                  {modelMappings.map((mapping, index) => (
+                    <div className="mapping-row" key={index}>
+                      <input
+                        placeholder="gpt-5.5"
+                        value={mapping.source}
+                        onChange={(event) => {
+                          const next = [...modelMappings];
+                          next[index] = { ...mapping, source: event.currentTarget.value };
+                          setModelMappings(next);
+                        }}
+                      />
+                      <input
+                        placeholder="deepseek-v4-pro"
+                        value={mapping.target}
+                        onChange={(event) => {
+                          const next = [...modelMappings];
+                          next[index] = { ...mapping, target: event.currentTarget.value };
+                          setModelMappings(next);
+                        }}
+                      />
+                      <button
+                        aria-label="删除映射"
+                        className="icon-button"
+                        onClick={() => setModelMappings(modelMappings.filter((_, rowIndex) => rowIndex !== index))}
+                        title="删除映射"
+                        type="button"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
               </div>
             </>
           )}
