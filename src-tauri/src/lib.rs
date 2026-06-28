@@ -41,6 +41,8 @@ struct ProviderConfig {
     enabled: bool,
     config: Value,
     #[serde(default)]
+    wire_api: ProviderWireApi,
+    #[serde(default)]
     connection_test_model: String,
     #[serde(default)]
     model_mappings: Vec<ModelMapping>,
@@ -139,6 +141,19 @@ struct BalanceStatus {
 struct ModelMapping {
     source: String,
     target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderWireApi {
+    Responses,
+    ChatCompletions,
+}
+
+impl Default for ProviderWireApi {
+    fn default() -> Self {
+        Self::Responses
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,6 +456,7 @@ struct SaveProviderPayload {
     balance_status: Option<BalanceStatus>,
     connection_test_model: Option<String>,
     model_mappings: Option<Vec<ModelMapping>>,
+    wire_api: Option<ProviderWireApi>,
     enabled: Option<bool>,
     base_url: Option<String>,
     api_key: Option<String>,
@@ -570,6 +586,21 @@ struct CostEstimate {
     breakdown: String,
     pricing_model_match: String,
     pricing_source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseAdapter {
+    Passthrough,
+    ChatCompletionsToResponses,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedUpstreamRequest {
+    path: String,
+    query: String,
+    body: Bytes,
+    adapter: ResponseAdapter,
+    upstream_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -771,6 +802,26 @@ struct RouteStreamState {
     status_success: bool,
     first_byte_ms: Option<u64>,
     sse_buffer: String,
+    usage: TokenUsage,
+    finished: bool,
+}
+
+struct ChatToResponsesStreamState {
+    stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    pending: PendingRouteLog,
+    status_success: bool,
+    first_byte_ms: Option<u64>,
+    sse_buffer: String,
+    response_id: String,
+    created_at: i64,
+    model: String,
+    output_text: String,
+    output_index: usize,
+    sequence_number: u64,
+    started: bool,
+    text_done: bool,
+    completed: bool,
+    usage_seen: bool,
     usage: TokenUsage,
     finished: bool,
 }
@@ -2128,6 +2179,594 @@ fn body_with_mapped_model(body: &[u8], mapped_model: Option<&str>) -> Bytes {
         .unwrap_or_else(|_| Bytes::copy_from_slice(body))
 }
 
+fn prepare_upstream_request(
+    provider: &ProviderConfig,
+    path: &str,
+    query: &str,
+    body: &[u8],
+    requested_model: &str,
+) -> Result<PreparedUpstreamRequest, String> {
+    let upstream_model = mapped_model_for_provider(provider, requested_model);
+    if provider.wire_api == ProviderWireApi::ChatCompletions
+        && path.trim_matches('/') == "responses"
+    {
+        Ok(PreparedUpstreamRequest {
+            path: "chat/completions".to_string(),
+            query: String::new(),
+            body: responses_to_chat_request_body(body, upstream_model.as_deref())?,
+            adapter: ResponseAdapter::ChatCompletionsToResponses,
+            upstream_model,
+        })
+    } else {
+        Ok(PreparedUpstreamRequest {
+            path: path.to_string(),
+            query: query.to_string(),
+            body: body_with_mapped_model(body, upstream_model.as_deref()),
+            adapter: ResponseAdapter::Passthrough,
+            upstream_model,
+        })
+    }
+}
+
+fn json_string_content(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => {
+            let mut text = String::new();
+            for item in items {
+                if let Some(value) = item.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(value);
+                } else if let Some(value) = item.get("content").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(value);
+                } else if item.get("type").and_then(Value::as_str) == Some("input_text") {
+                    if let Some(value) = item.get("text").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(value);
+                    }
+                } else {
+                    return None;
+                }
+            }
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+fn responses_input_item_to_chat_message(item: &Value) -> Result<Value, String> {
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("message");
+    match item_type {
+        "message" => {
+            let role = item
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user")
+                .to_string();
+            let content = item
+                .get("content")
+                .and_then(json_string_content)
+                .or_else(|| item.get("text").and_then(Value::as_str).map(str::to_string))
+                .ok_or_else(|| "Chat Completions 适配暂只支持文本 input".to_string())?;
+            Ok(json!({ "role": role, "content": content }))
+        }
+        "function_call" => {
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "function_call 缺少 name".to_string())?;
+            let arguments = item
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| Value::String("{}".to_string()));
+            let arguments = match arguments {
+                Value::String(value) => value,
+                other => other.to_string(),
+            };
+            Ok(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments
+                    }
+                }]
+            }))
+        }
+        "function_call_output" => {
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "function_call_output 缺少 call_id".to_string())?;
+            let output = item
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Ok(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": output
+            }))
+        }
+        other => Err(format!("Chat Completions 适配不支持 input 类型: {other}")),
+    }
+}
+
+fn responses_input_to_chat_messages(value: &Value) -> Result<Vec<Value>, String> {
+    match value {
+        Value::String(text) => Ok(vec![json!({ "role": "user", "content": text })]),
+        Value::Array(items) => items
+            .iter()
+            .map(responses_input_item_to_chat_message)
+            .collect::<Result<Vec<_>, _>>(),
+        _ => Err("Chat Completions 适配暂只支持文本 input".to_string()),
+    }
+}
+
+fn responses_tools_to_chat_tools(value: Option<&Value>) -> Result<Option<Value>, String> {
+    let Some(Value::Array(tools)) = value else {
+        return Ok(None);
+    };
+    let mut chat_tools = Vec::new();
+    for tool in tools {
+        let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or_default();
+        match tool_type {
+            "function" => {
+                let function = if tool.get("function").is_some() {
+                    tool.get("function").cloned().unwrap_or_else(|| json!({}))
+                } else {
+                    json!({
+                        "name": tool.get("name").cloned().unwrap_or(Value::Null),
+                        "description": tool.get("description").cloned().unwrap_or(Value::Null),
+                        "parameters": tool.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object", "properties": {} }))
+                    })
+                };
+                chat_tools.push(json!({ "type": "function", "function": function }));
+            }
+            other => {
+                return Err(format!(
+                    "Chat Completions 适配不支持 Responses tool 类型: {other}"
+                ));
+            }
+        }
+    }
+    Ok(Some(Value::Array(chat_tools)))
+}
+
+fn responses_tool_choice_to_chat(value: Option<&Value>) -> Option<Value> {
+    let value = value?;
+    if value.is_string() {
+        return Some(value.clone());
+    }
+    if value.get("type").and_then(Value::as_str) == Some("function") {
+        return Some(json!({
+            "type": "function",
+            "function": {
+                "name": value.get("name").cloned().unwrap_or(Value::Null)
+            }
+        }));
+    }
+    Some(value.clone())
+}
+
+fn responses_to_chat_request_body(
+    body: &[u8],
+    mapped_model: Option<&str>,
+) -> Result<Bytes, String> {
+    let mut value = serde_json::from_slice::<Value>(body)
+        .map_err(|err| format!("Responses 请求体不是有效 JSON: {err}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "Responses 请求体必须是 JSON 对象".to_string())?;
+
+    if object.contains_key("previous_response_id") {
+        return Err("Chat Completions 适配不支持 previous_response_id".to_string());
+    }
+
+    if let Some(model) = mapped_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        object.insert("model".to_string(), Value::String(model.to_string()));
+    }
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Responses 请求缺少 model".to_string())?
+        .to_string();
+
+    let input = object
+        .get("input")
+        .ok_or_else(|| "Responses 请求缺少 input".to_string())?;
+    let mut messages = Vec::new();
+    if let Some(instructions) = object.get("instructions").and_then(Value::as_str) {
+        if !instructions.trim().is_empty() {
+            messages.push(json!({ "role": "system", "content": instructions }));
+        }
+    }
+    messages.extend(responses_input_to_chat_messages(input)?);
+
+    let mut chat = Map::new();
+    chat.insert("model".to_string(), Value::String(model));
+    chat.insert("messages".to_string(), Value::Array(messages));
+    for (from, to) in [
+        ("max_output_tokens", "max_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("stop", "stop"),
+        ("stream", "stream"),
+        ("presence_penalty", "presence_penalty"),
+        ("frequency_penalty", "frequency_penalty"),
+        ("seed", "seed"),
+    ] {
+        if let Some(value) = object.get(from) {
+            chat.insert(to.to_string(), value.clone());
+        }
+    }
+    if object
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        chat.insert(
+            "stream_options".to_string(),
+            json!({ "include_usage": true }),
+        );
+    }
+    if let Some(tools) = responses_tools_to_chat_tools(object.get("tools"))? {
+        chat.insert("tools".to_string(), tools);
+    }
+    if let Some(tool_choice) = responses_tool_choice_to_chat(object.get("tool_choice")) {
+        chat.insert("tool_choice".to_string(), tool_choice);
+    }
+
+    serde_json::to_vec(&Value::Object(chat))
+        .map(Bytes::from)
+        .map_err(|err| format!("无法生成 Chat Completions 请求: {err}"))
+}
+
+fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
+    let usage = usage.cloned().unwrap_or_else(|| json!({}));
+    let input_tokens = scalar_number_at_path(&usage, &["prompt_tokens"]).unwrap_or_default() as i64;
+    let output_tokens =
+        scalar_number_at_path(&usage, &["completion_tokens"]).unwrap_or_default() as i64;
+    let total_tokens = scalar_number_at_path(&usage, &["total_tokens"])
+        .map(|value| value as i64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    let cached_tokens = scalar_number_at_path(&usage, &["prompt_tokens_details", "cached_tokens"])
+        .or_else(|| scalar_number_at_path(&usage, &["prompt_cache_hit_tokens"]))
+        .unwrap_or_default() as i64;
+    let reasoning_tokens =
+        scalar_number_at_path(&usage, &["completion_tokens_details", "reasoning_tokens"])
+            .unwrap_or_default() as i64;
+    json!({
+        "input_tokens": input_tokens,
+        "input_tokens_details": { "cached_tokens": cached_tokens },
+        "output_tokens": output_tokens,
+        "output_tokens_details": { "reasoning_tokens": reasoning_tokens },
+        "total_tokens": total_tokens
+    })
+}
+
+fn chat_message_to_responses_output(message: &Value) -> Vec<Value> {
+    let mut output = Vec::new();
+    if let Some(content) = message.get("content").and_then(Value::as_str) {
+        if !content.is_empty() {
+            output.push(json!({
+                "id": "msg_0",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": content }]
+            }));
+        }
+    }
+    if let Some(Value::Array(tool_calls)) = message.get("tool_calls") {
+        for call in tool_calls {
+            if call.get("type").and_then(Value::as_str) != Some("function") {
+                continue;
+            }
+            let function = call.get("function").unwrap_or(&Value::Null);
+            output.push(json!({
+                "id": call.get("id").cloned().unwrap_or(Value::Null),
+                "type": "function_call",
+                "call_id": call.get("id").cloned().unwrap_or(Value::Null),
+                "name": function.get("name").cloned().unwrap_or(Value::Null),
+                "arguments": function.get("arguments").cloned().unwrap_or_else(|| Value::String("{}".to_string())),
+                "status": "completed"
+            }));
+        }
+    }
+    output
+}
+
+fn chat_completion_to_responses_value(value: &Value) -> Value {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("resp_chatcmpl");
+    let created_at = value
+        .get("created")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let model = value.get("model").cloned().unwrap_or(Value::Null);
+    let message = value
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or_else(|| json!({ "role": "assistant", "content": "" }));
+    let output = chat_message_to_responses_output(&message);
+    let output_text = output
+        .iter()
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "completed",
+        "model": model,
+        "output": output,
+        "output_text": output_text,
+        "usage": chat_usage_to_responses_usage(value.get("usage"))
+    })
+}
+
+fn chat_completion_to_responses_bytes(bytes: &[u8]) -> Result<Bytes, String> {
+    let value = serde_json::from_slice::<Value>(bytes)
+        .map_err(|err| format!("Chat Completions 响应不是有效 JSON: {err}"))?;
+    serde_json::to_vec(&chat_completion_to_responses_value(&value))
+        .map(Bytes::from)
+        .map_err(|err| format!("无法生成 Responses 响应: {err}"))
+}
+
+fn sse_event(event: &str, data: Value) -> String {
+    format!("event: {event}\ndata: {}\n\n", data)
+}
+
+fn token_usage_to_responses_usage(usage: &TokenUsage) -> Value {
+    json!({
+        "input_tokens": usage.input_tokens,
+        "input_tokens_details": { "cached_tokens": usage.cached_input_tokens },
+        "output_tokens": usage.output_tokens,
+        "output_tokens_details": { "reasoning_tokens": usage.reasoning_output_tokens },
+        "total_tokens": usage.total_tokens
+    })
+}
+
+fn chat_stream_response_completed_event(
+    sequence_number: u64,
+    response_id: &str,
+    created_at: i64,
+    model: &str,
+    output_text: &str,
+    usage: &TokenUsage,
+) -> Bytes {
+    Bytes::from(sse_event(
+        "response.completed",
+        json!({
+            "type": "response.completed",
+            "sequence_number": sequence_number,
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": created_at,
+                "status": "completed",
+                "error": null,
+                "incomplete_details": null,
+                "instructions": null,
+                "max_output_tokens": null,
+                "model": model,
+                "usage": token_usage_to_responses_usage(usage),
+                "output": [{
+                    "id": "msg_0",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "annotations": [], "text": output_text }]
+                }],
+                "tools": []
+            }
+        }),
+    ))
+}
+
+fn chat_stream_output_item_done_event(sequence_number: u64, output_text: &str) -> Bytes {
+    Bytes::from(sse_event(
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "sequence_number": sequence_number,
+            "output_index": 0,
+            "item": {
+                "id": "msg_0",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "annotations": [], "text": output_text }]
+            }
+        }),
+    ))
+}
+
+fn chat_stream_events_to_responses(
+    buffer: &mut String,
+    bytes: &[u8],
+    response_id: &mut String,
+    created_at: &mut i64,
+    model: &mut String,
+    output_text: &mut String,
+    output_index: &mut usize,
+    sequence_number: &mut u64,
+    started: &mut bool,
+    text_done: &mut bool,
+    completed: &mut bool,
+    usage_seen: &mut bool,
+    usage: &mut TokenUsage,
+) -> Vec<Bytes> {
+    buffer.push_str(&String::from_utf8_lossy(bytes));
+    let mut out = Vec::new();
+    while let Some((index, delimiter_len)) = next_sse_event_boundary(buffer) {
+        let event = buffer[..index].to_string();
+        buffer.drain(..index + delimiter_len);
+        for line in event.lines() {
+            let line = line.trim();
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if response_id == "resp_chatcmpl" {
+                if let Some(id) = value.get("id").and_then(Value::as_str) {
+                    *response_id = id.to_string();
+                }
+            }
+            if *created_at == 0 {
+                if let Some(created) = value.get("created").and_then(Value::as_i64) {
+                    *created_at = created;
+                }
+            }
+            if model.is_empty() {
+                if let Some(model_value) = value.get("model").and_then(Value::as_str) {
+                    *model = model_value.to_string();
+                }
+            }
+            if !*started {
+                *started = true;
+                *sequence_number += 1;
+                out.push(Bytes::from(sse_event(
+                    "response.created",
+                    json!({
+                        "type": "response.created",
+                        "sequence_number": *sequence_number,
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "created_at": *created_at,
+                            "status": "in_progress",
+                            "model": model,
+                            "output": []
+                        }
+                    }),
+                )));
+                *sequence_number += 1;
+                out.push(Bytes::from(sse_event(
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "sequence_number": *sequence_number,
+                        "output_index": 0,
+                        "item": {
+                            "id": "msg_0",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": []
+                        }
+                    }),
+                )));
+            }
+            let choice = value
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first());
+            if let Some(delta) = choice.and_then(|choice| choice.get("delta")) {
+                if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        output_text.push_str(text);
+                        *sequence_number += 1;
+                        out.push(Bytes::from(sse_event(
+                            "response.output_text.delta",
+                            json!({
+                                "type": "response.output_text.delta",
+                                "sequence_number": *sequence_number,
+                                "item_id": "msg_0",
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": text
+                            }),
+                        )));
+                        *output_index += 1;
+                    }
+                }
+            }
+            if let Some(usage_value) = value.get("usage") {
+                let next = usage_from_value(&chat_usage_to_responses_usage(Some(usage_value)));
+                if !usage_is_zero(&next) {
+                    *usage = next;
+                    *usage_seen = true;
+                }
+            }
+            let finish_reason = choice
+                .and_then(|choice| choice.get("finish_reason"))
+                .and_then(Value::as_str);
+            if finish_reason.is_some() && !*text_done {
+                *text_done = true;
+                *sequence_number += 1;
+                out.push(Bytes::from(sse_event(
+                    "response.output_text.done",
+                    json!({
+                        "type": "response.output_text.done",
+                        "sequence_number": *sequence_number,
+                        "item_id": "msg_0",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": output_text.clone()
+                    }),
+                )));
+                *sequence_number += 1;
+                out.push(chat_stream_output_item_done_event(
+                    *sequence_number,
+                    output_text,
+                ));
+            }
+            if *text_done && *usage_seen && !*completed {
+                *completed = true;
+                *sequence_number += 1;
+                out.push(chat_stream_response_completed_event(
+                    *sequence_number,
+                    response_id,
+                    *created_at,
+                    model,
+                    output_text,
+                    usage,
+                ));
+            }
+        }
+    }
+    out
+}
+
 fn usage_from_response_value(value: &Value) -> TokenUsage {
     value
         .get("usage")
@@ -2422,6 +3061,105 @@ impl futures_util::Stream for RouteStreamState {
     }
 }
 
+impl futures_util::Stream for ChatToResponsesStreamState {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            match self.stream.poll_next_unpin(cx) {
+                std::task::Poll::Ready(Some(Ok(bytes))) => {
+                    if self.first_byte_ms.is_none() {
+                        self.first_byte_ms = Some(self.pending.start.elapsed().as_millis() as u64);
+                    }
+                    let mut buffer = std::mem::take(&mut self.sse_buffer);
+                    let mut response_id = std::mem::take(&mut self.response_id);
+                    let mut created_at = self.created_at;
+                    let mut model = std::mem::take(&mut self.model);
+                    let mut output_text = std::mem::take(&mut self.output_text);
+                    let mut output_index = self.output_index;
+                    let mut sequence_number = self.sequence_number;
+                    let mut started = self.started;
+                    let mut text_done = self.text_done;
+                    let mut completed = self.completed;
+                    let mut usage_seen = self.usage_seen;
+                    let mut usage = std::mem::take(&mut self.usage);
+                    let events = chat_stream_events_to_responses(
+                        &mut buffer,
+                        bytes.as_ref(),
+                        &mut response_id,
+                        &mut created_at,
+                        &mut model,
+                        &mut output_text,
+                        &mut output_index,
+                        &mut sequence_number,
+                        &mut started,
+                        &mut text_done,
+                        &mut completed,
+                        &mut usage_seen,
+                        &mut usage,
+                    );
+                    self.sse_buffer = buffer;
+                    self.response_id = response_id;
+                    self.created_at = created_at;
+                    self.model = model;
+                    self.output_text = output_text;
+                    self.output_index = output_index;
+                    self.sequence_number = sequence_number;
+                    self.started = started;
+                    self.text_done = text_done;
+                    self.completed = completed;
+                    self.usage_seen = usage_seen;
+                    self.usage = usage;
+                    if events.is_empty() {
+                        continue;
+                    }
+                    let mut joined = Vec::new();
+                    for event in events {
+                        joined.extend_from_slice(&event);
+                    }
+                    return std::task::Poll::Ready(Some(Ok(Bytes::from(joined))));
+                }
+                std::task::Poll::Ready(Some(Err(err))) => {
+                    if !self.finished {
+                        self.finished = true;
+                        self.pending.error = Some(format!("读取上游流失败: {err}"));
+                        let pending = self.pending.clone();
+                        let usage = self.usage.clone();
+                        finish_route_log(pending, false, usage, self.first_byte_ms);
+                    }
+                    return std::task::Poll::Ready(Some(Err(std::io::Error::other(err))));
+                }
+                std::task::Poll::Ready(None) => {
+                    if self.text_done && !self.completed {
+                        self.completed = true;
+                        self.sequence_number += 1;
+                        let completed = chat_stream_response_completed_event(
+                            self.sequence_number,
+                            &self.response_id,
+                            self.created_at,
+                            &self.model,
+                            &self.output_text,
+                            &self.usage,
+                        );
+                        return std::task::Poll::Ready(Some(Ok(completed)));
+                    }
+                    if !self.finished {
+                        self.finished = true;
+                        let pending = self.pending.clone();
+                        let usage = self.usage.clone();
+                        finish_route_log(pending, self.status_success, usage, self.first_byte_ms);
+                    }
+                    return std::task::Poll::Ready(None);
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+    }
+}
+
 async fn proxy_request(
     AxumState(proxy_state): AxumState<Arc<ProxyState>>,
     method: Method,
@@ -2459,13 +3197,19 @@ async fn proxy_request(
     let mut last_error = String::new();
     for (attempt_index, candidate) in candidates.iter().enumerate() {
         upstream_chain.push(candidate.provider.name.clone());
-        let upstream_url = join_url(&candidate.base_url, &path) + &query;
-        let upstream_model = mapped_model_for_provider(&candidate.provider, &model);
-        let upstream_body = body_with_mapped_model(&body_bytes, upstream_model.as_deref());
+        let prepared =
+            match prepare_upstream_request(&candidate.provider, &path, &query, &body_bytes, &model)
+            {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    return proxy_error(StatusCode::BAD_REQUEST, err);
+                }
+            };
+        let upstream_url = join_url(&candidate.base_url, &prepared.path) + &prepared.query;
         let mut request = proxy_state
             .client
             .request(reqwest_method.clone(), upstream_url)
-            .body(upstream_body);
+            .body(prepared.body.clone());
 
         for (name, value) in headers.iter() {
             if name == AUTHORIZATION
@@ -2493,7 +3237,7 @@ async fn proxy_request(
                     &method,
                     &path,
                     &model,
-                    upstream_model.as_deref(),
+                    prepared.upstream_model.as_deref(),
                     &upstream_chain,
                     None,
                     attempt_index + 1,
@@ -2520,7 +3264,7 @@ async fn proxy_request(
             &method,
             &path,
             &model,
-            upstream_model.as_deref(),
+            prepared.upstream_model.as_deref(),
             &upstream_chain,
             Some(status.as_u16()),
             attempt_index + 1,
@@ -2564,9 +3308,38 @@ async fn proxy_request(
                 usage: TokenUsage::default(),
                 finished: false,
             };
-            return builder
-                .body(Body::from_stream(stream))
-                .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"));
+            return match prepared.adapter {
+                ResponseAdapter::Passthrough => builder
+                    .body(Body::from_stream(stream))
+                    .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应")),
+                ResponseAdapter::ChatCompletionsToResponses => {
+                    let stream = ChatToResponsesStreamState {
+                        stream: stream.stream,
+                        pending: stream.pending,
+                        status_success: stream.status_success,
+                        first_byte_ms: stream.first_byte_ms,
+                        sse_buffer: String::new(),
+                        response_id: "resp_chatcmpl".to_string(),
+                        created_at: 0,
+                        model: String::new(),
+                        output_text: String::new(),
+                        output_index: 0,
+                        sequence_number: 0,
+                        started: false,
+                        text_done: false,
+                        completed: false,
+                        usage_seen: false,
+                        usage: TokenUsage::default(),
+                        finished: false,
+                    };
+                    builder
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap_or_else(|_| {
+                            proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应")
+                        })
+                }
+            };
         }
 
         let first_byte_ms = Some(pending.start.elapsed().as_millis() as u64);
@@ -2579,7 +3352,21 @@ async fn proxy_request(
                 return proxy_error(StatusCode::BAD_GATEWAY, format!("读取上游响应失败: {err}"));
             }
         };
-        let usage = usage_from_response_text(&String::from_utf8_lossy(&bytes));
+        let response_bytes = match prepared.adapter {
+            ResponseAdapter::Passthrough => bytes,
+            ResponseAdapter::ChatCompletionsToResponses => {
+                match chat_completion_to_responses_bytes(&bytes) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        let mut failed = pending;
+                        failed.error = Some(err.clone());
+                        finish_route_log(failed, false, TokenUsage::default(), first_byte_ms);
+                        return proxy_error(StatusCode::BAD_GATEWAY, err);
+                    }
+                }
+            }
+        };
+        let usage = usage_from_response_text(&String::from_utf8_lossy(&response_bytes));
         finish_route_log(pending, status_success, usage, first_byte_ms);
 
         let mut builder = Response::builder().status(status);
@@ -2597,7 +3384,7 @@ async fn proxy_request(
             }
         }
         return builder
-            .body(Body::from(bytes))
+            .body(Body::from(response_bytes))
             .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"));
     }
 
@@ -4331,6 +5118,9 @@ fn save_provider(
     if let Some(connection_test_model) = payload.connection_test_model {
         provider.connection_test_model = connection_test_model.trim().to_string();
     }
+    if let Some(wire_api) = payload.wire_api {
+        provider.wire_api = wire_api;
+    }
     if let Some(model_mappings) = payload.model_mappings {
         provider.model_mappings = normalize_model_mappings(model_mappings);
     }
@@ -4423,6 +5213,9 @@ fn preview_provider(
     }
 
     provider.config = toml_text_to_json(&payload.config_toml)?;
+    if let Some(wire_api) = payload.wire_api {
+        provider.wire_api = wire_api;
+    }
     if let Some(model_mappings) = payload.model_mappings {
         provider.model_mappings = normalize_model_mappings(model_mappings);
     }
@@ -4471,6 +5264,7 @@ fn add_provider(
         id: id.clone(),
         name: trimmed.to_string(),
         enabled: true,
+        wire_api: ProviderWireApi::Responses,
         connection_test_model: String::new(),
         model_mappings: Vec::new(),
         balance_query: BalanceQueryConfig::default(),
@@ -4922,6 +5716,7 @@ mod tests {
                     }
                 }
             }),
+            wire_api: ProviderWireApi::Responses,
             connection_test_model: String::new(),
             model_mappings: Vec::new(),
             balance_query: BalanceQueryConfig {
@@ -4952,6 +5747,7 @@ mod tests {
             name: "Provider A".to_string(),
             enabled: true,
             config: json!({}),
+            wire_api: ProviderWireApi::Responses,
             connection_test_model: String::new(),
             model_mappings: vec![
                 ModelMapping {
@@ -5004,6 +5800,236 @@ mod tests {
                 target: "deepseek-v4-pro".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn converts_responses_request_to_chat_completions() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "instructions": "Be concise.",
+            "input": "hello",
+            "max_output_tokens": 7,
+            "stream": true,
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Lookup data",
+                "parameters": { "type": "object", "properties": {} }
+            }]
+        })
+        .to_string();
+
+        let converted = responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
+            .expect("request converts");
+        let value = serde_json::from_slice::<Value>(&converted).expect("converted json");
+
+        assert_eq!(
+            value.get("model").and_then(Value::as_str),
+            Some("deepseek-chat")
+        );
+        assert_eq!(value.get("max_tokens").and_then(Value::as_i64), Some(7));
+        assert_eq!(
+            value.pointer("/messages/0/role").and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            value.pointer("/messages/1/role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            value.pointer("/tools/0/type").and_then(Value::as_str),
+            Some("function")
+        );
+        assert_eq!(
+            value
+                .pointer("/stream_options/include_usage")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn converts_chat_completion_response_to_responses() {
+        let body = json!({
+            "id": "chatcmpl-1",
+            "created": 123,
+            "model": "deepseek-chat",
+            "choices": [{
+                "message": { "role": "assistant", "content": "你好" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "prompt_tokens_details": { "cached_tokens": 4 },
+                "completion_tokens": 3,
+                "completion_tokens_details": { "reasoning_tokens": 1 },
+                "total_tokens": 13
+            }
+        })
+        .to_string();
+
+        let converted =
+            chat_completion_to_responses_bytes(body.as_bytes()).expect("response converts");
+        let value = serde_json::from_slice::<Value>(&converted).expect("converted json");
+
+        assert_eq!(
+            value.get("object").and_then(Value::as_str),
+            Some("response")
+        );
+        assert_eq!(
+            value.get("output_text").and_then(Value::as_str),
+            Some("你好")
+        );
+        assert_eq!(
+            value.pointer("/usage/input_tokens").and_then(Value::as_i64),
+            Some(10)
+        );
+        assert_eq!(
+            value
+                .pointer("/usage/input_tokens_details/cached_tokens")
+                .and_then(Value::as_i64),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn converts_chat_stream_chunk_to_responses_sse() {
+        let chunk = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+        let usage_chunk = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n";
+        let mut buffer = String::new();
+        let mut response_id = "resp_chatcmpl".to_string();
+        let mut created_at = 0;
+        let mut model = String::new();
+        let mut output_index = 0;
+        let mut output_text = String::new();
+        let mut sequence_number = 0;
+        let mut started = false;
+        let mut text_done = false;
+        let mut completed = false;
+        let mut usage_seen = false;
+        let mut usage = TokenUsage::default();
+
+        let first = chat_stream_events_to_responses(
+            &mut buffer,
+            chunk,
+            &mut response_id,
+            &mut created_at,
+            &mut model,
+            &mut output_text,
+            &mut output_index,
+            &mut sequence_number,
+            &mut started,
+            &mut text_done,
+            &mut completed,
+            &mut usage_seen,
+            &mut usage,
+        );
+        let second = chat_stream_events_to_responses(
+            &mut buffer,
+            usage_chunk,
+            &mut response_id,
+            &mut created_at,
+            &mut model,
+            &mut output_text,
+            &mut output_index,
+            &mut sequence_number,
+            &mut started,
+            &mut text_done,
+            &mut completed,
+            &mut usage_seen,
+            &mut usage,
+        );
+        let text = first
+            .into_iter()
+            .chain(second)
+            .map(|bytes| String::from_utf8(bytes.to_vec()).expect("utf8"))
+            .collect::<String>();
+
+        assert!(text.contains("response.output_text.delta"));
+        assert!(text.contains("\"delta\":\"hi\""));
+        assert!(text.contains("\"text\":\"hi\""));
+        assert!(text.contains("response.completed"));
+        assert_eq!(usage.input_tokens, 2);
+        assert_eq!(usage.output_tokens, 1);
+    }
+
+    #[test]
+    fn waits_for_late_chat_stream_usage_before_completed() {
+        let text_chunk = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+        let finish_chunk = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        let usage_chunk = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n";
+        let mut buffer = String::new();
+        let mut response_id = "resp_chatcmpl".to_string();
+        let mut created_at = 0;
+        let mut model = String::new();
+        let mut output_index = 0;
+        let mut output_text = String::new();
+        let mut sequence_number = 0;
+        let mut started = false;
+        let mut text_done = false;
+        let mut completed = false;
+        let mut usage_seen = false;
+        let mut usage = TokenUsage::default();
+
+        let first = chat_stream_events_to_responses(
+            &mut buffer,
+            text_chunk,
+            &mut response_id,
+            &mut created_at,
+            &mut model,
+            &mut output_text,
+            &mut output_index,
+            &mut sequence_number,
+            &mut started,
+            &mut text_done,
+            &mut completed,
+            &mut usage_seen,
+            &mut usage,
+        );
+        let second = chat_stream_events_to_responses(
+            &mut buffer,
+            finish_chunk,
+            &mut response_id,
+            &mut created_at,
+            &mut model,
+            &mut output_text,
+            &mut output_index,
+            &mut sequence_number,
+            &mut started,
+            &mut text_done,
+            &mut completed,
+            &mut usage_seen,
+            &mut usage,
+        );
+        let third = chat_stream_events_to_responses(
+            &mut buffer,
+            usage_chunk,
+            &mut response_id,
+            &mut created_at,
+            &mut model,
+            &mut output_text,
+            &mut output_index,
+            &mut sequence_number,
+            &mut started,
+            &mut text_done,
+            &mut completed,
+            &mut usage_seen,
+            &mut usage,
+        );
+        let before_usage = first
+            .into_iter()
+            .chain(second)
+            .map(|bytes| String::from_utf8(bytes.to_vec()).expect("utf8"))
+            .collect::<String>();
+        let after_usage = third
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes.to_vec()).expect("utf8"))
+            .collect::<String>();
+
+        assert!(!before_usage.contains("response.completed"));
+        assert!(after_usage.contains("response.completed"));
+        assert!(after_usage.contains("\"total_tokens\":3"));
+        assert_eq!(usage.total_tokens, 3);
     }
 
     #[test]

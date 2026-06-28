@@ -13,6 +13,7 @@ type JsonValue =
 type BalanceQueryType = "disabled" | "new_api" | "sub2_api";
 type NewApiBalanceTarget = "token_quota" | "account_balance";
 type BalanceAuthMode = "provider_token" | "separate_token";
+type ProviderWireApi = "responses" | "chat_completions";
 
 type BalanceQueryConfig = {
   enabled: boolean;
@@ -72,6 +73,7 @@ type ProviderConfig = {
   name: string;
   enabled: boolean;
   config: JsonValue;
+  wire_api: ProviderWireApi;
   connection_test_model: string;
   model_mappings: ModelMapping[];
   balance_query: BalanceQueryConfig;
@@ -736,6 +738,7 @@ function App() {
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerApiKeyDirty, setProviderApiKeyDirty] = useState(false);
   const [providerEnabled, setProviderEnabled] = useState(true);
+  const [providerWireApi, setProviderWireApi] = useState<ProviderWireApi>("responses");
   const [connectionTestResult, setConnectionTestResult] = useState<ProviderConnectionTestResult | null>(null);
   const [providerTestModel, setProviderTestModel] = useState("");
   const [providerModels, setProviderModels] = useState<string[]>([]);
@@ -866,6 +869,7 @@ function App() {
     setProviderApiKey(fields.apiKey);
     setProviderApiKeyDirty(false);
     setProviderEnabled(summary?.enabled ?? targetFull.enabled ?? true);
+    setProviderWireApi(targetFull.wire_api ?? "responses");
     setProviderTestModel(targetFull.connection_test_model ?? "");
     setProviderModels(targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
     setModelMappings(targetFull.model_mappings ?? []);
@@ -923,6 +927,7 @@ function App() {
         config_toml: "",
         base_url: providerBaseUrl,
         enabled: providerEnabled,
+        wire_api: providerWireApi,
         balance_query: nextBalance,
         balance_status: balanceTestStatus,
         connection_test_model: providerTestModel,
@@ -1321,6 +1326,7 @@ function App() {
           providerModels={providerModels}
           providerName={providerName}
           providerTestModel={providerTestModel}
+          providerWireApi={providerWireApi}
           secretVisible={secretVisible}
           setProviderApiKey={(value) => {
             setProviderApiKey(value);
@@ -1341,6 +1347,7 @@ function App() {
           setModelMappings={setModelMappings}
           setProviderName={setProviderName}
           setProviderTestModel={setProviderTestModel}
+          setProviderWireApi={setProviderWireApi}
           setSecretVisible={setSecretVisible}
           tab={editorTab}
         />
@@ -2334,6 +2341,7 @@ function ProviderEditor(props: {
   providerModels: string[];
   providerName: string;
   providerTestModel: string;
+  providerWireApi: ProviderWireApi;
   secretVisible: boolean;
   setProviderApiKey: (value: string) => void;
   setProviderApiKeyDirty: (dirty: boolean) => void;
@@ -2342,6 +2350,7 @@ function ProviderEditor(props: {
   setModelMappings: (mappings: ModelMapping[]) => void;
   setProviderName: (value: string) => void;
   setProviderTestModel: (value: string) => void;
+  setProviderWireApi: (value: ProviderWireApi) => void;
   setSecretVisible: (value: boolean) => void;
   tab: EditorTab;
 }) {
@@ -2366,6 +2375,7 @@ function ProviderEditor(props: {
     providerModels,
     providerName,
     providerTestModel,
+    providerWireApi,
     secretVisible,
     setProviderApiKey,
     setProviderApiKeyDirty,
@@ -2374,12 +2384,14 @@ function ProviderEditor(props: {
     setModelMappings,
     setProviderName,
     setProviderTestModel,
+    setProviderWireApi,
     setSecretVisible,
     tab,
   } = props;
   const modelOptions = providerTestModel && !providerModels.includes(providerTestModel)
     ? [providerTestModel, ...providerModels]
     : providerModels;
+  const upstreamPath = providerWireApi === "chat_completions" ? "chat/completions" : "responses";
 
   return (
     <div className="drawer-backdrop">
@@ -2411,7 +2423,7 @@ function ProviderEditor(props: {
               <label className="field">
                 <span>Base URL</span>
                 <input value={providerBaseUrl} onChange={(event) => setProviderBaseUrl(event.currentTarget.value)} />
-                <small>请求将转发至 {providerBaseUrl ? `${providerBaseUrl.replace(/\/$/, "")}/responses` : "-"}</small>
+                <small>请求将转发至 {providerBaseUrl ? `${providerBaseUrl.replace(/\/$/, "")}/${upstreamPath}` : "-"}</small>
               </label>
               <label className="field">
                 <span>转发 API Key</span>
@@ -2633,6 +2645,17 @@ function ProviderEditor(props: {
                 <select defaultValue="all">
                   <option value="all">全部模型</option>
                 </select>
+              </label>
+              <label className="field">
+                <span>接口协议</span>
+                <select
+                  value={providerWireApi}
+                  onChange={(event) => setProviderWireApi(event.currentTarget.value as ProviderWireApi)}
+                >
+                  <option value="responses">Responses API</option>
+                  <option value="chat_completions">Chat Completions 兼容</option>
+                </select>
+                <small>DeepSeek、GLM 等不支持 Responses 时选择兼容模式</small>
               </label>
               <div className="route-box">
                 <strong>故障处理</strong>
