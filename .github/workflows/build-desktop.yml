@@ -182,6 +182,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CODEX_HELPER_VERSION: ${{ needs.prepare-release.outputs.tag }}
         with:
           releaseId: ${{ needs.prepare-release.outputs.release_id }}
           args: ${{ matrix.build_args }}

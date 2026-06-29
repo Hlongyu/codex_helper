@@ -1903,6 +1903,33 @@ button.danger {
   color: #8390a4;
 }
 
+.settings-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.settings-row {
+  display: flex;
+  min-height: 58px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px solid #24364a;
+  border-radius: 12px;
+  background: #0d1520;
+  padding: 0 20px;
+}
+
+.settings-row span {
+  color: #8390a4;
+}
+
+.settings-row strong {
+  color: #f7f9fd;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
 @media (max-width: 1280px) {
   .metric-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));

@@ -468,6 +468,7 @@ struct DiffEntry {
 
 #[derive(Debug, Clone, Serialize)]
 struct AppState {
+    app_version: String,
     codex_config_path: String,
     manager_dir: String,
     current_config_raw: String,
@@ -706,6 +707,9 @@ struct ChatToolCallState {
 }
 
 const REASONING_CONTENT_FIELD: &str = "reasoning_content";
+const LOCAL_REASONING_ENCRYPTED_PREFIX: &str = "codex-helper-local-reasoning-v1:";
+const MISSING_REASONING_CONTENT_FALLBACK: &str =
+    "Previous reasoning content was unavailable in Responses history.";
 
 fn reasoning_content_from_value(value: &Value) -> Option<&str> {
     value
@@ -724,6 +728,42 @@ fn attach_reasoning_content(value: &mut Value, reasoning_content: Option<&str>) 
             Value::String(reasoning_content.to_string()),
         );
     }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let mut chars = value.as_bytes().chunks_exact(2);
+    for pair in &mut chars {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        bytes.push(((high << 4) | low) as u8);
+    }
+    Some(bytes)
+}
+
+fn local_reasoning_encrypted_content(reasoning_content: &str) -> String {
+    format!(
+        "{LOCAL_REASONING_ENCRYPTED_PREFIX}{}",
+        hex_encode(reasoning_content.as_bytes())
+    )
+}
+
+fn local_reasoning_from_encrypted_content(value: &str) -> Option<String> {
+    let encoded = value.strip_prefix(LOCAL_REASONING_ENCRYPTED_PREFIX)?;
+    String::from_utf8(hex_decode(encoded)?).ok()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3331,6 +3371,33 @@ fn response_tool_output_text(item: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn responses_reasoning_item_text(item: &Value) -> Option<String> {
+    reasoning_content_from_value(item)
+        .map(str::to_string)
+        .or_else(|| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .filter(|content| !content.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            item.get("content")
+                .and_then(json_string_content)
+                .filter(|content| !content.is_empty())
+        })
+        .or_else(|| {
+            item.get("summary")
+                .and_then(json_string_content)
+                .filter(|content| !content.is_empty())
+        })
+        .or_else(|| {
+            item.get("encrypted_content")
+                .and_then(Value::as_str)
+                .and_then(local_reasoning_from_encrypted_content)
+        })
+        .filter(|content| !content.is_empty())
+}
+
 fn responses_role_to_chat_role(role: &str) -> &str {
     match role {
         "developer" => "system",
@@ -3338,14 +3405,63 @@ fn responses_role_to_chat_role(role: &str) -> &str {
     }
 }
 
+fn responses_input_item_type(item: &Value) -> &str {
+    item.get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("message")
+}
+
+fn is_responses_tool_call_item_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "function_call" | "custom_tool_call" | "tool_search_call"
+    )
+}
+
+fn responses_input_tool_call_to_chat_tool_call(
+    item: &Value,
+    tool_context: &CodexToolContext,
+) -> Result<Value, String> {
+    match responses_input_item_type(item) {
+        "function_call" => {
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "function_call 缺少 name".to_string())?;
+            let namespace = item.get("namespace").and_then(Value::as_str);
+            let chat_name = tool_context.chat_name_for_response_function(name, namespace);
+            let arguments = canonical_tool_arguments(item.get("arguments"));
+            Ok(json!({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": chat_name,
+                    "arguments": arguments
+                }
+            }))
+        }
+        "custom_tool_call" => Ok(responses_custom_tool_call_to_chat_tool_call(item)),
+        "tool_search_call" => Ok(responses_tool_search_call_to_chat_tool_call(item)),
+        other => Err(format!("Chat Completions 适配不支持 input 类型: {other}")),
+    }
+}
+
+fn append_chat_tool_call(message: &mut Value, tool_call: Value) {
+    if let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+        tool_calls.push(tool_call);
+    }
+}
+
 fn responses_input_item_to_chat_message(
     item: &Value,
     tool_context: &CodexToolContext,
 ) -> Result<Value, String> {
-    let item_type = item
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("message");
+    let item_type = responses_input_item_type(item);
     match item_type {
         "message" => {
             let role = item
@@ -3361,48 +3477,12 @@ fn responses_input_item_to_chat_message(
                 .ok_or_else(|| "Chat Completions 适配暂只支持文本 input".to_string())?;
             Ok(json!({ "role": role, "content": content }))
         }
-        "function_call" => {
-            let call_id = item
-                .get("call_id")
-                .or_else(|| item.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let name = item
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "function_call 缺少 name".to_string())?;
-            let namespace = item.get("namespace").and_then(Value::as_str);
-            let chat_name = tool_context.chat_name_for_response_function(name, namespace);
-            let arguments = canonical_tool_arguments(item.get("arguments"));
+        "function_call" | "custom_tool_call" | "tool_search_call" => {
+            let tool_call = responses_input_tool_call_to_chat_tool_call(item, tool_context)?;
             let mut message = json!({
                 "role": "assistant",
                 "content": null,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": chat_name,
-                        "arguments": arguments
-                    }
-                }]
-            });
-            attach_reasoning_content(&mut message, reasoning_content_from_value(item));
-            Ok(message)
-        }
-        "custom_tool_call" => {
-            let mut message = json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [responses_custom_tool_call_to_chat_tool_call(item)]
-            });
-            attach_reasoning_content(&mut message, reasoning_content_from_value(item));
-            Ok(message)
-        }
-        "tool_search_call" => {
-            let mut message = json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [responses_tool_search_call_to_chat_tool_call(item)]
+                "tool_calls": [tool_call]
             });
             attach_reasoning_content(&mut message, reasoning_content_from_value(item));
             Ok(message)
@@ -3429,20 +3509,79 @@ fn responses_input_item_to_chat_message(
                 "content": response_tool_output_text(item)
             }))
         }
+        "reasoning" => Ok(json!({ "role": "assistant", "content": "" })),
         other => Err(format!("Chat Completions 适配不支持 input 类型: {other}")),
     }
+}
+
+fn chat_model_requires_reasoning_content_fallback(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("deepseek")
 }
 
 fn responses_input_to_chat_messages(
     value: &Value,
     tool_context: &CodexToolContext,
+    missing_reasoning_fallback: bool,
 ) -> Result<Vec<Value>, String> {
     match value {
         Value::String(text) => Ok(vec![json!({ "role": "user", "content": text })]),
-        Value::Array(items) => items
-            .iter()
-            .map(|item| responses_input_item_to_chat_message(item, tool_context))
-            .collect::<Result<Vec<_>, _>>(),
+        Value::Array(items) => {
+            let mut messages = Vec::new();
+            let mut pending_tool_call_message: Option<Value> = None;
+            let mut pending_reasoning_content: Option<String> = None;
+
+            for item in items {
+                let item_type = responses_input_item_type(item);
+                if item_type == "reasoning" {
+                    if let Some(reasoning_content) = responses_reasoning_item_text(item) {
+                        pending_reasoning_content = Some(reasoning_content);
+                    }
+                    continue;
+                }
+
+                if is_responses_tool_call_item_type(item_type) {
+                    let tool_call =
+                        responses_input_tool_call_to_chat_tool_call(item, tool_context)?;
+                    let item_reasoning_content =
+                        reasoning_content_from_value(item).map(str::to_string);
+                    if pending_tool_call_message.is_none() {
+                        let mut message = json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": []
+                        });
+                        let reasoning_content = item_reasoning_content
+                            .as_deref()
+                            .or(pending_reasoning_content.as_deref())
+                            .or_else(|| {
+                                missing_reasoning_fallback
+                                    .then_some(MISSING_REASONING_CONTENT_FALLBACK)
+                            });
+                        attach_reasoning_content(&mut message, reasoning_content);
+                        pending_tool_call_message = Some(message);
+                    } else if let Some(reasoning_content) = item_reasoning_content.as_deref() {
+                        if let Some(message) = pending_tool_call_message.as_mut() {
+                            attach_reasoning_content(message, Some(reasoning_content));
+                        }
+                    }
+                    if let Some(message) = pending_tool_call_message.as_mut() {
+                        append_chat_tool_call(message, tool_call);
+                    }
+                    pending_reasoning_content = None;
+                    continue;
+                }
+
+                if let Some(message) = pending_tool_call_message.take() {
+                    messages.push(message);
+                }
+                messages.push(responses_input_item_to_chat_message(item, tool_context)?);
+            }
+
+            if let Some(message) = pending_tool_call_message {
+                messages.push(message);
+            }
+            Ok(messages)
+        }
         _ => Err("Chat Completions 适配暂只支持文本 input".to_string()),
     }
 }
@@ -3511,6 +3650,7 @@ fn responses_to_chat_request_body(
         .and_then(Value::as_str)
         .ok_or_else(|| "Responses 请求缺少 model".to_string())?
         .to_string();
+    let missing_reasoning_fallback = chat_model_requires_reasoning_content_fallback(&model);
 
     let input = object
         .get("input")
@@ -3521,7 +3661,11 @@ fn responses_to_chat_request_body(
             messages.push(json!({ "role": "system", "content": instructions }));
         }
     }
-    messages.extend(responses_input_to_chat_messages(input, &tool_context)?);
+    messages.extend(responses_input_to_chat_messages(
+        input,
+        &tool_context,
+        missing_reasoning_fallback,
+    )?);
 
     let mut chat = Map::new();
     chat.insert("model".to_string(), Value::String(model));
@@ -3697,8 +3841,22 @@ fn response_message_item(output_text: &str, status: &str) -> Value {
     })
 }
 
+fn response_reasoning_item(reasoning_content: &str) -> Value {
+    json!({
+        "id": "rs_0",
+        "type": "reasoning",
+        "summary": [],
+        "content": null,
+        "encrypted_content": local_reasoning_encrypted_content(reasoning_content)
+    })
+}
+
 fn chat_message_to_responses_output(message: &Value, context: &CodexToolContext) -> Vec<Value> {
     let mut output = Vec::new();
+    let reasoning_content = reasoning_content_from_value(message);
+    if let Some(reasoning_content) = reasoning_content {
+        output.push(response_reasoning_item(reasoning_content));
+    }
     if let Some(content) = message.get("content").and_then(Value::as_str) {
         if !content.is_empty() {
             output.push(response_message_item(content, "completed"));
@@ -3728,7 +3886,7 @@ fn chat_message_to_responses_output(message: &Value, context: &CodexToolContext)
                 arguments,
                 context,
             );
-            attach_reasoning_content(&mut response_item, reasoning_content_from_value(message));
+            attach_reasoning_content(&mut response_item, reasoning_content);
             output.push(response_item);
         }
     }
@@ -3950,6 +4108,34 @@ fn finalize_stream_tool_calls(
     completed_output: &mut Vec<(usize, Value)>,
     reasoning_content: Option<&str>,
 ) {
+    if let Some(reasoning_content) = reasoning_content.filter(|content| !content.is_empty()) {
+        if !tool_calls.is_empty() {
+            let output_index = *next_output_index;
+            *next_output_index += 1;
+            let item = response_reasoning_item(reasoning_content);
+            *sequence_number += 1;
+            out.push(Bytes::from(sse_event(
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "sequence_number": *sequence_number,
+                    "output_index": output_index,
+                    "item": item
+                }),
+            )));
+            *sequence_number += 1;
+            out.push(Bytes::from(sse_event(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": *sequence_number,
+                    "output_index": output_index,
+                    "item": item
+                }),
+            )));
+            completed_output.push((output_index, item));
+        }
+    }
     for (index, state) in tool_calls.iter_mut() {
         if state.done {
             continue;
@@ -6945,6 +7131,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
         .collect();
 
     Ok(AppState {
+        app_version: env!("CODEX_HELPER_VERSION").to_string(),
         codex_config_path: codex_config_path()?.display().to_string(),
         manager_dir: manager_dir()?.display().to_string(),
         current_config_raw: redacted_toml_text(&current_config_raw),
@@ -8476,8 +8663,20 @@ mod tests {
         let response = serde_json::from_slice::<Value>(&converted).expect("converted json");
 
         assert_eq!(
+            response.pointer("/output/0/type").and_then(Value::as_str),
+            Some("reasoning")
+        );
+        let encrypted_reasoning = response
+            .pointer("/output/0/encrypted_content")
+            .and_then(Value::as_str)
+            .expect("reasoning item stores content");
+        assert_eq!(
+            local_reasoning_from_encrypted_content(encrypted_reasoning).as_deref(),
+            Some("I need to call a tool.")
+        );
+        assert_eq!(
             response
-                .pointer("/output/0/reasoning_content")
+                .pointer("/output/1/reasoning_content")
                 .and_then(Value::as_str),
             Some("I need to call a tool.")
         );
@@ -8503,6 +8702,126 @@ mod tests {
                 .pointer("/messages/0/tool_calls/0/id")
                 .and_then(Value::as_str),
             Some("call_lookup")
+        );
+    }
+
+    #[test]
+    fn applies_local_reasoning_item_to_next_chat_tool_call() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": null,
+                    "encrypted_content": local_reasoning_encrypted_content("Need a tool.")
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_lookup",
+                    "name": "lookup",
+                    "arguments": "{\"query\":\"weather\"}"
+                }
+            ]
+        })
+        .to_string();
+
+        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
+            .expect("request converts");
+        let request = serde_json::from_slice::<Value>(&converted).expect("request json");
+
+        assert_eq!(
+            request
+                .pointer("/messages/0/reasoning_content")
+                .and_then(Value::as_str),
+            Some("Need a tool.")
+        );
+        assert_eq!(
+            request
+                .pointer("/messages/0/tool_calls/0/id")
+                .and_then(Value::as_str),
+            Some("call_lookup")
+        );
+    }
+
+    #[test]
+    fn adds_deepseek_reasoning_fallback_for_legacy_tool_call_history() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_lookup",
+                "name": "lookup",
+                "arguments": "{\"query\":\"weather\"}"
+            }]
+        })
+        .to_string();
+
+        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
+            .expect("request converts");
+        let request = serde_json::from_slice::<Value>(&converted).expect("request json");
+
+        assert_eq!(
+            request
+                .pointer("/messages/0/reasoning_content")
+                .and_then(Value::as_str),
+            Some(MISSING_REASONING_CONTENT_FALLBACK)
+        );
+
+        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("glm-5.2"))
+            .expect("request converts");
+        let request = serde_json::from_slice::<Value>(&converted).expect("request json");
+        assert!(request.pointer("/messages/0/reasoning_content").is_none());
+    }
+
+    #[test]
+    fn merges_consecutive_responses_tool_calls_for_chat_history() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": local_reasoning_encrypted_content("Need both tools.")
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_one",
+                    "name": "lookup",
+                    "arguments": "{\"query\":\"one\"}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_two",
+                    "name": "lookup",
+                    "arguments": "{\"query\":\"two\"}"
+                }
+            ]
+        })
+        .to_string();
+
+        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
+            .expect("request converts");
+        let request = serde_json::from_slice::<Value>(&converted).expect("request json");
+
+        assert_eq!(
+            request
+                .pointer("/messages/0/reasoning_content")
+                .and_then(Value::as_str),
+            Some("Need both tools.")
+        );
+        assert_eq!(
+            request
+                .pointer("/messages/0/tool_calls")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            request
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
         );
     }
 
@@ -8739,6 +9058,8 @@ mod tests {
             .map(|bytes| String::from_utf8(bytes.to_vec()).expect("utf8"))
             .collect::<String>();
 
+        assert!(text.contains("\"type\":\"reasoning\""));
+        assert!(text.contains(LOCAL_REASONING_ENCRYPTED_PREFIX));
         assert!(text.contains("\"reasoning_content\":\"I should look it up.\""));
         assert!(text.contains("response.output_item.done"));
         assert!(text.contains("response.completed"));

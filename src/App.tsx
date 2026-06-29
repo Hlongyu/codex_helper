@@ -254,6 +254,7 @@ type RouteUsageStats = {
 };
 
 type AppState = {
+  app_version: string;
   codex_config_path: string;
   manager_dir: string;
   current_config_raw: string;
@@ -1426,11 +1427,17 @@ function App() {
               <div className="panel-head">
                 <div>
                   <h2>设置</h2>
-                  <p>通用偏好设置入口。路由接管与本地代理配置已移动到路由页。</p>
+                  <p>应用信息与通用偏好设置入口。路由接管与本地代理配置已移动到路由页。</p>
+                </div>
+              </div>
+              <div className="settings-list">
+                <div className="settings-row">
+                  <span>当前版本</span>
+                  <strong>{appState.app_version}</strong>
                 </div>
               </div>
               <div className="settings-placeholder">
-                <span>当前暂无额外设置</span>
+                <span>当前暂无额外偏好设置</span>
                 <button className="ghost" onClick={() => setScreen("route")} type="button">
                   打开路由配置
                 </button>
