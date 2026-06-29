@@ -705,6 +705,27 @@ struct ChatToolCallState {
     done: bool,
 }
 
+const REASONING_CONTENT_FIELD: &str = "reasoning_content";
+
+fn reasoning_content_from_value(value: &Value) -> Option<&str> {
+    value
+        .get(REASONING_CONTENT_FIELD)
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())
+}
+
+fn attach_reasoning_content(value: &mut Value, reasoning_content: Option<&str>) {
+    let Some(reasoning_content) = reasoning_content.filter(|content| !content.is_empty()) else {
+        return;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            REASONING_CONTENT_FIELD.to_string(),
+            Value::String(reasoning_content.to_string()),
+        );
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct UsageStatsFilter {
     #[serde(default)]
@@ -929,6 +950,7 @@ struct ChatToResponsesStreamState {
     created_at: i64,
     model: String,
     output_text: String,
+    reasoning_content: String,
     output_index: usize,
     next_output_index: usize,
     tool_context: CodexToolContext,
@@ -3352,7 +3374,7 @@ fn responses_input_item_to_chat_message(
             let namespace = item.get("namespace").and_then(Value::as_str);
             let chat_name = tool_context.chat_name_for_response_function(name, namespace);
             let arguments = canonical_tool_arguments(item.get("arguments"));
-            Ok(json!({
+            let mut message = json!({
                 "role": "assistant",
                 "content": null,
                 "tool_calls": [{
@@ -3363,18 +3385,28 @@ fn responses_input_item_to_chat_message(
                         "arguments": arguments
                     }
                 }]
-            }))
+            });
+            attach_reasoning_content(&mut message, reasoning_content_from_value(item));
+            Ok(message)
         }
-        "custom_tool_call" => Ok(json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [responses_custom_tool_call_to_chat_tool_call(item)]
-        })),
-        "tool_search_call" => Ok(json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [responses_tool_search_call_to_chat_tool_call(item)]
-        })),
+        "custom_tool_call" => {
+            let mut message = json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [responses_custom_tool_call_to_chat_tool_call(item)]
+            });
+            attach_reasoning_content(&mut message, reasoning_content_from_value(item));
+            Ok(message)
+        }
+        "tool_search_call" => {
+            let mut message = json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [responses_tool_search_call_to_chat_tool_call(item)]
+            });
+            attach_reasoning_content(&mut message, reasoning_content_from_value(item));
+            Ok(message)
+        }
         "function_call_output" => {
             let call_id = item
                 .get("call_id")
@@ -3688,14 +3720,16 @@ fn chat_message_to_responses_output(message: &Value, context: &CodexToolContext)
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let item_id = response_tool_call_item_id(call_id, chat_name, context);
-            output.push(response_tool_call_item_from_chat_name(
+            let mut response_item = response_tool_call_item_from_chat_name(
                 &item_id,
                 "completed",
                 call_id,
                 chat_name,
                 arguments,
                 context,
-            ));
+            );
+            attach_reasoning_content(&mut response_item, reasoning_content_from_value(message));
+            output.push(response_item);
         }
     }
     output
@@ -3914,6 +3948,7 @@ fn finalize_stream_tool_calls(
     tool_calls: &mut BTreeMap<usize, ChatToolCallState>,
     next_output_index: &mut usize,
     completed_output: &mut Vec<(usize, Value)>,
+    reasoning_content: Option<&str>,
 ) {
     for (index, state) in tool_calls.iter_mut() {
         if state.done {
@@ -3950,7 +3985,7 @@ fn finalize_stream_tool_calls(
             )));
         }
         let output_index = state.output_index.unwrap_or(0);
-        let item = response_tool_call_item_from_chat_name(
+        let mut item = response_tool_call_item_from_chat_name(
             &state.item_id,
             "completed",
             &state.call_id,
@@ -3958,6 +3993,7 @@ fn finalize_stream_tool_calls(
             &state.arguments,
             tool_context,
         );
+        attach_reasoning_content(&mut item, reasoning_content);
         if tool_context.is_custom_tool_chat_name(&state.name) {
             let input = custom_tool_input_from_chat_arguments(&state.arguments);
             if !input.is_empty() {
@@ -4019,6 +4055,7 @@ fn chat_stream_events_to_responses(
     created_at: &mut i64,
     model: &mut String,
     output_text: &mut String,
+    reasoning_content: &mut String,
     output_index: &mut usize,
     next_output_index: &mut usize,
     tool_context: &CodexToolContext,
@@ -4103,6 +4140,9 @@ fn chat_stream_events_to_responses(
                 .and_then(Value::as_array)
                 .and_then(|choices| choices.first());
             if let Some(delta) = choice.and_then(|choice| choice.get("delta")) {
+                if let Some(text) = reasoning_content_from_value(delta) {
+                    reasoning_content.push_str(text);
+                }
                 if let Some(text) = delta.get("content").and_then(Value::as_str) {
                     if !text.is_empty() {
                         output_text.push_str(text);
@@ -4170,6 +4210,7 @@ fn chat_stream_events_to_responses(
                     tool_calls,
                     next_output_index,
                     completed_output,
+                    Some(reasoning_content.as_str()),
                 );
             }
             if *text_done && *usage_seen && !*completed {
@@ -4518,6 +4559,7 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                     let mut created_at = self.created_at;
                     let mut model = std::mem::take(&mut self.model);
                     let mut output_text = std::mem::take(&mut self.output_text);
+                    let mut reasoning_content = std::mem::take(&mut self.reasoning_content);
                     let mut output_index = self.output_index;
                     let mut next_output_index = self.next_output_index;
                     let tool_context = self.tool_context.clone();
@@ -4536,6 +4578,7 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                         &mut created_at,
                         &mut model,
                         &mut output_text,
+                        &mut reasoning_content,
                         &mut output_index,
                         &mut next_output_index,
                         &tool_context,
@@ -4553,6 +4596,7 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                     self.created_at = created_at;
                     self.model = model;
                     self.output_text = output_text;
+                    self.reasoning_content = reasoning_content;
                     self.output_index = output_index;
                     self.next_output_index = next_output_index;
                     self.tool_context = tool_context;
@@ -4796,6 +4840,7 @@ async fn proxy_request(
                         created_at: 0,
                         model: String::new(),
                         output_text: String::new(),
+                        reasoning_content: String::new(),
                         output_index: 0,
                         next_output_index: 1,
                         tool_context: prepared.tool_context.clone(),
@@ -7566,6 +7611,7 @@ mod tests {
         created_at: i64,
         model: String,
         output_text: String,
+        reasoning_content: String,
         output_index: usize,
         next_output_index: usize,
         tool_context: CodexToolContext,
@@ -7587,6 +7633,7 @@ mod tests {
                 created_at: 0,
                 model: String::new(),
                 output_text: String::new(),
+                reasoning_content: String::new(),
                 output_index: 0,
                 next_output_index: 1,
                 tool_context,
@@ -7609,6 +7656,7 @@ mod tests {
                 &mut self.created_at,
                 &mut self.model,
                 &mut self.output_text,
+                &mut self.reasoning_content,
                 &mut self.output_index,
                 &mut self.next_output_index,
                 &self.tool_context,
@@ -8398,6 +8446,67 @@ mod tests {
     }
 
     #[test]
+    fn preserves_reasoning_content_for_chat_tool_call_round_trip() {
+        let body = json!({
+            "id": "chatcmpl-1",
+            "created": 123,
+            "model": "deepseek-chat",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "I need to call a tool.",
+                    "tool_calls": [{
+                        "id": "call_lookup",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": "{\"query\":\"weather\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string();
+
+        let converted =
+            chat_completion_to_responses_bytes(body.as_bytes(), &CodexToolContext::default())
+                .expect("response converts");
+        let response = serde_json::from_slice::<Value>(&converted).expect("converted json");
+
+        assert_eq!(
+            response
+                .pointer("/output/0/reasoning_content")
+                .and_then(Value::as_str),
+            Some("I need to call a tool.")
+        );
+
+        let next_request = json!({
+            "model": "gpt-5.5",
+            "input": response.get("output").cloned().unwrap_or_else(|| json!([]))
+        })
+        .to_string();
+        let (converted_request, _) =
+            responses_to_chat_request_body(next_request.as_bytes(), Some("deepseek-chat"))
+                .expect("request converts");
+        let request = serde_json::from_slice::<Value>(&converted_request).expect("request json");
+
+        assert_eq!(
+            request
+                .pointer("/messages/0/reasoning_content")
+                .and_then(Value::as_str),
+            Some("I need to call a tool.")
+        );
+        assert_eq!(
+            request
+                .pointer("/messages/0/tool_calls/0/id")
+                .and_then(Value::as_str),
+            Some("call_lookup")
+        );
+    }
+
+    #[test]
     fn converts_namespace_and_tool_search_tools() {
         let body = json!({
             "model": "gpt-5.5",
@@ -8610,6 +8719,28 @@ mod tests {
         assert!(text.contains("response.custom_tool_call_input.done"));
         assert!(text.contains("\"input\":\"patch text\""));
         assert!(!text.contains("response.function_call_arguments.delta"));
+        assert!(text.contains("response.completed"));
+    }
+
+    #[test]
+    fn preserves_streamed_reasoning_content_for_chat_tool_calls() {
+        let reasoning_start = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"reasoning_content\":\"I should \"},\"finish_reason\":null}]}\n\n";
+        let tool_start = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"reasoning_content\":\"look it up.\",\"tool_calls\":[{\"index\":0,\"id\":\"call_lookup\",\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]},\"finish_reason\":null}]}\n\n";
+        let tool_args = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"query\\\":\\\"weather\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n";
+        let mut state = ChatStreamTestState::new(CodexToolContext::default());
+
+        let first = state.ingest(reasoning_start);
+        let second = state.ingest(tool_start);
+        let third = state.ingest(tool_args);
+        let text = first
+            .into_iter()
+            .chain(second)
+            .chain(third)
+            .map(|bytes| String::from_utf8(bytes.to_vec()).expect("utf8"))
+            .collect::<String>();
+
+        assert!(text.contains("\"reasoning_content\":\"I should look it up.\""));
+        assert!(text.contains("response.output_item.done"));
         assert!(text.contains("response.completed"));
     }
 
