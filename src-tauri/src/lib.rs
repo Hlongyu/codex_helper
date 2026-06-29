@@ -3309,6 +3309,13 @@ fn response_tool_output_text(item: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn responses_role_to_chat_role(role: &str) -> &str {
+    match role {
+        "developer" => "system",
+        other => other,
+    }
+}
+
 fn responses_input_item_to_chat_message(
     item: &Value,
     tool_context: &CodexToolContext,
@@ -3322,6 +3329,7 @@ fn responses_input_item_to_chat_message(
             let role = item
                 .get("role")
                 .and_then(Value::as_str)
+                .map(responses_role_to_chat_role)
                 .unwrap_or("user")
                 .to_string();
             let content = item
@@ -8221,6 +8229,32 @@ mod tests {
                 .pointer("/stream_options/include_usage")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn maps_responses_developer_role_for_chat_completions() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [{
+                "type": "message",
+                "role": "developer",
+                "content": "Follow project instructions."
+            }]
+        })
+        .to_string();
+
+        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
+            .expect("request converts");
+        let value = serde_json::from_slice::<Value>(&converted).expect("converted json");
+
+        assert_eq!(
+            value.pointer("/messages/0/role").and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            value.pointer("/messages/0/content").and_then(Value::as_str),
+            Some("Follow project instructions.")
         );
     }
 
