@@ -33,6 +33,7 @@ const DEFAULT_ROUTER_PORT: u16 = 18080;
 const DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
 const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
 static ROUTE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const DEFAULT_NEW_API_QUOTA_PER_USD: f64 = 500_000.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderConfig {
@@ -45,7 +46,13 @@ struct ProviderConfig {
     #[serde(default)]
     connection_test_model: String,
     #[serde(default)]
+    allowed_models: Vec<String>,
+    #[serde(default)]
     model_mappings: Vec<ModelMapping>,
+    #[serde(default)]
+    provider_pricing: Vec<PricingRule>,
+    #[serde(default)]
+    pricing_sync_status: Option<PricingSyncStatus>,
     #[serde(default)]
     balance_query: BalanceQueryConfig,
     #[serde(default)]
@@ -249,9 +256,35 @@ struct PricingRule {
     cached_input_per_million: f64,
     output_per_million: f64,
     reasoning_output_per_million: f64,
+    #[serde(default)]
+    request_price: f64,
     currency: String,
     #[serde(default)]
     source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PricingSyncStatus {
+    ok: bool,
+    label: String,
+    checked_at: Option<u64>,
+    error: Option<String>,
+    #[serde(default)]
+    group: String,
+    #[serde(default)]
+    group_ratio: f64,
+    #[serde(default)]
+    pricing_count: usize,
+}
+
+fn pricing_sync_label(group: &str, group_ratio: f64, pricing_count: usize) -> String {
+    let group = group.trim();
+    let group_label = if group.is_empty() {
+        "默认分组"
+    } else {
+        group
+    };
+    format!("可用 · {group_label} × {group_ratio:.4} · {pricing_count} 个价格")
 }
 
 impl Default for PricingRule {
@@ -264,6 +297,7 @@ impl Default for PricingRule {
             cached_input_per_million: 0.0,
             output_per_million: 0.0,
             reasoning_output_per_million: 0.0,
+            request_price: 0.0,
             currency: "USD".to_string(),
             source: String::new(),
         }
@@ -406,6 +440,13 @@ struct ProviderSummary {
     latency_ms: Option<u64>,
     latency_label: String,
     latency_error: Option<String>,
+    provider_today_cost: f64,
+    provider_month_cost: f64,
+    provider_currency: String,
+    provider_pricing_count: usize,
+    pricing_sync_ok: bool,
+    pricing_sync_label: String,
+    pricing_sync_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -455,7 +496,9 @@ struct SaveProviderPayload {
     balance_query: Option<BalanceQueryConfig>,
     balance_status: Option<BalanceStatus>,
     connection_test_model: Option<String>,
+    allowed_models: Option<Vec<String>>,
     model_mappings: Option<Vec<ModelMapping>>,
+    provider_pricing: Option<Vec<PricingRule>>,
     wire_api: Option<ProviderWireApi>,
     enabled: Option<bool>,
     base_url: Option<String>,
@@ -504,9 +547,33 @@ struct LoadProviderModelsPayload {
     api_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SyncProviderPricingPayload {
+    provider_id: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    balance_query: Option<BalanceQueryConfig>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ProviderModelsResponse {
     models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderPricingSyncResponse {
+    state: AppState,
+    pricing: Vec<PricingRule>,
+    ok: bool,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderPricingSyncData {
+    pricing: Vec<PricingRule>,
+    group: String,
+    group_ratio: f64,
+    pricing_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -711,6 +778,16 @@ struct RouteRequestLog {
     cost_breakdown: String,
     pricing_model_match: String,
     pricing_source: String,
+    #[serde(default)]
+    provider_estimated_cost: f64,
+    #[serde(default = "default_currency")]
+    provider_currency: String,
+    #[serde(default)]
+    provider_cost_breakdown: String,
+    #[serde(default)]
+    provider_pricing_model_match: String,
+    #[serde(default)]
+    provider_pricing_source: String,
     first_byte_ms: Option<u64>,
     total_ms: u64,
 }
@@ -829,6 +906,7 @@ struct PendingRouteLog {
     route_attempts: usize,
     error: Option<String>,
     start: Instant,
+    provider_pricing: Vec<PricingRule>,
 }
 
 struct RouteStreamState {
@@ -879,6 +957,10 @@ fn default_router_port() -> u16 {
 
 fn default_router_token() -> String {
     random_router_token()
+}
+
+fn default_currency() -> String {
+    "USD".to_string()
 }
 
 fn random_router_token() -> String {
@@ -997,6 +1079,7 @@ fn default_pricing_rules() -> Vec<PricingRule> {
             cached_input_per_million: cached_input,
             output_per_million: output,
             reasoning_output_per_million: 0.0,
+            request_price: 0.0,
             currency: "USD".to_string(),
             source: SOURCE.to_string(),
         }
@@ -1080,6 +1163,14 @@ fn load_state_file() -> Result<ManagerState, String> {
 
 fn normalize_state(mut state: ManagerState) -> ManagerState {
     state.pricing = default_pricing_rules();
+    for provider in &mut state.providers {
+        provider.allowed_models =
+            normalize_model_names(std::mem::take(&mut provider.allowed_models));
+        provider.model_mappings =
+            normalize_model_mappings(std::mem::take(&mut provider.model_mappings));
+        provider.provider_pricing =
+            normalize_provider_pricing(std::mem::take(&mut provider.provider_pricing));
+    }
     if state.router.local_token.trim().is_empty()
         || state.router.local_token == DEFAULT_ROUTER_TOKEN
     {
@@ -1294,6 +1385,507 @@ fn normalize_model_mappings(mappings: Vec<ModelMapping>) -> Vec<ModelMapping> {
     normalized
 }
 
+fn normalize_provider_pricing(pricing: Vec<PricingRule>) -> Vec<PricingRule> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for (index, mut rule) in pricing.into_iter().enumerate() {
+        rule.provider_match = "*".to_string();
+        rule.model_match = rule.model_match.trim().to_string();
+        if rule.model_match.is_empty() {
+            continue;
+        }
+        let key = rule.model_match.to_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        if rule.id.trim().is_empty() {
+            rule.id = format!("provider-price-{index}");
+        } else {
+            rule.id = rule.id.trim().to_string();
+        }
+        rule.input_per_million = rule.input_per_million.max(0.0);
+        rule.cached_input_per_million = rule.cached_input_per_million.max(0.0);
+        rule.output_per_million = rule.output_per_million.max(0.0);
+        rule.reasoning_output_per_million = rule.reasoning_output_per_million.max(0.0);
+        rule.request_price = rule.request_price.max(0.0);
+        rule.currency = rule.currency.trim().to_uppercase();
+        if rule.currency.is_empty() {
+            rule.currency = default_currency();
+        }
+        rule.source = if rule.source.trim().is_empty() {
+            "供应商手动价格".to_string()
+        } else {
+            rule.source.trim().to_string()
+        };
+        normalized.push(rule);
+    }
+    normalized
+}
+
+fn provider_price_rule_id(model: &str) -> String {
+    let slug = model
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if slug.is_empty() {
+        "provider-price".to_string()
+    } else {
+        format!("provider-price-{slug}")
+    }
+}
+
+fn newapi_endpoint_from_base_url(base_url: &str) -> String {
+    let mut endpoint = base_url.trim().trim_end_matches('/').to_string();
+    if endpoint.to_ascii_lowercase().ends_with("/v1") {
+        endpoint.truncate(endpoint.len().saturating_sub(3));
+        endpoint = endpoint.trim_end_matches('/').to_string();
+    }
+    endpoint
+}
+
+fn finite_number(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+fn scalar_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64().and_then(finite_number),
+        Value::String(text) => text.trim().parse::<f64>().ok().and_then(finite_number),
+        _ => None,
+    }
+}
+
+fn object_get_ci<'a>(map: &'a Map<String, Value>, keys: &[&str]) -> Option<(&'a str, &'a Value)> {
+    for (key, value) in map {
+        if keys
+            .iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+        {
+            return Some((key.as_str(), value));
+        }
+    }
+    None
+}
+
+fn object_number_ci(map: &Map<String, Value>, keys: &[&str]) -> Option<f64> {
+    object_get_ci(map, keys).and_then(|(_, value)| scalar_number(value))
+}
+
+fn object_string_ci(map: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    object_get_ci(map, keys).and_then(|(_, value)| match value {
+        Value::String(text) => Some(text.trim().to_string()).filter(|text| !text.is_empty()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    })
+}
+
+fn normalize_price_per_million(field_name: &str, value: f64) -> f64 {
+    let field = field_name.to_ascii_lowercase();
+    if field.contains("per_token") || field.contains("per-token") || field.contains("/token") {
+        value * 1_000_000.0
+    } else if field.contains("per_1k")
+        || field.contains("per-k")
+        || field.contains("per_k")
+        || field.contains("1k")
+        || field.contains("thousand")
+    {
+        value * 1_000.0
+    } else {
+        value
+    }
+}
+
+fn object_price_per_million_ci(map: &Map<String, Value>, keys: &[&str]) -> Option<f64> {
+    object_get_ci(map, keys)
+        .and_then(|(key, value)| scalar_number(value).map(|price| (key, price)))
+        .map(|(key, price)| normalize_price_per_million(key, price).max(0.0))
+}
+
+fn newapi_ratio_source(source: &str, quota_per_usd: f64) -> String {
+    if (quota_per_usd.fract()).abs() < f64::EPSILON {
+        format!("{source} ratio, {:.0} quota/USD", quota_per_usd)
+    } else {
+        format!("{source} ratio, {quota_per_usd:.4} quota/USD")
+    }
+}
+
+fn newapi_rule_from_record(
+    model_key: Option<&str>,
+    record: &Map<String, Value>,
+    source: &str,
+    quota_per_usd: f64,
+) -> Option<PricingRule> {
+    let model = object_string_ci(record, &["model_name", "model", "name", "id"])
+        .or_else(|| model_key.map(str::trim).map(str::to_string))
+        .filter(|model| !model.is_empty())?;
+
+    let input_price = object_price_per_million_ci(
+        record,
+        &[
+            "input_price",
+            "input_price_usd",
+            "input_per_million",
+            "input_usd_per_million",
+            "input_price_per_million",
+            "input_price_per_1m",
+            "input_price_per_1k",
+            "input_price_per_token",
+            "prompt_price",
+            "prompt_price_usd",
+            "prompt_per_million",
+            "prompt_usd_per_million",
+            "prompt_price_per_million",
+            "prompt_price_per_1m",
+            "prompt_price_per_1k",
+            "prompt_price_per_token",
+        ],
+    );
+    let output_price = object_price_per_million_ci(
+        record,
+        &[
+            "output_price",
+            "output_price_usd",
+            "output_per_million",
+            "output_usd_per_million",
+            "output_price_per_million",
+            "output_price_per_1m",
+            "output_price_per_1k",
+            "output_price_per_token",
+            "completion_price",
+            "completion_price_usd",
+            "completion_per_million",
+            "completion_usd_per_million",
+            "completion_price_per_million",
+            "completion_price_per_1m",
+            "completion_price_per_1k",
+            "completion_price_per_token",
+        ],
+    );
+    let cached_input_price = object_price_per_million_ci(
+        record,
+        &[
+            "cached_input_price",
+            "cached_input_price_usd",
+            "cached_input_per_million",
+            "cached_input_usd_per_million",
+            "cached_input_price_per_million",
+            "cached_input_price_per_1m",
+            "cached_input_price_per_1k",
+            "cached_input_price_per_token",
+            "cache_read_price",
+            "cache_read_price_per_million",
+            "cache_read_price_per_1m",
+            "cached_prompt_price",
+            "cached_prompt_price_per_million",
+        ],
+    );
+    let cache_ratio = object_number_ci(
+        record,
+        &[
+            "cache_ratio",
+            "cacheRatio",
+            "cached_ratio",
+            "cachedRatio",
+            "cache_read_ratio",
+            "cacheReadRatio",
+            "cached_input_ratio",
+            "cachedInputRatio",
+            "prompt_cache_ratio",
+            "promptCacheRatio",
+        ],
+    )
+    .map(|ratio| ratio.max(0.0));
+    let reasoning_price = object_price_per_million_ci(
+        record,
+        &[
+            "reasoning_output_price",
+            "reasoning_output_price_usd",
+            "reasoning_output_per_million",
+            "reasoning_output_price_per_million",
+        ],
+    );
+
+    if input_price.is_some() || output_price.is_some() {
+        let input = input_price.or(output_price).unwrap_or_default().max(0.0);
+        let output = output_price.unwrap_or(input).max(0.0);
+        return Some(PricingRule {
+            id: provider_price_rule_id(&model),
+            provider_match: "*".to_string(),
+            model_match: model,
+            input_per_million: input,
+            cached_input_per_million: cached_input_price
+                .or_else(|| cache_ratio.map(|ratio| input * ratio))
+                .unwrap_or(input)
+                .max(0.0),
+            output_per_million: output,
+            reasoning_output_per_million: reasoning_price.unwrap_or(0.0).max(0.0),
+            request_price: object_price_per_million_ci(
+                record,
+                &["request_price", "request_price_usd", "price_per_request"],
+            )
+            .unwrap_or(0.0)
+            .max(0.0),
+            currency: "USD".to_string(),
+            source: format!("{source} explicit price"),
+        });
+    }
+
+    let quota_type = object_number_ci(record, &["quota_type", "quotaType"])
+        .map(|value| value.round() as i64)
+        .unwrap_or(0);
+    if quota_type == 1 {
+        let model_price = object_number_ci(
+            record,
+            &[
+                "model_price",
+                "modelPrice",
+                "request_price",
+                "requestPrice",
+                "price",
+            ],
+        )
+        .unwrap_or(0.0)
+        .max(0.0);
+        if model_price <= 0.0 {
+            return None;
+        }
+        return Some(PricingRule {
+            id: provider_price_rule_id(&model),
+            provider_match: "*".to_string(),
+            model_match: model,
+            input_per_million: 0.0,
+            cached_input_per_million: 0.0,
+            output_per_million: 0.0,
+            reasoning_output_per_million: 0.0,
+            request_price: model_price,
+            currency: "USD".to_string(),
+            source: format!("{source} fixed request price"),
+        });
+    }
+
+    let model_ratio = object_number_ci(record, &["model_ratio", "modelRatio", "ratio"])?;
+    let completion_ratio = object_number_ci(
+        record,
+        &[
+            "completion_ratio",
+            "completionRatio",
+            "output_ratio",
+            "outputRatio",
+        ],
+    )
+    .unwrap_or(1.0)
+    .max(0.0);
+    let input = model_ratio.max(0.0) * 1_000_000.0 / quota_per_usd;
+    let cached_input = input * cache_ratio.unwrap_or(1.0);
+    let output = input * completion_ratio;
+
+    Some(PricingRule {
+        id: provider_price_rule_id(&model),
+        provider_match: "*".to_string(),
+        model_match: model,
+        input_per_million: input,
+        cached_input_per_million: cached_input,
+        output_per_million: output,
+        reasoning_output_per_million: 0.0,
+        request_price: 0.0,
+        currency: "USD".to_string(),
+        source: newapi_ratio_source(source, quota_per_usd),
+    })
+}
+
+fn collect_newapi_record_rules(
+    value: &Value,
+    model_key: Option<&str>,
+    source: &str,
+    quota_per_usd: f64,
+    rules: &mut Vec<PricingRule>,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_newapi_record_rules(item, None, source, quota_per_usd, rules);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(rule) = newapi_rule_from_record(model_key, map, source, quota_per_usd) {
+                rules.push(rule);
+                return;
+            }
+
+            for (key, child) in map {
+                if key.eq_ignore_ascii_case("model_ratio")
+                    || key.eq_ignore_ascii_case("completion_ratio")
+                    || key.eq_ignore_ascii_case("model_price")
+                    || key.eq_ignore_ascii_case("cache_ratio")
+                    || key.eq_ignore_ascii_case("cacheRatio")
+                {
+                    continue;
+                }
+                let child_model_key = if child.is_object()
+                    && !matches!(
+                        key.as_str(),
+                        "data" | "result" | "pricing" | "prices" | "models" | "items" | "list"
+                    ) {
+                    Some(key.as_str())
+                } else {
+                    None
+                };
+                collect_newapi_record_rules(child, child_model_key, source, quota_per_usd, rules);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn find_object_by_key_ci<'a>(value: &'a Value, target_key: &str) -> Option<&'a Map<String, Value>> {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key.eq_ignore_ascii_case(target_key) {
+                    if let Some(child_map) = child.as_object() {
+                        return Some(child_map);
+                    }
+                }
+            }
+            for child in map.values() {
+                if let Some(found) = find_object_by_key_ci(child, target_key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| find_object_by_key_ci(item, target_key)),
+        _ => None,
+    }
+}
+
+fn map_number_for_key_ci(map: &Map<String, Value>, target_key: &str) -> Option<f64> {
+    map.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(target_key))
+        .and_then(|(_, value)| scalar_number(value))
+}
+
+fn append_newapi_ratio_config_rules(
+    value: &Value,
+    source: &str,
+    quota_per_usd: f64,
+    rules: &mut Vec<PricingRule>,
+) {
+    if let Some(model_price_map) = find_object_by_key_ci(value, "model_price") {
+        for (model, price_value) in model_price_map {
+            let model = model.trim();
+            if model.is_empty() {
+                continue;
+            }
+            let Some(model_price) = scalar_number(price_value) else {
+                continue;
+            };
+            if model_price <= 0.0 {
+                continue;
+            }
+            rules.push(PricingRule {
+                id: provider_price_rule_id(model),
+                provider_match: "*".to_string(),
+                model_match: model.to_string(),
+                input_per_million: 0.0,
+                cached_input_per_million: 0.0,
+                output_per_million: 0.0,
+                reasoning_output_per_million: 0.0,
+                request_price: model_price,
+                currency: "USD".to_string(),
+                source: format!("{source} fixed request price"),
+            });
+        }
+    }
+
+    let Some(model_ratio_map) = find_object_by_key_ci(value, "model_ratio") else {
+        return;
+    };
+    let completion_ratio_map = find_object_by_key_ci(value, "completion_ratio");
+    let cache_ratio_map = find_object_by_key_ci(value, "cache_ratio")
+        .or_else(|| find_object_by_key_ci(value, "cacheRatio"));
+    let source = newapi_ratio_source(source, quota_per_usd);
+
+    for (model, ratio_value) in model_ratio_map {
+        let model = model.trim();
+        if model.is_empty() {
+            continue;
+        }
+        let Some(model_ratio) = scalar_number(ratio_value) else {
+            continue;
+        };
+        let completion_ratio = completion_ratio_map
+            .and_then(|map| map_number_for_key_ci(map, model))
+            .unwrap_or(1.0)
+            .max(0.0);
+        let cache_ratio = cache_ratio_map
+            .and_then(|map| map_number_for_key_ci(map, model))
+            .unwrap_or(1.0)
+            .max(0.0);
+        let input = model_ratio.max(0.0) * 1_000_000.0 / quota_per_usd;
+        rules.push(PricingRule {
+            id: provider_price_rule_id(model),
+            provider_match: "*".to_string(),
+            model_match: model.to_string(),
+            input_per_million: input,
+            cached_input_per_million: input * cache_ratio,
+            output_per_million: input * completion_ratio,
+            reasoning_output_per_million: 0.0,
+            request_price: 0.0,
+            currency: "USD".to_string(),
+            source: source.clone(),
+        });
+    }
+}
+
+fn parse_newapi_pricing_value(value: &Value, source: &str, quota_per_usd: f64) -> Vec<PricingRule> {
+    let quota_per_usd = if quota_per_usd > 0.0 {
+        quota_per_usd
+    } else {
+        DEFAULT_NEW_API_QUOTA_PER_USD
+    };
+    let mut rules = Vec::new();
+    collect_newapi_record_rules(value, None, source, quota_per_usd, &mut rules);
+    if rules.is_empty() {
+        append_newapi_ratio_config_rules(value, source, quota_per_usd, &mut rules);
+    }
+    normalize_provider_pricing(rules)
+}
+
+fn normalize_model_names(models: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for model in models {
+        let model = model.trim();
+        if model.is_empty() {
+            continue;
+        }
+        let key = model.to_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        normalized.push(model.to_string());
+    }
+    normalized
+}
+
+fn provider_accepts_model(provider: &ProviderConfig, requested_model: &str) -> bool {
+    let requested = requested_model.trim();
+    if requested.is_empty() || requested == "未知模型" || provider.allowed_models.is_empty() {
+        return true;
+    }
+    provider
+        .allowed_models
+        .iter()
+        .any(|model| model.trim().eq_ignore_ascii_case(requested))
+}
+
 fn mapped_model_for_provider(provider: &ProviderConfig, requested_model: &str) -> Option<String> {
     let requested = requested_model.trim();
     if requested.is_empty() || requested == "未知模型" {
@@ -1419,6 +2011,42 @@ fn merge_balance_config_draft(
         draft.query_token = provider.balance_query.query_token.clone();
     }
     normalize_balance_config(draft, provider)
+}
+
+fn newapi_pricing_auth_from_config(
+    provider: &ProviderConfig,
+    endpoint: &str,
+) -> Option<(String, String)> {
+    let config = normalize_balance_config(provider.balance_query.clone(), provider);
+    if !matches!(config.query_type, BalanceQueryType::NewApi) {
+        return None;
+    }
+    if newapi_endpoint_from_base_url(&config.endpoint) != endpoint {
+        return None;
+    }
+    let token = match config.auth_mode {
+        BalanceAuthMode::SeparateToken => config.query_token.trim().to_string(),
+        BalanceAuthMode::ProviderToken => String::new(),
+    };
+    let user_id = config.new_api_user_id.trim().to_string();
+    if token.is_empty() || user_id.is_empty() {
+        return None;
+    }
+    Some((token, user_id))
+}
+
+fn newapi_pricing_auth_for_endpoint(
+    state: &ManagerState,
+    provider: &ProviderConfig,
+    endpoint: &str,
+) -> Option<(String, String)> {
+    newapi_pricing_auth_from_config(provider, endpoint).or_else(|| {
+        state
+            .providers
+            .iter()
+            .filter(|candidate| candidate.id != provider.id)
+            .find_map(|candidate| newapi_pricing_auth_from_config(candidate, endpoint))
+    })
 }
 
 fn apply_provider_connection_draft(
@@ -2074,6 +2702,44 @@ fn router_patch_desired(router: &RouterConfig) -> Value {
     })
 }
 
+fn router_patch_matches_current(current_json: &Value, router: &RouterConfig) -> bool {
+    let desired = router_patch_desired(router);
+    let desired_flat = flatten(&desired);
+    let current_flat = flatten(current_json);
+    desired_flat
+        .iter()
+        .all(|(path, desired)| current_flat.get(path) == Some(desired))
+}
+
+fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String> {
+    if !state.router.enabled {
+        return Ok(false);
+    }
+
+    let (doc, marker_present, _, _) = read_current_toml()?;
+    let current_json = toml_doc_to_json(&doc);
+    if router_patch_matches_current(&current_json, &state.router) {
+        return Ok(false);
+    }
+
+    let desired = router_patch_desired(&state.router);
+    let was_managed = marker_present
+        || state.router_backup.is_some()
+        || state.last_applied.as_ref() == Some(&desired);
+    if !was_managed {
+        return Ok(false);
+    }
+
+    if state.router_backup.is_none() {
+        state.router_backup = Some(capture_router_backup(&doc));
+    }
+    let raw = render_router_patch_toml(doc, marker_present, &state.router)?;
+    fs::write(codex_config_path()?, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
+    state.last_applied = Some(desired);
+    state.applied_provider_id = None;
+    Ok(true)
+}
+
 fn compute_diffs(
     state: &ManagerState,
     provider: Option<&ProviderConfig>,
@@ -2174,6 +2840,46 @@ fn upstream_candidates() -> Result<(RouterConfig, Vec<UpstreamCandidate>), Strin
         return Err("没有已启用且配置完整的供应商".to_string());
     }
     Ok((state.router, candidates))
+}
+
+fn configured_route_models(candidates: &[UpstreamCandidate]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut models = Vec::new();
+    for candidate in candidates {
+        for model in &candidate.provider.allowed_models {
+            let model = model.trim();
+            if model.is_empty() {
+                continue;
+            }
+            let key = model.to_lowercase();
+            if !seen.insert(key) {
+                continue;
+            }
+            models.push(model.to_string());
+        }
+    }
+    models
+}
+
+fn models_response(models: Vec<String>) -> Response {
+    let data = models
+        .into_iter()
+        .map(|model| {
+            json!({
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "codex-helper"
+            })
+        })
+        .collect::<Vec<_>>();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json; charset=utf-8")
+        .body(Body::from(
+            json!({ "object": "list", "data": data }).to_string(),
+        ))
+        .unwrap_or_else(|_| Response::new(Body::from("{}")))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -3637,6 +4343,13 @@ fn finish_route_log(
         pricing_model,
         &usage,
     );
+    let provider_cost = estimate_provider_cost(
+        &pending.provider_pricing,
+        &pending.provider_id,
+        &pending.provider_name,
+        pricing_model,
+        &usage,
+    );
     let status = if pending.error.is_some() || !status_success {
         "failed"
     } else {
@@ -3674,9 +4387,17 @@ fn finish_route_log(
         cost_breakdown: cost.breakdown,
         pricing_model_match: cost.pricing_model_match,
         pricing_source: cost.pricing_source,
+        provider_estimated_cost: provider_cost.amount,
+        provider_currency: provider_cost.currency,
+        provider_cost_breakdown: provider_cost.breakdown,
+        provider_pricing_model_match: provider_cost.pricing_model_match,
+        provider_pricing_source: provider_cost.pricing_source,
         first_byte_ms,
         total_ms,
     };
+    if !is_usage_route_log(&log) {
+        return;
+    }
     if let Err(err) = append_route_log(&log) {
         eprintln!("{err}");
     }
@@ -3726,6 +4447,7 @@ fn build_pending_route_log(
         route_attempts,
         error,
         start,
+        provider_pricing: candidate.provider.provider_pricing.clone(),
     }
 }
 
@@ -3899,6 +4621,12 @@ async fn proxy_request(
     if bearer_token(&headers) != Some(router.local_token.trim()) {
         return proxy_error(StatusCode::UNAUTHORIZED, "本地路由 Token 无效");
     }
+    if method == Method::GET && path.trim_matches('/') == "models" {
+        let models = configured_route_models(&candidates);
+        if !models.is_empty() {
+            return models_response(models);
+        }
+    }
 
     let query = uri
         .query()
@@ -3914,6 +4642,21 @@ async fn proxy_request(
         Ok(method) => method,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("请求方法无效: {err}")),
     };
+
+    let candidates = candidates
+        .iter()
+        .filter(|candidate| provider_accepts_model(&candidate.provider, &model))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return proxy_error(
+            StatusCode::BAD_GATEWAY,
+            if model.trim().is_empty() || model == "未知模型" {
+                "没有可用的上游供应商".to_string()
+            } else {
+                format!("没有可用的上游供应商支持模型: {model}")
+            },
+        );
+    }
 
     let mut upstream_chain = Vec::new();
     let mut last_error = String::new();
@@ -4362,6 +5105,302 @@ async fn fetch_newapi_quota_per_unit(client: &reqwest::Client, endpoint: &str) -
         .or_else(|| number_at_path(&body, &["quota_per_unit"]))
 }
 
+async fn fetch_newapi_json(
+    client: &reqwest::Client,
+    endpoint: &str,
+    path: &str,
+    token: Option<&str>,
+    user_id: Option<&str>,
+) -> Result<Value, String> {
+    let url = join_url(endpoint, path);
+    let mut request = client.get(url).header("accept", "application/json");
+    if let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) {
+        request = request.bearer_auth(token);
+    }
+    if let Some(user_id) = user_id.map(str::trim).filter(|user_id| !user_id.is_empty()) {
+        request = request.header("New-Api-User", user_id);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("请求 {path} 失败: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("{path} 返回 HTTP {}", status.as_u16()));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|err| format!("{path} 响应不是有效 JSON: {err}"))
+}
+
+fn newapi_failure_message(value: &Value) -> Option<String> {
+    let success = value.get("success").and_then(Value::as_bool)?;
+    if success {
+        return None;
+    }
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("error").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+        .or_else(|| Some("接口返回 success=false".to_string()))
+}
+
+fn bearer_token_core(token: &str) -> String {
+    token
+        .trim()
+        .strip_prefix("Bearer ")
+        .or_else(|| token.trim().strip_prefix("bearer "))
+        .unwrap_or_else(|| token.trim())
+        .strip_prefix("sk-")
+        .unwrap_or_else(|| {
+            token
+                .trim()
+                .strip_prefix("Bearer ")
+                .or_else(|| token.trim().strip_prefix("bearer "))
+                .unwrap_or_else(|| token.trim())
+        })
+        .to_string()
+}
+
+fn masked_key_matches(masked: &str, full_token: &str) -> bool {
+    let masked = masked.trim().strip_prefix("sk-").unwrap_or(masked.trim());
+    let token = bearer_token_core(full_token);
+    if masked.is_empty() || token.is_empty() {
+        return false;
+    }
+    if masked == token {
+        return true;
+    }
+    if token.len() <= 8 {
+        return false;
+    }
+    let prefix = &token[..4];
+    let suffix = &token[token.len() - 4..];
+    masked.starts_with(prefix) && masked.ends_with(suffix)
+}
+
+fn value_array_at<'a>(value: &'a Value, paths: &[&[&str]]) -> Option<&'a Vec<Value>> {
+    paths
+        .iter()
+        .find_map(|path| value_at_path(value, path).and_then(Value::as_array))
+}
+
+fn group_ratio_for_pricing_record(
+    record: &Map<String, Value>,
+    group_ratios: &Map<String, Value>,
+    key_group: &str,
+) -> f64 {
+    let key_group = key_group.trim();
+    let groups = record
+        .get("enable_groups")
+        .or_else(|| record.get("enable_group"))
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|group| !group.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if !key_group.is_empty() && groups.iter().any(|group| *group == key_group) {
+        return map_number_for_key_ci(group_ratios, key_group).unwrap_or(1.0);
+    }
+
+    groups
+        .iter()
+        .filter_map(|group| map_number_for_key_ci(group_ratios, group))
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or_else(|| {
+            if key_group.is_empty() {
+                1.0
+            } else {
+                map_number_for_key_ci(group_ratios, key_group).unwrap_or(1.0)
+            }
+        })
+}
+
+fn group_ratio_for_key(group_ratios: &Map<String, Value>, key_group: &str) -> Option<f64> {
+    let key_group = key_group.trim();
+    if key_group.is_empty() {
+        return None;
+    }
+    map_number_for_key_ci(group_ratios, key_group)
+}
+
+fn apply_pricing_multiplier(mut rule: PricingRule, multiplier: f64, group: &str) -> PricingRule {
+    let multiplier = if multiplier.is_finite() && multiplier >= 0.0 {
+        multiplier
+    } else {
+        1.0
+    };
+    rule.input_per_million *= multiplier;
+    rule.cached_input_per_million *= multiplier;
+    rule.output_per_million *= multiplier;
+    rule.reasoning_output_per_million *= multiplier;
+    rule.request_price *= multiplier;
+    if multiplier != 1.0 || !group.trim().is_empty() {
+        let group = if group.trim().is_empty() {
+            "默认分组"
+        } else {
+            group.trim()
+        };
+        rule.source = format!("{} · group {group} × {multiplier:.4}", rule.source);
+    }
+    rule
+}
+
+fn parse_newapi_pricing_with_group(
+    value: &Value,
+    source: &str,
+    quota_per_usd: f64,
+    key_group: &str,
+) -> Vec<PricingRule> {
+    let Some(items) = value_array_at(value, &[&["data"], &["pricing"], &["prices"]]) else {
+        return parse_newapi_pricing_value(value, source, quota_per_usd);
+    };
+    let Some(group_ratios) = value.get("group_ratio").and_then(Value::as_object) else {
+        return parse_newapi_pricing_value(value, source, quota_per_usd);
+    };
+    let key_group_ratio = group_ratio_for_key(group_ratios, key_group);
+
+    let quota_per_usd = if quota_per_usd > 0.0 {
+        quota_per_usd
+    } else {
+        DEFAULT_NEW_API_QUOTA_PER_USD
+    };
+    let mut pricing = Vec::new();
+    for item in items {
+        let Some(record) = item.as_object() else {
+            continue;
+        };
+        let Some(rule) = newapi_rule_from_record(None, record, source, quota_per_usd) else {
+            continue;
+        };
+        let multiplier = key_group_ratio
+            .unwrap_or_else(|| group_ratio_for_pricing_record(record, group_ratios, key_group));
+        pricing.push(apply_pricing_multiplier(rule, multiplier, key_group));
+    }
+    normalize_provider_pricing(pricing)
+}
+
+fn token_group_from_list(value: &Value, provider_token: &str) -> Option<String> {
+    let items = value_array_at(
+        value,
+        &[
+            &["data", "items"],
+            &["items"],
+            &["data", "tokens"],
+            &["tokens"],
+        ],
+    )?;
+    for item in items {
+        let Some(map) = item.as_object() else {
+            continue;
+        };
+        let masked = object_string_ci(map, &["key", "token"])?;
+        if masked_key_matches(&masked, provider_token) {
+            return object_string_ci(map, &["group", "token_group"]);
+        }
+    }
+    None
+}
+
+async fn fetch_newapi_token_group(
+    client: &reqwest::Client,
+    endpoint: &str,
+    auth: Option<(&str, &str)>,
+    provider_token: &str,
+) -> Option<String> {
+    let (token, user_id) = auth?;
+    let body = fetch_newapi_json(
+        client,
+        endpoint,
+        "/api/token/search?page=1&page_size=100",
+        Some(token),
+        Some(user_id),
+    )
+    .await
+    .ok()?;
+    token_group_from_list(&body, provider_token)
+}
+
+async fn fetch_newapi_provider_pricing(
+    provider: &ProviderConfig,
+    auth: Option<(String, String)>,
+) -> Result<ProviderPricingSyncData, String> {
+    let base_url = custom_provider_base_url(provider)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Base URL 为空".to_string())?;
+    let endpoint = newapi_endpoint_from_base_url(&base_url);
+    if endpoint.trim().is_empty() {
+        return Err("New API 地址为空".to_string());
+    }
+    let auth_ref = auth
+        .as_ref()
+        .map(|(token, user_id)| (token.as_str(), user_id.as_str()));
+    let provider_token = custom_provider_token(provider).unwrap_or_default();
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|err| format!("创建 HTTP 客户端失败: {err}"))?;
+    let quota_per_usd = fetch_newapi_quota_per_unit(&client, &endpoint)
+        .await
+        .filter(|value| *value > 0.0)
+        .unwrap_or(DEFAULT_NEW_API_QUOTA_PER_USD);
+    let key_group = fetch_newapi_token_group(&client, &endpoint, auth_ref, &provider_token)
+        .await
+        .unwrap_or_default();
+
+    let attempts = [
+        ("/api/pricing", "New API /api/pricing", auth_ref),
+        ("/api/ratio_config", "New API /api/ratio_config", None),
+    ];
+    let mut errors = Vec::new();
+    for (path, source, request_auth) in attempts {
+        let (request_token, request_user_id) = request_auth
+            .map(|(token, user_id)| (Some(token), Some(user_id)))
+            .unwrap_or((None, None));
+        match fetch_newapi_json(&client, &endpoint, path, request_token, request_user_id).await {
+            Ok(body) => {
+                if let Some(message) = newapi_failure_message(&body) {
+                    errors.push(format!("{path} 返回失败: {message}"));
+                    continue;
+                }
+                let pricing =
+                    parse_newapi_pricing_with_group(&body, source, quota_per_usd, &key_group);
+                if !pricing.is_empty() {
+                    let group_ratio = body
+                        .get("group_ratio")
+                        .and_then(Value::as_object)
+                        .and_then(|ratios| map_number_for_key_ci(ratios, &key_group))
+                        .unwrap_or(1.0);
+                    let pricing_count = pricing.len();
+                    return Ok(ProviderPricingSyncData {
+                        pricing,
+                        group: key_group,
+                        group_ratio,
+                        pricing_count,
+                    });
+                }
+                errors.push(format!("{path} 未解析到可用价格"));
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+
+    Err(format!("未能从 New API 同步价格：{}", errors.join("；")))
+}
+
 async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
     let config = normalize_balance_config(provider.balance_query.clone(), provider);
     let checked_at = now_epoch_seconds().ok();
@@ -4615,6 +5654,9 @@ fn read_route_logs() -> Result<Vec<RouteRequestLog>, String> {
             continue;
         }
         if let Ok(log) = serde_json::from_str::<RouteRequestLog>(&line) {
+            if !is_usage_route_log(&log) {
+                continue;
+            }
             logs.push(log);
         }
     }
@@ -4700,6 +5742,13 @@ fn is_success_route_log(log: &RouteRequestLog) -> bool {
     log.status == "success"
 }
 
+fn is_usage_route_log(log: &RouteRequestLog) -> bool {
+    matches!(
+        (log.method.as_str(), log.path.as_str()),
+        ("POST", "/v1/responses") | ("POST", "/v1/chat/completions") | ("POST", "/v1/completions")
+    )
+}
+
 fn route_available_providers(logs: &[RouteRequestLog]) -> Vec<RouteLogFilterOption> {
     let mut map = BTreeMap::<String, RouteLogFilterOption>::new();
     for log in logs {
@@ -4780,6 +5829,32 @@ fn route_breakdown_by(
     rows
 }
 
+fn provider_cost_for_range(
+    logs: &[RouteRequestLog],
+    provider_id: &str,
+    day_key: &str,
+    month_key: &str,
+) -> (f64, f64, String) {
+    let mut today_cost = 0.0;
+    let mut month_cost = 0.0;
+    let mut currency = default_currency();
+    for log in logs
+        .iter()
+        .filter(|log| log.provider_id == provider_id && is_success_route_log(log))
+    {
+        if !log.provider_currency.trim().is_empty() {
+            currency = log.provider_currency.clone();
+        }
+        if log.day == day_key {
+            today_cost += log.provider_estimated_cost;
+        }
+        if log.day.starts_with(month_key) {
+            month_cost += log.provider_estimated_cost;
+        }
+    }
+    (today_cost, month_cost, currency)
+}
+
 fn route_bucket_label(log: &RouteRequestLog, filter: &RouteLogFilter) -> (String, String) {
     if filter.start_day.is_none() && filter.end_day.is_none() {
         return (
@@ -4801,6 +5876,7 @@ fn build_route_logs_response(
 ) -> RouteLogsResponse {
     let filtered = logs
         .iter()
+        .filter(|log| is_usage_route_log(log))
         .filter(|log| route_log_matches_filter(log, &filter))
         .cloned()
         .collect::<Vec<_>>();
@@ -4821,9 +5897,9 @@ fn build_route_logs_response(
         page,
         page_size,
         total_pages,
-        available_providers: route_available_providers(&logs),
-        available_models: route_available_models(&logs),
-        available_days: route_available_days(&logs),
+        available_providers: route_available_providers(&filtered),
+        available_models: route_available_models(&filtered),
+        available_days: route_available_days(&filtered),
     }
 }
 
@@ -4838,7 +5914,7 @@ fn build_route_usage_stats(
     let successful = filtered
         .iter()
         .copied()
-        .filter(|log| is_success_route_log(log))
+        .filter(|log| is_success_route_log(log) && is_usage_route_log(log))
         .collect::<Vec<_>>();
     let now = Local::now();
     let today_key = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
@@ -4868,7 +5944,7 @@ fn build_route_usage_stats(
         }
         total_ms_total = total_ms_total.saturating_add(log.total_ms);
         total_ms_count += 1;
-        if !is_success_route_log(log) {
+        if !is_success_route_log(log) || !is_usage_route_log(log) {
             continue;
         }
         add_route_log_usage(&mut summary, log);
@@ -4901,10 +5977,15 @@ fn build_route_usage_stats(
     }
 
     let page_size = normalized_page_size(filter.page_size);
-    let total_pages = filtered.len().div_ceil(page_size).max(1);
+    let usage_filtered = filtered
+        .iter()
+        .copied()
+        .filter(|log| is_usage_route_log(log))
+        .collect::<Vec<_>>();
+    let total_pages = usage_filtered.len().div_ceil(page_size).max(1);
     let page = filter.page.unwrap_or(1).clamp(1, total_pages);
     let start = (page - 1) * page_size;
-    let details = filtered
+    let details = usage_filtered
         .iter()
         .skip(start)
         .take(page_size)
@@ -4954,7 +6035,7 @@ fn build_route_usage_stats(
             (model.clone(), model)
         }),
         details,
-        total: filtered.len(),
+        total: usage_filtered.len(),
         page,
         page_size,
         total_pages,
@@ -5107,6 +6188,7 @@ fn estimate_cost(
         cached_input_per_million: 0.0,
         output_per_million: 0.0,
         reasoning_output_per_million: 0.0,
+        request_price: 0.0,
         currency: "USD".to_string(),
         source: "未匹配到 OpenAI GPT 官方价格，按 0 估算".to_string(),
     });
@@ -5122,7 +6204,8 @@ fn estimate_cost(
     let output_cost = usage.output_tokens as f64 / million * rule.output_per_million;
     let reasoning_cost =
         usage.reasoning_output_tokens as f64 / million * rule.reasoning_output_per_million;
-    let cost = input_cost + cached_input_cost + output_cost + reasoning_cost;
+    let request_cost = rule.request_price.max(0.0);
+    let cost = input_cost + cached_input_cost + output_cost + reasoning_cost + request_cost;
     let source = if rule.source.trim().is_empty() {
         "OpenAI API pricing, USD per 1M tokens".to_string()
     } else {
@@ -5150,6 +6233,9 @@ fn estimate_cost(
             usage.output_tokens, rule.output_per_million, output_cost
         ),
     ];
+    if request_cost > 0.0 {
+        breakdown.push(format!("固定请求: ${request_cost:.6}/次"));
+    }
     if usage.reasoning_output_tokens > 0 {
         if rule.reasoning_output_per_million > 0.0 {
             breakdown.push(format!(
@@ -5173,6 +6259,37 @@ fn estimate_cost(
         pricing_model_match: rule.model_match,
         pricing_source: source,
     }
+}
+
+fn estimate_provider_cost(
+    provider_pricing: &[PricingRule],
+    provider_key: &str,
+    provider_name: &str,
+    model: &str,
+    usage: &TokenUsage,
+) -> CostEstimate {
+    if provider_pricing.is_empty() {
+        return CostEstimate {
+            amount: 0.0,
+            currency: default_currency(),
+            breakdown: "未配置供应商价格，按 0 估算".to_string(),
+            pricing_model_match: "未配置供应商价格".to_string(),
+            pricing_source: "未配置供应商价格".to_string(),
+        };
+    }
+    let mut cost = estimate_cost(provider_pricing, provider_key, provider_name, model, usage);
+    if cost.pricing_model_match == "未匹配官方 GPT 价格" {
+        cost.pricing_model_match = "未匹配供应商价格".to_string();
+        cost.pricing_source = "未匹配供应商价格，按 0 估算".to_string();
+        cost.breakdown = cost
+            .breakdown
+            .replace("未匹配官方 GPT 价格", "未匹配供应商价格")
+            .replace(
+                "未匹配到 OpenAI GPT 官方价格，按 0 估算",
+                "未匹配供应商价格，按 0 估算",
+            );
+    }
+    cost
 }
 
 fn provider_snapshot_at<'a>(
@@ -5710,6 +6827,10 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
     let diffs = compute_diffs(&state, provider.as_ref(), &current_json, &desired);
     let redacted_diffs = diffs.iter().cloned().map(redacted_diff).collect::<Vec<_>>();
     let desired_flat = flatten(&desired);
+    let route_logs = read_route_logs().unwrap_or_default();
+    let now = Local::now();
+    let today_key = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
+    let month_key = format!("{:04}-{:02}", now.year(), now.month());
 
     let summary = desired_flat
         .iter()
@@ -5736,6 +6857,9 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                 compute_diffs(&state, Some(provider), &current_json, &provider_desired).len();
             let balance_status = provider.balance_status.as_ref();
             let connection_status = provider.connection_status.as_ref();
+            let pricing_sync_status = provider.pricing_sync_status.as_ref();
+            let (provider_today_cost, provider_month_cost, provider_currency) =
+                provider_cost_for_range(&route_logs, &provider.id, &today_key, &month_key);
             ProviderSummary {
                 id: provider.id.clone(),
                 name: provider.name.clone(),
@@ -5754,6 +6878,15 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                     .map(|latency_ms| format!("{latency_ms} ms"))
                     .unwrap_or_else(|| "-".to_string()),
                 latency_error: connection_status.and_then(|status| status.error.clone()),
+                provider_today_cost,
+                provider_month_cost,
+                provider_currency,
+                provider_pricing_count: provider.provider_pricing.len(),
+                pricing_sync_ok: pricing_sync_status.is_some_and(|status| status.ok),
+                pricing_sync_label: pricing_sync_status
+                    .map(|status| status.label.clone())
+                    .unwrap_or_else(|| "未同步".to_string()),
+                pricing_sync_error: pricing_sync_status.and_then(|status| status.error.clone()),
             }
         })
         .collect();
@@ -5786,7 +6919,11 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
 
 #[tauri::command]
 fn load_app_state(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState, String> {
-    build_app_state(load_state_file()?, &router_runtime)
+    let mut state = load_state_file()?;
+    if ensure_router_config_applied(&mut state)? {
+        save_state(&state)?;
+    }
+    build_app_state(state, &router_runtime)
 }
 
 #[tauri::command]
@@ -5844,11 +6981,17 @@ fn save_provider(
     if let Some(connection_test_model) = payload.connection_test_model {
         provider.connection_test_model = connection_test_model.trim().to_string();
     }
+    if let Some(allowed_models) = payload.allowed_models {
+        provider.allowed_models = normalize_model_names(allowed_models);
+    }
     if let Some(wire_api) = payload.wire_api {
         provider.wire_api = wire_api;
     }
     if let Some(model_mappings) = payload.model_mappings {
         provider.model_mappings = normalize_model_mappings(model_mappings);
+    }
+    if let Some(provider_pricing) = payload.provider_pricing {
+        provider.provider_pricing = normalize_provider_pricing(provider_pricing);
     }
     if payload.base_url.is_some() || payload.api_key.is_some() {
         apply_provider_connection_draft(
@@ -5870,6 +7013,7 @@ fn save_provider(
                 .flatten()
         });
     }
+    ensure_router_config_applied(&mut state)?;
     save_state(&state)?;
     build_app_state(state, &router_runtime)
 }
@@ -5939,11 +7083,17 @@ fn preview_provider(
     }
 
     provider.config = toml_text_to_json(&payload.config_toml)?;
+    if let Some(allowed_models) = payload.allowed_models {
+        provider.allowed_models = normalize_model_names(allowed_models);
+    }
     if let Some(wire_api) = payload.wire_api {
         provider.wire_api = wire_api;
     }
     if let Some(model_mappings) = payload.model_mappings {
         provider.model_mappings = normalize_model_mappings(model_mappings);
+    }
+    if let Some(provider_pricing) = payload.provider_pricing {
+        provider.provider_pricing = normalize_provider_pricing(provider_pricing);
     }
     if let Some(balance_query) = payload.balance_query {
         provider.balance_query = merge_balance_config_draft(provider, balance_query);
@@ -5992,7 +7142,10 @@ fn add_provider(
         enabled: true,
         wire_api: ProviderWireApi::Responses,
         connection_test_model: String::new(),
+        allowed_models: Vec::new(),
         model_mappings: Vec::new(),
+        provider_pricing: Vec::new(),
+        pricing_sync_status: None,
         balance_query: BalanceQueryConfig::default(),
         balance_status: None,
         connection_status: None,
@@ -6049,6 +7202,7 @@ fn save_router_config(
             local_token.to_string()
         },
     };
+    ensure_router_config_applied(&mut state)?;
     save_state(&state)?;
     ensure_router(&router_runtime, &state.router)?;
     build_app_state(state, &router_runtime)
@@ -6173,6 +7327,82 @@ async fn load_provider_models(
 }
 
 #[tauri::command]
+async fn sync_provider_pricing(
+    payload: SyncProviderPricingPayload,
+    router_runtime: tauri::State<'_, RouterRuntime>,
+) -> Result<ProviderPricingSyncResponse, String> {
+    let mut state = load_state_file()?;
+    let provider = state
+        .providers
+        .iter()
+        .find(|provider| provider.id == payload.provider_id)
+        .cloned()
+        .ok_or_else(|| "供应商不存在".to_string())?;
+    let mut test_provider = provider.clone();
+    apply_provider_connection_draft(
+        &mut test_provider,
+        payload.base_url.as_deref(),
+        payload.api_key.as_deref(),
+    )?;
+    if let Some(balance_query) = payload.balance_query {
+        test_provider.balance_query = merge_balance_config_draft(&test_provider, balance_query);
+    }
+
+    let base_url = custom_provider_base_url(&test_provider)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Base URL 为空".to_string())?;
+    let endpoint = newapi_endpoint_from_base_url(&base_url);
+    let auth = newapi_pricing_auth_for_endpoint(&state, &test_provider, &endpoint);
+    let checked_at = now_epoch_seconds().ok();
+    let sync_result = fetch_newapi_provider_pricing(&test_provider, auth).await;
+    let (pricing, ok, message) = {
+        let provider = state
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == payload.provider_id)
+            .ok_or_else(|| "供应商不存在".to_string())?;
+        match sync_result {
+            Ok(sync) => {
+                let label = pricing_sync_label(&sync.group, sync.group_ratio, sync.pricing_count);
+                provider.provider_pricing = sync.pricing.clone();
+                provider.pricing_sync_status = Some(PricingSyncStatus {
+                    ok: true,
+                    label: label.clone(),
+                    checked_at,
+                    error: None,
+                    group: sync.group,
+                    group_ratio: sync.group_ratio,
+                    pricing_count: sync.pricing_count,
+                });
+                (sync.pricing, true, label)
+            }
+            Err(err) => {
+                let pricing = provider.provider_pricing.clone();
+                provider.pricing_sync_status = Some(PricingSyncStatus {
+                    ok: false,
+                    label: "不可用".to_string(),
+                    checked_at,
+                    error: Some(err.clone()),
+                    group: String::new(),
+                    group_ratio: 0.0,
+                    pricing_count: pricing.len(),
+                });
+                (pricing, false, err)
+            }
+        }
+    };
+
+    save_state(&state)?;
+    let app_state = build_app_state(state, &router_runtime)?;
+    Ok(ProviderPricingSyncResponse {
+        state: app_state,
+        pricing,
+        ok,
+        message,
+    })
+}
+
+#[tauri::command]
 async fn query_provider_balance(
     payload: QueryBalancePayload,
     router_runtime: tauri::State<'_, RouterRuntime>,
@@ -6278,7 +7508,16 @@ pub fn run() {
         .manage(UsageCacheState::default())
         .manage(RouterRuntime::default())
         .setup(|app| {
-            let state = load_state_file()?;
+            let mut state = load_state_file()?;
+            match ensure_router_config_applied(&mut state) {
+                Ok(true) => {
+                    if let Err(err) = save_state(&state) {
+                        eprintln!("{err}");
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => eprintln!("Codex 接管配置检查失败: {err}"),
+            }
             let router_runtime = app.state::<RouterRuntime>();
             if let Err(err) = ensure_router(&router_runtime, &state.router) {
                 eprintln!("本地路由启动失败: {err}");
@@ -6300,6 +7539,7 @@ pub fn run() {
             load_route_logs,
             load_route_usage_stats,
             load_provider_models,
+            sync_provider_pricing,
             query_provider_balance,
             test_provider_connection,
             test_provider_connection_state
@@ -6419,13 +7659,22 @@ mod tests {
     }
 
     fn route_log_for_stats_test(status: &str, provider_id: &str, cost: f64) -> RouteRequestLog {
+        route_log_with_path_for_stats_test(status, provider_id, "/v1/responses", cost)
+    }
+
+    fn route_log_with_path_for_stats_test(
+        status: &str,
+        provider_id: &str,
+        path: &str,
+        cost: f64,
+    ) -> RouteRequestLog {
         RouteRequestLog {
             id: format!("test-{status}-{provider_id}"),
             started_at_ms: 1_782_470_400_000,
             day: "2026-06-27".to_string(),
             hour: "10:00".to_string(),
             method: "POST".to_string(),
-            path: "/v1/responses".to_string(),
+            path: path.to_string(),
             model: "test-model".to_string(),
             upstream_model: None,
             provider_id: provider_id.to_string(),
@@ -6456,6 +7705,11 @@ mod tests {
             cost_breakdown: String::new(),
             pricing_model_match: "test-model".to_string(),
             pricing_source: "test".to_string(),
+            provider_estimated_cost: cost * 2.0,
+            provider_currency: "USD".to_string(),
+            provider_cost_breakdown: String::new(),
+            provider_pricing_model_match: "test-model".to_string(),
+            provider_pricing_source: "provider-test".to_string(),
             first_byte_ms: Some(100),
             total_ms: 200,
         }
@@ -6492,6 +7746,52 @@ mod tests {
     }
 
     #[test]
+    fn route_usage_ignores_successful_non_generation_requests() {
+        let stats = build_route_usage_stats(
+            vec![
+                route_log_for_stats_test("success", "provider-a", 0.000123),
+                route_log_with_path_for_stats_test("success", "provider-a", "/v1/models", 0.0),
+            ],
+            RouteLogFilter {
+                start_day: Some("2026-06-27".to_string()),
+                end_day: Some("2026-06-27".to_string()),
+                page_size: Some(50),
+                ..Default::default()
+            },
+        )
+        .expect("route usage stats should build");
+
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.details.len(), 1);
+        assert_eq!(stats.success_count, 2);
+        assert_eq!(stats.summary.request_count, 1);
+        assert_eq!(stats.summary.total_tokens, 10);
+        assert_eq!(stats.buckets[0].request_count, 1);
+        assert_eq!(stats.providers[0].request_count, 1);
+        assert_eq!(stats.models[0].request_count, 1);
+    }
+
+    #[test]
+    fn route_logs_ignore_non_generation_requests() {
+        let response = build_route_logs_response(
+            vec![
+                route_log_for_stats_test("success", "provider-a", 0.000123),
+                route_log_with_path_for_stats_test("success", "provider-b", "/v1/models", 0.0),
+            ],
+            RouteLogFilter {
+                page_size: Some(50),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.logs.len(), 1);
+        assert_eq!(response.logs[0].path, "/v1/responses");
+        assert_eq!(response.available_providers.len(), 1);
+        assert_eq!(response.available_providers[0].id, "provider-a");
+    }
+
+    #[test]
     fn empty_balance_token_draft_preserves_saved_token() {
         let provider = ProviderConfig {
             id: "provider-a".to_string(),
@@ -6508,7 +7808,10 @@ mod tests {
             }),
             wire_api: ProviderWireApi::Responses,
             connection_test_model: String::new(),
+            allowed_models: Vec::new(),
             model_mappings: Vec::new(),
+            provider_pricing: Vec::new(),
+            pricing_sync_status: None,
             balance_query: BalanceQueryConfig {
                 enabled: true,
                 query_type: BalanceQueryType::NewApi,
@@ -6539,6 +7842,7 @@ mod tests {
             config: json!({}),
             wire_api: ProviderWireApi::Responses,
             connection_test_model: String::new(),
+            allowed_models: vec!["gpt-5.5".to_string(), "gpt-5.4".to_string()],
             model_mappings: vec![
                 ModelMapping {
                     source: "gpt-5.5".to_string(),
@@ -6549,6 +7853,8 @@ mod tests {
                     target: "deepseek-flash".to_string(),
                 },
             ],
+            provider_pricing: Vec::new(),
+            pricing_sync_status: None,
             balance_query: BalanceQueryConfig::default(),
             balance_status: None,
             connection_status: None,
@@ -6564,6 +7870,8 @@ mod tests {
             Some("deepseek-v4-pro")
         );
         assert_eq!(model_from_request_body(body), "gpt-5.5");
+        assert!(provider_accepts_model(&provider, "gpt-5.5"));
+        assert!(!provider_accepts_model(&provider, "gpt-5.3"));
     }
 
     #[test]
@@ -6590,6 +7898,284 @@ mod tests {
                 target: "deepseek-v4-pro".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn normalizes_allowed_model_drafts() {
+        let models = normalize_model_names(vec![
+            " gpt-5.5 ".to_string(),
+            "GPT-5.5".to_string(),
+            "gpt-5.4".to_string(),
+            String::new(),
+        ]);
+
+        assert_eq!(models, vec!["gpt-5.5", "gpt-5.4"]);
+    }
+
+    #[test]
+    fn estimates_provider_cost_from_manual_price() {
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            cached_input_tokens: 200,
+            output_tokens: 500,
+            reasoning_output_tokens: 0,
+            total_tokens: 1_500,
+        };
+        let pricing = normalize_provider_pricing(vec![PricingRule {
+            id: String::new(),
+            provider_match: "ignored".to_string(),
+            model_match: " glm-5.2 ".to_string(),
+            input_per_million: 2.0,
+            cached_input_per_million: 0.5,
+            output_per_million: 8.0,
+            reasoning_output_per_million: 0.0,
+            request_price: 0.0,
+            currency: "usd".to_string(),
+            source: String::new(),
+        }]);
+
+        let cost = estimate_provider_cost(&pricing, "provider-b", "Provider B", "glm-5.2", &usage);
+
+        assert_eq!(pricing[0].provider_match, "*");
+        assert_eq!(pricing[0].currency, "USD");
+        assert_eq!(cost.pricing_model_match, "glm-5.2");
+        assert!((cost.amount - 0.0057).abs() < 0.0000001);
+    }
+
+    #[test]
+    fn parses_newapi_pricing_ratio_records() {
+        let pricing = parse_newapi_pricing_value(
+            &json!({
+                "data": [{
+                    "model_name": "glm-5.2",
+                    "model_ratio": 1.25,
+                    "completion_ratio": 4,
+                    "cache_ratio": 0.25,
+                    "quota_type": 0
+                }]
+            }),
+            "New API /api/pricing",
+            DEFAULT_NEW_API_QUOTA_PER_USD,
+        );
+
+        assert_eq!(pricing.len(), 1);
+        assert_eq!(pricing[0].model_match, "glm-5.2");
+        assert!((pricing[0].input_per_million - 2.5).abs() < 0.0000001);
+        assert!((pricing[0].cached_input_per_million - 0.625).abs() < 0.0000001);
+        assert!((pricing[0].output_per_million - 10.0).abs() < 0.0000001);
+        assert!(pricing[0].source.contains("/api/pricing"));
+    }
+
+    #[test]
+    fn parses_newapi_pricing_fixed_request_records() {
+        let pricing = parse_newapi_pricing_value(
+            &json!({
+                "success": true,
+                "data": [{
+                    "model_name": "glm-image",
+                    "quota_type": 1,
+                    "model_price": 0.02,
+                    "model_ratio": 0,
+                    "completion_ratio": 0
+                }]
+            }),
+            "New API /api/pricing",
+            DEFAULT_NEW_API_QUOTA_PER_USD,
+        );
+
+        assert_eq!(pricing.len(), 1);
+        assert_eq!(pricing[0].model_match, "glm-image");
+        assert_eq!(pricing[0].input_per_million, 0.0);
+        assert_eq!(pricing[0].output_per_million, 0.0);
+        assert!((pricing[0].request_price - 0.02).abs() < 0.0000001);
+
+        let cost = estimate_provider_cost(
+            &pricing,
+            "provider-b",
+            "Provider B",
+            "glm-image",
+            &TokenUsage::default(),
+        );
+        assert!((cost.amount - 0.02).abs() < 0.0000001);
+        assert!(cost.breakdown.contains("固定请求"));
+    }
+
+    #[test]
+    fn masked_key_matches_newapi_token_keys() {
+        assert!(masked_key_matches(
+            "JCoW****b1v4",
+            "sk-JCoWabcdefghijklmnob1v4"
+        ));
+        assert!(masked_key_matches("LiVt1234YDmL", "LiVt1234YDmL"));
+        assert!(!masked_key_matches(
+            "JCoW****b1v4",
+            "sk-JCoWabcdefghijklmnozzzz"
+        ));
+    }
+
+    #[test]
+    fn token_group_from_list_matches_masked_provider_key() {
+        let group = token_group_from_list(
+            &json!({
+                "data": {
+                    "items": [
+                        { "key": "LiVt****YDmL", "group": "gpt-pro" },
+                        { "key": "JCoW****b1v4", "group": "国模特价" }
+                    ]
+                }
+            }),
+            "sk-JCoWabcdefghijklmnob1v4",
+        );
+
+        assert_eq!(group.as_deref(), Some("国模特价"));
+    }
+
+    #[test]
+    fn parses_newapi_pricing_with_key_group_multiplier() {
+        let pricing = parse_newapi_pricing_with_group(
+            &json!({
+                "group_ratio": {
+                    "gpt-pro": 0.15,
+                    "国模特价": 0.1,
+                    "官方中转": 1
+                },
+                "data": [{
+                    "model_name": "glm-5.2",
+                    "quota_type": 0,
+                    "model_ratio": 4,
+                    "completion_ratio": 3.5,
+                    "cache_ratio": 0.25,
+                    "enable_groups": ["国模特价"]
+                }]
+            }),
+            "New API /api/pricing",
+            DEFAULT_NEW_API_QUOTA_PER_USD,
+            "国模特价",
+        );
+
+        assert_eq!(pricing.len(), 1);
+        assert_eq!(pricing[0].model_match, "glm-5.2");
+        assert!((pricing[0].input_per_million - 0.8).abs() < 0.0000001);
+        assert!((pricing[0].cached_input_per_million - 0.2).abs() < 0.0000001);
+        assert!((pricing[0].output_per_million - 2.8).abs() < 0.0000001);
+        assert!(pricing[0].source.contains("group 国模特价 × 0.1000"));
+    }
+
+    #[test]
+    fn parses_newapi_ratio_config_maps() {
+        let pricing = parse_newapi_pricing_value(
+            &json!({
+                "data": {
+                    "model_ratio": {
+                        "deepseek-chat": 0.25,
+                        "deepseek-reasoner": "0.5"
+                    },
+                    "completion_ratio": {
+                        "deepseek-chat": 4,
+                        "deepseek-reasoner": 8
+                    },
+                    "cache_ratio": {
+                        "deepseek-chat": 0.25,
+                        "deepseek-reasoner": "0.5"
+                    }
+                }
+            }),
+            "New API /api/ratio_config",
+            DEFAULT_NEW_API_QUOTA_PER_USD,
+        );
+
+        assert_eq!(pricing.len(), 2);
+        assert_eq!(pricing[0].model_match, "deepseek-chat");
+        assert!((pricing[0].input_per_million - 0.5).abs() < 0.0000001);
+        assert!((pricing[0].cached_input_per_million - 0.125).abs() < 0.0000001);
+        assert!((pricing[0].output_per_million - 2.0).abs() < 0.0000001);
+        assert_eq!(pricing[1].model_match, "deepseek-reasoner");
+        assert!((pricing[1].input_per_million - 1.0).abs() < 0.0000001);
+        assert!((pricing[1].cached_input_per_million - 0.5).abs() < 0.0000001);
+        assert!((pricing[1].output_per_million - 8.0).abs() < 0.0000001);
+    }
+
+    #[test]
+    fn configured_route_models_merge_allowed_models_in_order() {
+        let candidates = vec![
+            UpstreamCandidate {
+                provider: ProviderConfig {
+                    id: "provider-a".to_string(),
+                    name: "Provider A".to_string(),
+                    enabled: true,
+                    config: json!({}),
+                    wire_api: ProviderWireApi::Responses,
+                    connection_test_model: String::new(),
+                    allowed_models: vec!["gpt-5.5".to_string(), "gpt-5.4".to_string()],
+                    model_mappings: Vec::new(),
+                    provider_pricing: Vec::new(),
+                    pricing_sync_status: None,
+                    balance_query: BalanceQueryConfig::default(),
+                    balance_status: None,
+                    connection_status: None,
+                },
+                base_url: "https://example-a.com/v1".to_string(),
+                token: "token-a".to_string(),
+                route_order: 1,
+            },
+            UpstreamCandidate {
+                provider: ProviderConfig {
+                    id: "provider-b".to_string(),
+                    name: "Provider B".to_string(),
+                    enabled: true,
+                    config: json!({}),
+                    wire_api: ProviderWireApi::ChatCompletions,
+                    connection_test_model: String::new(),
+                    allowed_models: vec!["GPT-5.4".to_string(), "gpt-5.3".to_string()],
+                    model_mappings: Vec::new(),
+                    provider_pricing: Vec::new(),
+                    pricing_sync_status: None,
+                    balance_query: BalanceQueryConfig::default(),
+                    balance_status: None,
+                    connection_status: None,
+                },
+                base_url: "https://example-b.com/v1".to_string(),
+                token: "token-b".to_string(),
+                route_order: 2,
+            },
+        ];
+
+        assert_eq!(
+            configured_route_models(&candidates),
+            vec!["gpt-5.5", "gpt-5.4", "gpt-5.3"]
+        );
+    }
+
+    #[test]
+    fn maps_allowed_responses_model_before_chat_completions_forwarding() {
+        let provider = ProviderConfig {
+            id: "provider-b".to_string(),
+            name: "Provider B".to_string(),
+            enabled: true,
+            config: json!({}),
+            wire_api: ProviderWireApi::ChatCompletions,
+            connection_test_model: String::new(),
+            allowed_models: vec!["gpt-5.2".to_string()],
+            model_mappings: vec![ModelMapping {
+                source: "gpt-5.2".to_string(),
+                target: "glm-5.2".to_string(),
+            }],
+            provider_pricing: Vec::new(),
+            pricing_sync_status: None,
+            balance_query: BalanceQueryConfig::default(),
+            balance_status: None,
+            connection_status: None,
+        };
+        let body = br#"{"model":"gpt-5.2","input":"hello"}"#;
+
+        let prepared = prepare_upstream_request(&provider, "responses", "", body, "gpt-5.2")
+            .expect("request prepares");
+        let value = serde_json::from_slice::<Value>(&prepared.body).expect("prepared body is json");
+
+        assert!(provider_accepts_model(&provider, "gpt-5.2"));
+        assert_eq!(prepared.path, "chat/completions");
+        assert_eq!(prepared.upstream_model.as_deref(), Some("glm-5.2"));
+        assert_eq!(value.get("model").and_then(Value::as_str), Some("glm-5.2"));
     }
 
     #[test]

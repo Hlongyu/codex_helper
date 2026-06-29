@@ -50,9 +50,39 @@ type ProviderModelsResponse = {
   models: string[];
 };
 
+type ProviderPricingSyncResponse = {
+  state: AppState;
+  pricing: PricingRule[];
+  ok: boolean;
+  message: string;
+};
+
 type ModelMapping = {
   source: string;
   target: string;
+};
+
+type PricingRule = {
+  id: string;
+  provider_match: string;
+  model_match: string;
+  input_per_million: number;
+  cached_input_per_million: number;
+  output_per_million: number;
+  reasoning_output_per_million: number;
+  request_price: number;
+  currency: string;
+  source: string;
+};
+
+type PricingSyncStatus = {
+  ok: boolean;
+  label: string;
+  checked_at?: number | null;
+  error?: string | null;
+  group: string;
+  group_ratio: number;
+  pricing_count: number;
 };
 
 type RouterConfig = {
@@ -75,7 +105,10 @@ type ProviderConfig = {
   config: JsonValue;
   wire_api: ProviderWireApi;
   connection_test_model: string;
+  allowed_models: string[];
   model_mappings: ModelMapping[];
+  provider_pricing: PricingRule[];
+  pricing_sync_status?: PricingSyncStatus | null;
   balance_query: BalanceQueryConfig;
   balance_status?: BalanceStatus | null;
   connection_status?: unknown;
@@ -92,6 +125,13 @@ type ProviderSummary = {
   latency_ms?: number | null;
   latency_label: string;
   latency_error?: string | null;
+  provider_today_cost: number;
+  provider_month_cost: number;
+  provider_currency: string;
+  provider_pricing_count: number;
+  pricing_sync_ok: boolean;
+  pricing_sync_label: string;
+  pricing_sync_error?: string | null;
 };
 
 type UsageSummary = {
@@ -135,6 +175,11 @@ type RouteRequestLog = {
   cost_breakdown: string;
   pricing_model_match: string;
   pricing_source: string;
+  provider_estimated_cost: number;
+  provider_currency: string;
+  provider_cost_breakdown: string;
+  provider_pricing_model_match: string;
+  provider_pricing_source: string;
   first_byte_ms?: number | null;
   total_ms: number;
 };
@@ -284,6 +329,59 @@ function normalizeBalanceQuery(config?: BalanceQueryConfig | null, endpoint = ""
     next.auth_mode = "separate_token";
   }
   return next;
+}
+
+function normalizeModelNames(models: string[]) {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const value of models) {
+    const model = value.trim();
+    if (!model) continue;
+    const key = model.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(model);
+  }
+  return normalized;
+}
+
+function defaultPricingRule(model = ""): PricingRule {
+  return {
+    id: `provider-price-${Date.now()}`,
+    provider_match: "*",
+    model_match: model,
+    input_per_million: 0,
+    cached_input_per_million: 0,
+    output_per_million: 0,
+    reasoning_output_per_million: 0,
+    request_price: 0,
+    currency: "USD",
+    source: "供应商手动价格",
+  };
+}
+
+function normalizeProviderPricing(pricing: PricingRule[]) {
+  const seen = new Set<string>();
+  return pricing.flatMap((rule, index) => {
+    const model = rule.model_match.trim();
+    if (!model) return [];
+    const key = model.toLowerCase();
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [{
+      ...rule,
+      id: rule.id.trim() || `provider-price-${index}`,
+      provider_match: "*",
+      model_match: model,
+      input_per_million: Math.max(0, Number(rule.input_per_million) || 0),
+      cached_input_per_million: Math.max(0, Number(rule.cached_input_per_million) || 0),
+      output_per_million: Math.max(0, Number(rule.output_per_million) || 0),
+      reasoning_output_per_million: Math.max(0, Number(rule.reasoning_output_per_million) || 0),
+      request_price: Math.max(0, Number(rule.request_price) || 0),
+      currency: (rule.currency || "USD").trim().toUpperCase(),
+      source: rule.source.trim() || "供应商手动价格",
+    }];
+  });
 }
 
 function formatMoney(value: number, currency = "USD") {
@@ -742,7 +840,9 @@ function App() {
   const [connectionTestResult, setConnectionTestResult] = useState<ProviderConnectionTestResult | null>(null);
   const [providerTestModel, setProviderTestModel] = useState("");
   const [providerModels, setProviderModels] = useState<string[]>([]);
+  const [allowedModels, setAllowedModels] = useState<string[]>([]);
   const [modelMappings, setModelMappings] = useState<ModelMapping[]>([]);
+  const [providerPricing, setProviderPricing] = useState<PricingRule[]>([]);
   const [balanceQuery, setBalanceQuery] = useState<BalanceQueryConfig>(() =>
     defaultBalanceQuery(),
   );
@@ -842,6 +942,10 @@ function App() {
       null
     );
   }, [appState]);
+  const editingProviderSummary = useMemo(() => {
+    if (!appState || !editingId) return null;
+    return appState.providers.find((provider) => provider.id === editingId) ?? null;
+  }, [appState, editingId]);
 
   const requestCount = routeUsageStats?.success_count ?? routeUsageStats?.summary.request_count ?? 0;
   const officialCost = routeUsageStats?.summary.estimated_cost ?? 0;
@@ -871,8 +975,10 @@ function App() {
     setProviderEnabled(summary?.enabled ?? targetFull.enabled ?? true);
     setProviderWireApi(targetFull.wire_api ?? "responses");
     setProviderTestModel(targetFull.connection_test_model ?? "");
-    setProviderModels(targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
+    setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
+    setAllowedModels(targetFull.allowed_models ?? []);
     setModelMappings(targetFull.model_mappings ?? []);
+    setProviderPricing(targetFull.provider_pricing ?? []);
     setBalanceQuery(
       normalizeBalanceQuery(
         targetFull.balance_query,
@@ -931,7 +1037,9 @@ function App() {
         balance_query: nextBalance,
         balance_status: balanceTestStatus,
         connection_test_model: providerTestModel,
+        allowed_models: allowedModels,
         model_mappings: modelMappings,
+        provider_pricing: normalizeProviderPricing(providerPricing),
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
@@ -1005,6 +1113,10 @@ function App() {
         provider_id: editingId,
         base_url: providerBaseUrl,
         api_key: null,
+        balance_query: {
+          ...balanceQuery,
+          endpoint: balanceQuery.endpoint || endpointFromBaseUrl(providerBaseUrl),
+        },
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
@@ -1016,6 +1128,30 @@ function App() {
       if (!providerTestModel && result.models[0]) {
         setProviderTestModel(result.models[0]);
       }
+    });
+  }
+
+  async function syncProviderPricing() {
+    if (!editingId) return;
+    await run(async () => {
+      const nextBalance = {
+        ...balanceQuery,
+        endpoint: balanceQuery.endpoint || endpointFromBaseUrl(providerBaseUrl),
+      };
+      const payload: Record<string, unknown> = {
+        provider_id: editingId,
+        base_url: providerBaseUrl,
+        api_key: null,
+        balance_query: nextBalance,
+      };
+      if (providerApiKeyDirty) {
+        payload.api_key = providerApiKey;
+      }
+      const result = await callCommand<ProviderPricingSyncResponse>("sync_provider_pricing", {
+        payload,
+      });
+      setAppState(result.state);
+      setProviderPricing(result.pricing);
     });
   }
 
@@ -1311,11 +1447,17 @@ function App() {
           balanceTokenVisible={balanceTokenVisible}
           busy={busy}
           connectionTestResult={connectionTestResult}
+          allowedModels={allowedModels}
           modelMappings={modelMappings}
+          pricingSyncError={editingProviderSummary?.pricing_sync_error ?? null}
+          pricingSyncLabel={editingProviderSummary?.pricing_sync_label ?? "未同步"}
+          pricingSyncOk={editingProviderSummary?.pricing_sync_ok ?? false}
+          providerPricing={providerPricing}
           onBalanceTokenVisible={setBalanceTokenVisible}
           onClose={() => setEditorOpen(false)}
           onLoadProviderModels={loadProviderModels}
           onSave={saveProvider}
+          onSyncProviderPricing={syncProviderPricing}
           onTab={setEditorTab}
           onTestBalance={testBalance}
           onTestConnection={testConnection}
@@ -1344,7 +1486,9 @@ function App() {
             setProviderTestModel("");
           }}
           setProviderEnabled={setProviderEnabled}
+          setAllowedModels={setAllowedModels}
           setModelMappings={setModelMappings}
+          setProviderPricing={setProviderPricing}
           setProviderName={setProviderName}
           setProviderTestModel={setProviderTestModel}
           setProviderWireApi={setProviderWireApi}
@@ -2250,6 +2394,7 @@ function ProvidersScreen({
           <span>状态</span>
           <span>供应商</span>
           <span>余额</span>
+          <span>消耗</span>
           <span>延迟</span>
           <span>启用</span>
           <span>操作</span>
@@ -2293,6 +2438,20 @@ function ProvidersScreen({
                   {formatBalanceForCard(provider.balance_label)}
                 </strong>
               </div>
+              <div className="provider-cost-cell">
+                <strong>{formatMoney(provider.provider_today_cost, provider.provider_currency)}</strong>
+                <small>
+                  本月 {formatMoney(provider.provider_month_cost, provider.provider_currency)}
+                  {provider.provider_pricing_count ? ` · ${provider.provider_pricing_count} 个价格` : " · 未计价"}
+                </small>
+                <span
+                  className={`price-sync-line ${provider.pricing_sync_ok ? "ok" : "missing"}`}
+                  title={provider.pricing_sync_error ?? undefined}
+                >
+                  <i />
+                  {provider.pricing_sync_label || "未同步"}
+                </span>
+              </div>
               <b
                 className={providerLatencyTone(provider)}
                 title={provider.latency_error ?? undefined}
@@ -2321,6 +2480,7 @@ function ProvidersScreen({
 }
 
 function ProviderEditor(props: {
+  allowedModels: string[];
   balanceQuery: BalanceQueryConfig;
   balanceTestStatus: BalanceStatus | null;
   balanceTokenVisible: boolean;
@@ -2331,23 +2491,30 @@ function ProviderEditor(props: {
   onClose: () => void;
   onLoadProviderModels: () => void;
   onSave: () => void;
+  onSyncProviderPricing: () => void;
   onTab: (tab: EditorTab) => void;
   onTestBalance: () => void;
   onTestConnection: () => void;
   onUpdateBalance: (patch: Partial<BalanceQueryConfig>) => void;
+  pricingSyncError: string | null;
+  pricingSyncLabel: string;
+  pricingSyncOk: boolean;
   providerApiKey: string;
   providerBaseUrl: string;
   providerEnabled: boolean;
   providerModels: string[];
   providerName: string;
+  providerPricing: PricingRule[];
   providerTestModel: string;
   providerWireApi: ProviderWireApi;
   secretVisible: boolean;
+  setAllowedModels: (models: string[]) => void;
   setProviderApiKey: (value: string) => void;
   setProviderApiKeyDirty: (dirty: boolean) => void;
   setProviderBaseUrl: (value: string) => void;
   setProviderEnabled: (value: boolean) => void;
   setModelMappings: (mappings: ModelMapping[]) => void;
+  setProviderPricing: (pricing: PricingRule[]) => void;
   setProviderName: (value: string) => void;
   setProviderTestModel: (value: string) => void;
   setProviderWireApi: (value: ProviderWireApi) => void;
@@ -2355,6 +2522,7 @@ function ProviderEditor(props: {
   tab: EditorTab;
 }) {
   const {
+    allowedModels,
     balanceQuery,
     balanceTestStatus,
     balanceTokenVisible,
@@ -2365,33 +2533,67 @@ function ProviderEditor(props: {
     onClose,
     onLoadProviderModels,
     onSave,
+    onSyncProviderPricing,
     onTab,
     onTestBalance,
     onTestConnection,
     onUpdateBalance,
+    pricingSyncError,
+    pricingSyncLabel,
+    pricingSyncOk,
     providerApiKey,
     providerBaseUrl,
     providerEnabled,
     providerModels,
     providerName,
+    providerPricing,
     providerTestModel,
     providerWireApi,
     secretVisible,
+    setAllowedModels,
     setProviderApiKey,
     setProviderApiKeyDirty,
     setProviderBaseUrl,
     setProviderEnabled,
     setModelMappings,
+    setProviderPricing,
     setProviderName,
     setProviderTestModel,
     setProviderWireApi,
     setSecretVisible,
     tab,
   } = props;
+  const [customAllowedModel, setCustomAllowedModel] = useState("");
   const modelOptions = providerTestModel && !providerModels.includes(providerTestModel)
     ? [providerTestModel, ...providerModels]
     : providerModels;
+  const allowedModelOptions = normalizeModelNames([...providerModels, ...allowedModels]);
+  const allModelsAllowed = allowedModels.length === 0;
   const upstreamPath = providerWireApi === "chat_completions" ? "chat/completions" : "responses";
+  const updateAllowedModels = (models: string[]) => setAllowedModels(normalizeModelNames(models));
+  const updateProviderPricing = (pricing: PricingRule[]) => setProviderPricing(pricing);
+  const changePricingRule = (index: number, patch: Partial<PricingRule>) => {
+    const next = [...providerPricing];
+    next[index] = { ...next[index], ...patch };
+    updateProviderPricing(next);
+  };
+  const addPricingRule = () => {
+    updateProviderPricing([...providerPricing, defaultPricingRule()]);
+  };
+  const toggleAllowedModel = (model: string, checked: boolean) => {
+    const currentModels = allModelsAllowed ? allowedModelOptions : allowedModels;
+    updateAllowedModels(
+      checked
+        ? [...currentModels, model]
+        : currentModels.filter((current) => current.toLowerCase() !== model.toLowerCase()),
+    );
+  };
+  const addCustomAllowedModel = () => {
+    const model = customAllowedModel.trim();
+    if (!model) return;
+    updateAllowedModels([...(allModelsAllowed ? allowedModelOptions : allowedModels), model]);
+    setCustomAllowedModel("");
+  };
 
   return (
     <div className="drawer-backdrop">
@@ -2640,12 +2842,55 @@ function ProviderEditor(props: {
                   </select>
                 </label>
               </div>
-              <label className="field">
-                <span>允许模型</span>
-                <select defaultValue="all">
-                  <option value="all">全部模型</option>
-                </select>
-              </label>
+              <div className="model-filter-box">
+                <div className="mapping-box-head">
+                  <div>
+                    <strong>允许模型</strong>
+                    <p>{allModelsAllowed ? "当前接收所有客户端模型" : `仅接收 ${allowedModels.length} 个客户端模型`}</p>
+                  </div>
+                  <button
+                    className="ghost small"
+                    onClick={() => updateAllowedModels([])}
+                    type="button"
+                  >
+                    全部模型
+                  </button>
+                </div>
+                <div className="model-option-grid">
+                  {allowedModelOptions.length === 0 && (
+                    <p className="mapping-empty">刷新远端模型，或在下方手动添加客户端模型名。</p>
+                  )}
+                  {allowedModelOptions.map((model) => {
+                    const checked = allModelsAllowed || allowedModels.some((current) => current.toLowerCase() === model.toLowerCase());
+                    return (
+                      <label className={checked ? "model-option selected" : "model-option"} key={model}>
+                        <input
+                          checked={checked}
+                          onChange={(event) => toggleAllowedModel(model, event.currentTarget.checked)}
+                          type="checkbox"
+                        />
+                        <span>{model}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <div className="custom-model-row">
+                  <input
+                    placeholder="手动输入模型，例如 gpt-5.3-codex"
+                    value={customAllowedModel}
+                    onChange={(event) => setCustomAllowedModel(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        addCustomAllowedModel();
+                      }
+                    }}
+                  />
+                  <button className="ghost small" onClick={addCustomAllowedModel} type="button">
+                    添加
+                  </button>
+                </div>
+              </div>
               <label className="field">
                 <span>接口协议</span>
                 <select
@@ -2724,6 +2969,83 @@ function ProviderEditor(props: {
                         className="icon-button"
                         onClick={() => setModelMappings(modelMappings.filter((_, rowIndex) => rowIndex !== index))}
                         title="删除映射"
+                        type="button"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="pricing-box">
+                <div className="mapping-box-head">
+                  <div>
+                    <strong>供应商计价</strong>
+                    <p>使用上游模型名计算独立消耗，不影响官方估算</p>
+                  </div>
+                  <div className="pricing-actions">
+                    <span
+                      className={`price-sync-line drawer-sync ${pricingSyncOk ? "ok" : "missing"}`}
+                      title={pricingSyncError ?? undefined}
+                    >
+                      <i />
+                      {pricingSyncLabel}
+                    </span>
+                    <button className="ghost small" disabled={busy} onClick={onSyncProviderPricing} type="button">
+                      {busy ? "同步中" : "同步 New API"}
+                    </button>
+                    <button className="ghost small" onClick={addPricingRule} type="button">
+                      添加价格
+                    </button>
+                  </div>
+                </div>
+                <div className="pricing-grid">
+                  <span>上游模型</span>
+                  <span>输入 / 1M</span>
+                  <span>缓存 / 1M</span>
+                  <span>输出 / 1M</span>
+                  <span>请求 / 次</span>
+                  <span>币种</span>
+                  <span />
+                  {providerPricing.length === 0 && (
+                    <p className="mapping-empty">未配置价格时，供应商消耗按 0 估算。</p>
+                  )}
+                  {providerPricing.map((rule, index) => (
+                    <div className="pricing-row" key={rule.id || index}>
+                      <input
+                        placeholder="glm-5.2"
+                        value={rule.model_match}
+                        onChange={(event) => changePricingRule(index, { model_match: event.currentTarget.value })}
+                      />
+                      <input
+                        inputMode="decimal"
+                        value={String(rule.input_per_million)}
+                        onChange={(event) => changePricingRule(index, { input_per_million: Number(event.currentTarget.value) || 0 })}
+                      />
+                      <input
+                        inputMode="decimal"
+                        value={String(rule.cached_input_per_million)}
+                        onChange={(event) => changePricingRule(index, { cached_input_per_million: Number(event.currentTarget.value) || 0 })}
+                      />
+                      <input
+                        inputMode="decimal"
+                        value={String(rule.output_per_million)}
+                        onChange={(event) => changePricingRule(index, { output_per_million: Number(event.currentTarget.value) || 0 })}
+                      />
+                      <input
+                        inputMode="decimal"
+                        value={String(rule.request_price ?? 0)}
+                        onChange={(event) => changePricingRule(index, { request_price: Number(event.currentTarget.value) || 0 })}
+                      />
+                      <input
+                        value={rule.currency}
+                        onChange={(event) => changePricingRule(index, { currency: event.currentTarget.value.toUpperCase() })}
+                      />
+                      <button
+                        aria-label="删除价格"
+                        className="icon-button"
+                        onClick={() => updateProviderPricing(providerPricing.filter((_, rowIndex) => rowIndex !== index))}
+                        title="删除价格"
                         type="button"
                       >
                         ×

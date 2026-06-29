@@ -793,7 +793,7 @@ button:disabled {
 .provider-table > header,
 .provider-line {
   display: grid;
-  grid-template-columns: 36px 84px minmax(240px, 1.6fr) 130px 92px 72px 124px;
+  grid-template-columns: 36px 84px minmax(220px, 1.5fr) 118px 150px 82px 72px 124px;
   align-items: center;
   gap: 14px;
 }
@@ -862,15 +862,65 @@ button:disabled {
 }
 
 .provider-name-cell small,
-.balance-cell small {
+.balance-cell small,
+.provider-cost-cell small {
   color: #758397;
 }
 
-.balance-cell strong {
+.balance-cell strong,
+.provider-cost-cell strong {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.provider-cost-cell small {
+  display: block;
+  overflow: hidden;
+  margin-top: 4px;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.price-sync-line {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+  color: #758397;
+  font-size: 12px;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.price-sync-line i {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #56657a;
+}
+
+.price-sync-line.ok {
+  color: #56e0aa;
+}
+
+.price-sync-line.ok i {
+  background: #56e0aa;
+}
+
+.price-sync-line.missing {
+  color: #758397;
+}
+
+.price-sync-line.drawer-sync {
+  max-width: 210px;
+  margin-top: 0;
 }
 
 .muted-text {
@@ -1243,6 +1293,22 @@ button:disabled {
   padding: 18px;
 }
 
+.model-filter-box {
+  border: 1px solid #26394f;
+  border-radius: 14px;
+  background: #151f2d;
+  margin-top: 24px;
+  padding: 18px;
+}
+
+.pricing-box {
+  border: 1px solid #26394f;
+  border-radius: 14px;
+  background: #151f2d;
+  margin-top: 24px;
+  padding: 18px;
+}
+
 .mapping-box-head {
   display: flex;
   align-items: flex-start;
@@ -1254,6 +1320,12 @@ button:disabled {
   margin: 5px 0 0;
   color: #8390a4;
   font-size: 13px;
+}
+
+.pricing-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .mapping-grid {
@@ -1274,6 +1346,94 @@ button:disabled {
 }
 
 .mapping-row input {
+  width: 100%;
+  height: 38px;
+  min-width: 0;
+  border: 1px solid #24364a;
+  border-radius: 10px;
+  background: #0e151f;
+  color: #f7f9fd;
+  outline: none;
+  padding: 0 12px;
+}
+
+.pricing-grid {
+  display: grid;
+  grid-template-columns: minmax(110px, 1.3fr) repeat(4, minmax(72px, 0.8fr)) 68px 34px;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.pricing-grid > span {
+  color: #8390a4;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.pricing-row {
+  display: contents;
+}
+
+.pricing-row input {
+  width: 100%;
+  height: 38px;
+  min-width: 0;
+  border: 1px solid #24364a;
+  border-radius: 10px;
+  background: #0e151f;
+  color: #f7f9fd;
+  outline: none;
+  padding: 0 10px;
+}
+
+.model-option-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.model-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  border: 1px solid #24364a;
+  border-radius: 10px;
+  background: #0e151f;
+  color: #c8d1df;
+  padding: 0 11px;
+}
+
+.model-option.selected {
+  border-color: #2d7773;
+  background: #10282d;
+  color: #f7f9fd;
+}
+
+.model-option input {
+  width: 16px;
+  height: 16px;
+  accent-color: #31c7b7;
+}
+
+.model-option span {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.custom-model-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.custom-model-row input {
   width: 100%;
   height: 38px;
   min-width: 0;
