@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tokio::sync::oneshot;
 use toml_edit::{Array, DocumentMut, Item, Value as TomlValue};
@@ -32,8 +34,13 @@ const DEFAULT_ROUTER_HOST: &str = "127.0.0.1";
 const DEFAULT_ROUTER_PORT: u16 = 18080;
 const DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
 const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_MODEL_CONTEXT_OVERRIDE_WINDOW: i64 = 1_000_000;
+const FALLBACK_CODEX_MODEL_CONTEXT_WINDOW: i64 = 272_000;
 static ROUTE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_NEW_API_QUOTA_PER_USD: f64 = 500_000.0;
+const MAIN_WINDOW_LABEL: &str = "main";
+const TRAY_SHOW_ID: &str = "show";
+const TRAY_QUIT_ID: &str = "quit";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderConfig {
@@ -150,6 +157,16 @@ struct ModelMapping {
     target: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ModelContextOverride {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    context_window: i64,
+    #[serde(default)]
+    auto_compact_token_limit: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ProviderWireApi {
@@ -181,6 +198,8 @@ struct RouterConfig {
     port: u16,
     #[serde(default = "default_router_token")]
     local_token: String,
+    #[serde(default)]
+    model_context_overrides: Vec<ModelContextOverride>,
 }
 
 impl Default for RouterConfig {
@@ -190,6 +209,7 @@ impl Default for RouterConfig {
             host: default_router_host(),
             port: default_router_port(),
             local_token: default_router_token(),
+            model_context_overrides: Vec::new(),
         }
     }
 }
@@ -523,6 +543,7 @@ struct SaveRouterPayload {
     host: String,
     port: u16,
     local_token: String,
+    model_context_overrides: Option<Vec<ModelContextOverride>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1021,6 +1042,73 @@ fn default_router_token() -> String {
     random_router_token()
 }
 
+fn default_model_context_override_window() -> i64 {
+    DEFAULT_MODEL_CONTEXT_OVERRIDE_WINDOW
+}
+
+fn normalized_model_context_window(value: i64) -> i64 {
+    if value > 0 {
+        value
+    } else {
+        default_model_context_override_window()
+    }
+}
+
+fn default_auto_compact_for_context(context_window: i64) -> i64 {
+    ((context_window as f64) * 0.95).round().max(1.0) as i64
+}
+
+fn normalized_model_auto_compact_token_limit(value: i64, context_window: i64) -> i64 {
+    if value > 0 && value <= context_window {
+        value
+    } else {
+        default_auto_compact_for_context(context_window)
+    }
+}
+
+fn normalize_model_context_overrides(
+    overrides: Vec<ModelContextOverride>,
+) -> Vec<ModelContextOverride> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for override_config in overrides {
+        let model = override_config.model.trim();
+        if model.is_empty() {
+            continue;
+        }
+        let key = model.to_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        let context_window = normalized_model_context_window(override_config.context_window);
+        let auto_compact_token_limit = normalized_model_auto_compact_token_limit(
+            override_config.auto_compact_token_limit,
+            context_window,
+        );
+        normalized.push(ModelContextOverride {
+            model: model.to_string(),
+            context_window,
+            auto_compact_token_limit,
+        });
+    }
+    normalized
+}
+
+fn normalize_router_model_context_overrides(router: &mut RouterConfig) {
+    router.model_context_overrides =
+        normalize_model_context_overrides(std::mem::take(&mut router.model_context_overrides));
+}
+
+fn router_model_context_override<'a>(
+    router: &'a RouterConfig,
+    model: &str,
+) -> Option<&'a ModelContextOverride> {
+    router
+        .model_context_overrides
+        .iter()
+        .find(|override_config| override_config.model.eq_ignore_ascii_case(model))
+}
+
 fn default_currency() -> String {
     "USD".to_string()
 }
@@ -1238,6 +1326,7 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
     {
         state.router.local_token = random_router_token();
     }
+    normalize_router_model_context_overrides(&mut state.router);
     let provider_exists = |provider_id: &str| {
         state
             .providers
@@ -2174,6 +2263,7 @@ fn model_id_from_value(value: &Value) -> Option<String> {
         Value::String(model) => Some(model.trim().to_string()).filter(|model| !model.is_empty()),
         Value::Object(_) => value
             .get("id")
+            .or_else(|| value.get("slug"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|model| !model.is_empty())
@@ -2923,7 +3013,18 @@ fn configured_route_models(candidates: &[UpstreamCandidate]) -> Vec<String> {
     models
 }
 
-fn models_response(models: Vec<String>) -> Response {
+fn codex_model_catalog_requested(query: Option<&str>) -> bool {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .any(|part| {
+            let key = part.split_once('=').map(|(key, _)| key).unwrap_or(part);
+            key == "client_version"
+        })
+}
+
+fn openai_models_value(models: Vec<String>) -> Value {
     let data = models
         .into_iter()
         .map(|model| {
@@ -2935,13 +3036,182 @@ fn models_response(models: Vec<String>) -> Response {
             })
         })
         .collect::<Vec<_>>();
+    json!({ "object": "list", "data": data })
+}
+
+fn load_codex_model_catalog_templates() -> Vec<Value> {
+    let Ok(path) = codex_home().map(|path| path.join("models_cache.json")) else {
+        return Vec::new();
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    value
+        .get("models")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn fallback_codex_model_catalog_entry(model: &str) -> Value {
+    json!({
+        "slug": model,
+        "display_name": model,
+        "description": "Routed by Codex Helper.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            { "effort": "low", "description": "Fast responses with lighter reasoning" },
+            { "effort": "medium", "description": "Balances speed and reasoning depth" },
+            { "effort": "high", "description": "Greater reasoning depth for complex work" },
+            { "effort": "xhigh", "description": "Extra high reasoning depth for complex work" }
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 1,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": null,
+        "upgrade": null,
+        "base_instructions": "You are Codex, a coding agent.",
+        "model_messages": {
+            "instructions_template": "You are Codex, a coding agent.\n\n{{ personality }}",
+            "instructions_variables": {
+                "personality_default": "",
+                "personality_friendly": "",
+                "personality_pragmatic": ""
+            }
+        },
+        "supports_reasoning_summaries": true,
+        "default_reasoning_summary": "none",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "truncation_policy": { "mode": "tokens", "limit": 10000 },
+        "supports_parallel_tool_calls": true,
+        "supports_image_detail_original": true,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": true,
+        "use_responses_lite": false
+    })
+}
+
+fn codex_model_catalog_entry(model: &str, templates: &[Value], router: &RouterConfig) -> Value {
+    let mut entry = templates
+        .iter()
+        .find(|entry| {
+            entry
+                .get("slug")
+                .and_then(Value::as_str)
+                .is_some_and(|slug| slug.eq_ignore_ascii_case(model))
+        })
+        .cloned()
+        .or_else(|| {
+            templates
+                .iter()
+                .find(|entry| {
+                    entry
+                        .get("slug")
+                        .and_then(Value::as_str)
+                        .is_some_and(|slug| slug == "gpt-5.4" || slug == "gpt-5.5")
+                })
+                .cloned()
+        })
+        .or_else(|| templates.first().cloned())
+        .unwrap_or_else(|| fallback_codex_model_catalog_entry(model));
+
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("slug".to_string(), Value::String(model.to_string()));
+        object.insert("display_name".to_string(), Value::String(model.to_string()));
+        if let Some(override_config) = router_model_context_override(router, model) {
+            let context_window = normalized_model_context_window(override_config.context_window);
+            let auto_compact_token_limit = normalized_model_auto_compact_token_limit(
+                override_config.auto_compact_token_limit,
+                context_window,
+            );
+            object.insert(
+                "context_window".to_string(),
+                Value::Number(context_window.into()),
+            );
+            object.insert(
+                "max_context_window".to_string(),
+                Value::Number(context_window.into()),
+            );
+            object.insert(
+                "auto_compact_token_limit".to_string(),
+                Value::Number(auto_compact_token_limit.into()),
+            );
+            let effective_context_window_percent =
+                ((auto_compact_token_limit as f64 / context_window as f64) * 100.0)
+                    .round()
+                    .clamp(1.0, 100.0) as i64;
+            object.insert(
+                "effective_context_window_percent".to_string(),
+                Value::Number(effective_context_window_percent.into()),
+            );
+        } else if !object.contains_key("context_window") {
+            object.insert(
+                "context_window".to_string(),
+                Value::Number(FALLBACK_CODEX_MODEL_CONTEXT_WINDOW.into()),
+            );
+            object.insert(
+                "max_context_window".to_string(),
+                Value::Number(FALLBACK_CODEX_MODEL_CONTEXT_WINDOW.into()),
+            );
+            object.insert(
+                "auto_compact_token_limit".to_string(),
+                Value::Number(
+                    default_auto_compact_for_context(FALLBACK_CODEX_MODEL_CONTEXT_WINDOW).into(),
+                ),
+            );
+            object.insert(
+                "effective_context_window_percent".to_string(),
+                Value::Number(95.into()),
+            );
+        }
+        object.insert("visibility".to_string(), Value::String("list".to_string()));
+        object.insert("supported_in_api".to_string(), Value::Bool(true));
+    }
+
+    entry
+}
+
+fn codex_models_catalog_value_with_templates(
+    models: Vec<String>,
+    templates: &[Value],
+    router: &RouterConfig,
+) -> Value {
+    let models = models
+        .into_iter()
+        .map(|model| codex_model_catalog_entry(&model, templates, router))
+        .collect::<Vec<_>>();
+    json!({ "models": models })
+}
+
+fn codex_models_catalog_value(models: Vec<String>, router: &RouterConfig) -> Value {
+    let templates = load_codex_model_catalog_templates();
+    codex_models_catalog_value_with_templates(models, &templates, router)
+}
+
+fn json_response(value: Value) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json; charset=utf-8")
-        .body(Body::from(
-            json!({ "object": "list", "data": data }).to_string(),
-        ))
+        .body(Body::from(value.to_string()))
         .unwrap_or_else(|_| Response::new(Body::from("{}")))
+}
+
+fn models_response(models: Vec<String>) -> Response {
+    json_response(openai_models_value(models))
+}
+
+fn codex_models_response(models: Vec<String>, router: &RouterConfig) -> Response {
+    json_response(codex_models_catalog_value(models, router))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -4862,7 +5132,11 @@ async fn proxy_request(
     if method == Method::GET && path.trim_matches('/') == "models" {
         let models = configured_route_models(&candidates);
         if !models.is_empty() {
-            return models_response(models);
+            return if codex_model_catalog_requested(uri.query()) {
+                codex_models_response(models, &router)
+            } else {
+                models_response(models)
+            };
         }
     }
 
@@ -7427,6 +7701,8 @@ fn save_router_config(
     if payload.enabled && local_token.is_empty() {
         return Err("本地路由 Token 不能为空".to_string());
     }
+    let model_context_overrides =
+        normalize_model_context_overrides(payload.model_context_overrides.unwrap_or_default());
 
     state.router = RouterConfig {
         enabled: payload.enabled,
@@ -7441,6 +7717,7 @@ fn save_router_config(
         } else {
             local_token.to_string()
         },
+        model_context_overrides,
     };
     ensure_router_config_applied(&mut state)?;
     save_state(&state)?;
@@ -7742,12 +8019,55 @@ async fn test_provider_connection_state(
     build_app_state(state, &router_runtime)
 }
 
+fn show_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return;
+    };
+
+    if let Err(err) = window.show() {
+        eprintln!("显示主窗口失败: {err}");
+    }
+    if let Err(err) = window.unminimize() {
+        eprintln!("恢复主窗口失败: {err}");
+    }
+    if let Err(err) = window.set_focus() {
+        eprintln!("聚焦主窗口失败: {err}");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(UsageCacheState::default())
         .manage(RouterRuntime::default())
         .setup(|app| {
+            let show_item = MenuItem::with_id(app, TRAY_SHOW_ID, "显示主窗口", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "退出", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let mut tray_builder = TrayIconBuilder::new()
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .tooltip("Codex Helper")
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    TRAY_SHOW_ID => show_main_window(app),
+                    TRAY_QUIT_ID => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            }
+            tray_builder.build(app)?;
+
             let mut state = load_state_file()?;
             match ensure_router_config_applied(&mut state) {
                 Ok(true) => {
@@ -7763,6 +8083,16 @@ pub fn run() {
                 eprintln!("本地路由启动失败: {err}");
             }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == MAIN_WINDOW_LABEL {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    if let Err(err) = window.hide() {
+                        eprintln!("隐藏主窗口失败: {err}");
+                    }
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             load_app_state,
@@ -9112,5 +9442,121 @@ mod tests {
         }));
 
         assert_eq!(models, vec!["doubao-seed-1-6", "doubao-seed-1-6-thinking"]);
+    }
+
+    #[test]
+    fn parses_model_ids_from_codex_catalog_response() {
+        let models = models_from_response_value(&json!({
+            "models": [
+                { "slug": "gpt-5.5" },
+                { "slug": " gpt-5.4 " },
+                { "id": "legacy-id" },
+                { "object": "model" }
+            ]
+        }));
+
+        assert_eq!(models, vec!["gpt-5.4", "gpt-5.5", "legacy-id"]);
+    }
+
+    #[test]
+    fn detects_codex_model_catalog_requests() {
+        assert!(codex_model_catalog_requested(Some(
+            "client_version=0.142.1"
+        )));
+        assert!(codex_model_catalog_requested(Some(
+            "foo=bar&client_version=1"
+        )));
+        assert!(!codex_model_catalog_requested(None));
+        assert!(!codex_model_catalog_requested(Some("limit=100")));
+    }
+
+    #[test]
+    fn codex_catalog_preserves_template_context_without_override() {
+        let router = RouterConfig::default();
+        let template = json!({
+            "slug": "gpt-5.4",
+            "display_name": "GPT-5.4",
+            "description": "template",
+            "base_instructions": "keep template instructions",
+            "context_window": 272000,
+            "max_context_window": 1000000,
+            "supported_in_api": true,
+            "visibility": "list"
+        });
+        let catalog = codex_models_catalog_value_with_templates(
+            vec!["gpt-5.5".to_string()],
+            &[template],
+            &router,
+        );
+        let model = catalog
+            .pointer("/models/0")
+            .and_then(Value::as_object)
+            .expect("catalog model");
+
+        assert_eq!(model.get("slug").and_then(Value::as_str), Some("gpt-5.5"));
+        assert_eq!(
+            model.get("base_instructions").and_then(Value::as_str),
+            Some("keep template instructions")
+        );
+        assert_eq!(
+            model.get("context_window").and_then(Value::as_i64),
+            Some(272_000)
+        );
+        assert_eq!(
+            model.get("max_context_window").and_then(Value::as_i64),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            model
+                .get("auto_compact_token_limit")
+                .and_then(Value::as_i64),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_catalog_uses_configured_model_context_override() {
+        let router = RouterConfig {
+            model_context_overrides: vec![ModelContextOverride {
+                model: "deepseek-reasoner".to_string(),
+                context_window: 1_000_000,
+                auto_compact_token_limit: 950_000,
+            }],
+            ..RouterConfig::default()
+        };
+        let catalog = codex_models_catalog_value_with_templates(
+            vec!["deepseek-reasoner".to_string()],
+            &[],
+            &router,
+        );
+        let model = catalog
+            .pointer("/models/0")
+            .and_then(Value::as_object)
+            .expect("catalog model");
+
+        assert_eq!(
+            model.get("slug").and_then(Value::as_str),
+            Some("deepseek-reasoner")
+        );
+        assert_eq!(
+            model.get("context_window").and_then(Value::as_i64),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            model.get("max_context_window").and_then(Value::as_i64),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            model
+                .get("auto_compact_token_limit")
+                .and_then(Value::as_i64),
+            Some(950_000)
+        );
+        assert_eq!(
+            model
+                .get("effective_context_window_percent")
+                .and_then(Value::as_i64),
+            Some(95)
+        );
     }
 }

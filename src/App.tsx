@@ -62,6 +62,12 @@ type ModelMapping = {
   target: string;
 };
 
+type ModelContextOverride = {
+  model: string;
+  context_window: number;
+  auto_compact_token_limit: number;
+};
+
 type PricingRule = {
   id: string;
   provider_match: string;
@@ -90,6 +96,7 @@ type RouterConfig = {
   host: string;
   port: number;
   local_token: string;
+  model_context_overrides: ModelContextOverride[];
 };
 
 type RouterStatus = {
@@ -295,6 +302,7 @@ function defaultRouterConfig(): RouterConfig {
     host: "127.0.0.1",
     port: 18080,
     local_token: "",
+    model_context_overrides: [],
   };
 }
 
@@ -381,6 +389,27 @@ function normalizeProviderPricing(pricing: PricingRule[]) {
       request_price: Math.max(0, Number(rule.request_price) || 0),
       currency: (rule.currency || "USD").trim().toUpperCase(),
       source: rule.source.trim() || "供应商手动价格",
+    }];
+  });
+}
+
+function normalizeModelContextOverrides(overrides: ModelContextOverride[]) {
+  const seen = new Set<string>();
+  return overrides.flatMap((overrideConfig) => {
+    const model = overrideConfig.model.trim();
+    if (!model) return [];
+    const key = model.toLowerCase();
+    if (seen.has(key)) return [];
+    seen.add(key);
+    const contextWindow = Math.max(0, Math.floor(Number(overrideConfig.context_window) || 0));
+    if (!contextWindow) return [];
+    const autoCompact = Math.floor(Number(overrideConfig.auto_compact_token_limit) || 0);
+    return [{
+      model,
+      context_window: contextWindow,
+      auto_compact_token_limit: autoCompact > 0 && autoCompact <= contextWindow
+        ? autoCompact
+        : Math.max(1, Math.round(contextWindow * 0.95)),
     }];
   });
 }
@@ -1201,7 +1230,10 @@ function App() {
   async function saveRouter(nextRouter: RouterConfig, apply = false) {
     await run(async () => {
       const saved = await callCommand<AppState>("save_router_config", {
-        payload: nextRouter,
+        payload: {
+          ...nextRouter,
+          model_context_overrides: normalizeModelContextOverrides(nextRouter.model_context_overrides ?? []),
+        },
       });
       if (apply) {
         const applied = await callCommand<AppState>("apply_config");
@@ -1522,6 +1554,32 @@ function RouteScreen({
   routerOn: boolean;
   setRouterDraft: (router: RouterConfig) => void;
 }) {
+  const modelContextOverrides = routerDraft.model_context_overrides ?? [];
+  const updateModelContextOverride = (index: number, patch: Partial<ModelContextOverride>) => {
+    const next = [...modelContextOverrides];
+    next[index] = { ...next[index], ...patch };
+    setRouterDraft({ ...routerDraft, model_context_overrides: next });
+  };
+  const addModelContextOverride = () => {
+    setRouterDraft({
+      ...routerDraft,
+      model_context_overrides: [
+        ...modelContextOverrides,
+        {
+          model: "",
+          context_window: 1000000,
+          auto_compact_token_limit: 950000,
+        },
+      ],
+    });
+  };
+  const removeModelContextOverride = (index: number) => {
+    setRouterDraft({
+      ...routerDraft,
+      model_context_overrides: modelContextOverrides.filter((_, rowIndex) => rowIndex !== index),
+    });
+  };
+
   return (
     <section className="route-page">
       <div className="section-title">
@@ -1588,6 +1646,56 @@ function RouteScreen({
                 }
               />
             </label>
+          </div>
+          <div className="model-context-box">
+            <div className="mapping-box-head">
+              <div>
+                <strong>模型上下文覆盖</strong>
+                <p>仅覆盖下方模型；未配置的模型保持 Codex 原始上下文。</p>
+              </div>
+              <button className="ghost small" onClick={addModelContextOverride} type="button">
+                添加模型
+              </button>
+            </div>
+            <div className="model-context-grid">
+              <span>模型</span>
+              <span>上下文窗口</span>
+              <span>自动压缩阈值</span>
+              <span />
+              {modelContextOverrides.length === 0 && (
+                <p className="mapping-empty">未配置覆盖，所有模型使用原始 catalog 中的上下文。</p>
+              )}
+              {modelContextOverrides.map((overrideConfig, index) => (
+                <div className="model-context-row" key={index}>
+                  <input
+                    placeholder="deepseek-reasoner"
+                    value={overrideConfig.model}
+                    onChange={(event) => updateModelContextOverride(index, { model: event.currentTarget.value })}
+                  />
+                  <input
+                    inputMode="numeric"
+                    value={String(overrideConfig.context_window)}
+                    onChange={(event) =>
+                      updateModelContextOverride(index, {
+                        context_window: Number(event.currentTarget.value.replace(/\D/g, "")) || 0,
+                      })
+                    }
+                  />
+                  <input
+                    inputMode="numeric"
+                    value={String(overrideConfig.auto_compact_token_limit)}
+                    onChange={(event) =>
+                      updateModelContextOverride(index, {
+                        auto_compact_token_limit: Number(event.currentTarget.value.replace(/\D/g, "")) || 0,
+                      })
+                    }
+                  />
+                  <button className="ghost small" onClick={() => removeModelContextOverride(index)} type="button">
+                    删除
+                  </button>
+                </div>
+              ))}
+            </div>
           </div>
           <div className="route-toggle-line">
             <div>
