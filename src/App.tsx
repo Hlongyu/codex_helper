@@ -62,12 +62,6 @@ type ModelMapping = {
   target: string;
 };
 
-type ModelContextOverride = {
-  model: string;
-  context_window: number;
-  auto_compact_token_limit: number;
-};
-
 type PricingRule = {
   id: string;
   provider_match: string;
@@ -96,7 +90,11 @@ type RouterConfig = {
   host: string;
   port: number;
   local_token: string;
-  model_context_overrides: ModelContextOverride[];
+};
+
+type ClientConfigs = {
+  codex: { enabled: boolean };
+  claude: { enabled: boolean };
 };
 
 type RouterStatus = {
@@ -111,6 +109,7 @@ type ProviderConfig = {
   enabled: boolean;
   config: JsonValue;
   wire_api: ProviderWireApi;
+  service_tier: string;
   connection_test_model: string;
   allowed_models: string[];
   model_mappings: ModelMapping[];
@@ -121,12 +120,26 @@ type ProviderConfig = {
   connection_status?: unknown;
 };
 
+type ClaudeProviderConfig = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  base_url: string;
+  api_key: string;
+  connection_test_model: string;
+  allowed_models: string[];
+  model_mappings: ModelMapping[];
+  provider_pricing: PricingRule[];
+  connection_status?: unknown;
+};
+
 type ProviderSummary = {
   id: string;
   name: string;
   enabled: boolean;
   pending_changes: number;
   base_url: string;
+  provider_type: string;
   balance_label: string;
   balance_error?: string | null;
   latency_ms?: number | null;
@@ -263,21 +276,27 @@ type RouteUsageStats = {
 type AppState = {
   app_version: string;
   codex_config_path: string;
+  claude_settings_path: string;
   manager_dir: string;
   current_config_raw: string;
   current_config_exists: boolean;
   active_provider_id: string;
+  active_claude_provider_id: string;
   providers: ProviderSummary[];
+  claude_providers: ProviderSummary[];
   active_provider: ProviderConfig | null;
+  active_claude_provider: ClaudeProviderConfig | null;
   active_provider_toml: string;
   final_preview_toml: string;
   diffs: Array<{ path: string; action: string }>;
   router: RouterConfig;
+  clients: ClientConfigs;
   router_status: RouterStatus;
 };
 
 type Screen = "dashboard" | "route" | "providers" | "usage" | "requests" | "settings";
 type EditorTab = "base" | "balance" | "route";
+type ProviderKind = "codex" | "claude";
 type TimeRange = "today" | "week" | "month" | "all";
 type TrendMetric = "cost" | "tokens" | "requests";
 
@@ -302,7 +321,6 @@ function defaultRouterConfig(): RouterConfig {
     host: "127.0.0.1",
     port: 18080,
     local_token: "",
-    model_context_overrides: [],
   };
 }
 
@@ -389,27 +407,6 @@ function normalizeProviderPricing(pricing: PricingRule[]) {
       request_price: Math.max(0, Number(rule.request_price) || 0),
       currency: (rule.currency || "USD").trim().toUpperCase(),
       source: rule.source.trim() || "供应商手动价格",
-    }];
-  });
-}
-
-function normalizeModelContextOverrides(overrides: ModelContextOverride[]) {
-  const seen = new Set<string>();
-  return overrides.flatMap((overrideConfig) => {
-    const model = overrideConfig.model.trim();
-    if (!model) return [];
-    const key = model.toLowerCase();
-    if (seen.has(key)) return [];
-    seen.add(key);
-    const contextWindow = Math.max(0, Math.floor(Number(overrideConfig.context_window) || 0));
-    if (!contextWindow) return [];
-    const autoCompact = Math.floor(Number(overrideConfig.auto_compact_token_limit) || 0);
-    return [{
-      model,
-      context_window: contextWindow,
-      auto_compact_token_limit: autoCompact > 0 && autoCompact <= contextWindow
-        ? autoCompact
-        : Math.max(1, Math.round(contextWindow * 0.95)),
     }];
   });
 }
@@ -660,6 +657,11 @@ function routeBaseUrl(router: RouterConfig | RouterStatus) {
   return `http://${router.host || "127.0.0.1"}:${router.port || 18080}/v1`;
 }
 
+function claudeBaseUrl(router: RouterConfig | RouterStatus) {
+  if ("address" in router) return `http://${router.address}`;
+  return `http://${router.host || "127.0.0.1"}:${router.port || 18080}`;
+}
+
 function serviceOk(state: AppState | null) {
   return Boolean(state?.router.enabled && state.router_status.running);
 }
@@ -856,9 +858,11 @@ function App() {
   const [requestFilter, setRequestFilter] = useState<RouteLogFilter>({ model: "", page_size: 20 });
   const [requestAutoRefresh, setRequestAutoRefresh] = useState(true);
   const [screen, setScreen] = useState<Screen>("dashboard");
+  const [providerKind, setProviderKind] = useState<ProviderKind>("codex");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [editorOpen, setEditorOpen] = useState(false);
+  const [editorKind, setEditorKind] = useState<ProviderKind>("codex");
   const [editorTab, setEditorTab] = useState<EditorTab>("base");
   const [editingId, setEditingId] = useState("");
   const [providerName, setProviderName] = useState("");
@@ -867,6 +871,7 @@ function App() {
   const [providerApiKeyDirty, setProviderApiKeyDirty] = useState(false);
   const [providerEnabled, setProviderEnabled] = useState(true);
   const [providerWireApi, setProviderWireApi] = useState<ProviderWireApi>("responses");
+  const [providerServiceTier, setProviderServiceTier] = useState("");
   const [connectionTestResult, setConnectionTestResult] = useState<ProviderConnectionTestResult | null>(null);
   const [providerTestModel, setProviderTestModel] = useState("");
   const [providerModels, setProviderModels] = useState<string[]>([]);
@@ -974,8 +979,9 @@ function App() {
   }, [appState]);
   const editingProviderSummary = useMemo(() => {
     if (!appState || !editingId) return null;
-    return appState.providers.find((provider) => provider.id === editingId) ?? null;
-  }, [appState, editingId]);
+    const providers = editorKind === "claude" ? appState.claude_providers : appState.providers;
+    return providers.find((provider) => provider.id === editingId) ?? null;
+  }, [appState, editingId, editorKind]);
 
   const requestCount = routeUsageStats?.success_count ?? routeUsageStats?.summary.request_count ?? 0;
   const officialCost = routeUsageStats?.summary.estimated_cost ?? 0;
@@ -997,6 +1003,7 @@ function App() {
 
   function fillProviderEditor(targetFull: ProviderConfig, summary: ProviderSummary | null, tab: EditorTab) {
     const fields = providerFields(targetFull);
+    setEditorKind("codex");
     setEditingId(summary?.id ?? targetFull.id);
     setProviderName(summary?.name ?? targetFull.name ?? "");
     setProviderBaseUrl(summary?.base_url || fields.baseUrl);
@@ -1004,6 +1011,7 @@ function App() {
     setProviderApiKeyDirty(false);
     setProviderEnabled(summary?.enabled ?? targetFull.enabled ?? true);
     setProviderWireApi(targetFull.wire_api ?? "responses");
+    setProviderServiceTier(targetFull.service_tier ?? "");
     setProviderTestModel(targetFull.connection_test_model ?? "");
     setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
     setAllowedModels(targetFull.allowed_models ?? []);
@@ -1023,6 +1031,25 @@ function App() {
     setEditorOpen(true);
   }
 
+  function fillClaudeProviderEditor(targetFull: ClaudeProviderConfig, summary: ProviderSummary | null) {
+    setEditorKind("claude");
+    setEditingId(summary?.id ?? targetFull.id);
+    setProviderName(summary?.name ?? targetFull.name ?? "");
+    setProviderBaseUrl(summary?.base_url || targetFull.base_url || "");
+    setProviderApiKey(targetFull.api_key || "");
+    setProviderApiKeyDirty(false);
+    setProviderEnabled(summary?.enabled ?? targetFull.enabled ?? true);
+    setProviderTestModel(targetFull.connection_test_model ?? "");
+    setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
+    setAllowedModels(targetFull.allowed_models ?? []);
+    setModelMappings(targetFull.model_mappings ?? []);
+    setProviderPricing(targetFull.provider_pricing ?? []);
+    setEditorTab("base");
+    setSecretVisible(false);
+    setConnectionTestResult(null);
+    setEditorOpen(true);
+  }
+
   async function openProviderEditor(provider?: ProviderSummary, tab: EditorTab = "base") {
     const targetSummary = provider ?? activeProvider;
     if (!targetSummary) return;
@@ -1031,6 +1058,17 @@ function App() {
         providerId: targetSummary.id,
       });
       fillProviderEditor(targetFull, targetSummary, tab);
+    });
+  }
+
+  async function openClaudeProviderEditor(provider?: ProviderSummary) {
+    const targetSummary = provider ?? appState?.claude_providers[0] ?? null;
+    if (!targetSummary) return;
+    await run(async () => {
+      const targetFull = await callCommand<ClaudeProviderConfig>("get_claude_provider", {
+        providerId: targetSummary.id,
+      });
+      fillClaudeProviderEditor(targetFull, targetSummary);
     });
   }
 
@@ -1050,6 +1088,22 @@ function App() {
     });
   }
 
+  async function addClaudeProvider() {
+    await run(async () => {
+      const name = `新 Claude 供应商 ${newProviderCount}`;
+      const state = await callCommand<AppState>("add_claude_provider", { name });
+      setNewProviderCount((value) => value + 1);
+      setAppState(state);
+      const created = state.claude_providers.find((provider) => provider.id === state.active_claude_provider_id);
+      if (created) {
+        const targetFull = await callCommand<ClaudeProviderConfig>("get_claude_provider", {
+          providerId: created.id,
+        });
+        fillClaudeProviderEditor(targetFull, created);
+      }
+    });
+  }
+
   async function saveProvider() {
     if (!editingId) return;
     await run(async () => {
@@ -1064,6 +1118,7 @@ function App() {
         base_url: providerBaseUrl,
         enabled: providerEnabled,
         wire_api: providerWireApi,
+        service_tier: providerServiceTier,
         balance_query: nextBalance,
         balance_status: balanceTestStatus,
         connection_test_model: providerTestModel,
@@ -1075,6 +1130,30 @@ function App() {
         payload.api_key = providerApiKey;
       }
       const state = await callCommand<AppState>("save_provider", {
+        payload,
+      });
+      setAppState(state);
+      setEditorOpen(false);
+    });
+  }
+
+  async function saveClaudeProvider() {
+    if (!editingId) return;
+    await run(async () => {
+      const payload: Record<string, unknown> = {
+        provider_id: editingId,
+        provider_name: providerName,
+        base_url: providerBaseUrl,
+        enabled: providerEnabled,
+        connection_test_model: providerTestModel,
+        allowed_models: allowedModels,
+        model_mappings: modelMappings,
+        provider_pricing: normalizeProviderPricing(providerPricing),
+      };
+      if (providerApiKeyDirty) {
+        payload.api_key = providerApiKey;
+      }
+      const state = await callCommand<AppState>("save_claude_provider", {
         payload,
       });
       setAppState(state);
@@ -1161,6 +1240,27 @@ function App() {
     });
   }
 
+  async function loadClaudeProviderModels() {
+    if (!editingId) return;
+    await run(async () => {
+      const payload: Record<string, unknown> = {
+        provider_id: editingId,
+        base_url: providerBaseUrl,
+        api_key: null,
+      };
+      if (providerApiKeyDirty) {
+        payload.api_key = providerApiKey;
+      }
+      const result = await callCommand<ProviderModelsResponse>("load_claude_provider_models", {
+        payload,
+      });
+      setProviderModels(result.models);
+      if (!providerTestModel && result.models[0]) {
+        setProviderTestModel(result.models[0]);
+      }
+    });
+  }
+
   async function syncProviderPricing() {
     if (!editingId) return;
     await run(async () => {
@@ -1200,9 +1300,32 @@ function App() {
     });
   }
 
+  async function toggleClaudeProvider(provider: ProviderSummary, enabled: boolean) {
+    await run(async () => {
+      const state = await callCommand<AppState>("save_claude_provider", {
+        payload: {
+          provider_id: provider.id,
+          provider_name: provider.name,
+          base_url: provider.base_url,
+          enabled,
+        },
+      });
+      setAppState(state);
+    });
+  }
+
   async function reorderProviders(providerIds: string[]) {
     await run(async () => {
       const state = await callCommand<AppState>("reorder_providers", {
+        payload: { provider_ids: providerIds },
+      });
+      setAppState(state);
+    });
+  }
+
+  async function reorderClaudeProviders(providerIds: string[]) {
+    await run(async () => {
+      const state = await callCommand<AppState>("reorder_claude_providers", {
         payload: { provider_ids: providerIds },
       });
       setAppState(state);
@@ -1230,10 +1353,7 @@ function App() {
   async function saveRouter(nextRouter: RouterConfig, apply = false) {
     await run(async () => {
       const saved = await callCommand<AppState>("save_router_config", {
-        payload: {
-          ...nextRouter,
-          model_context_overrides: normalizeModelContextOverrides(nextRouter.model_context_overrides ?? []),
-        },
+        payload: nextRouter,
       });
       if (apply) {
         const applied = await callCommand<AppState>("apply_config");
@@ -1246,9 +1366,18 @@ function App() {
     });
   }
 
-  async function toggleRouter(enabled: boolean) {
-    const next = { ...(appState?.router ?? routerDraft), enabled };
-    await saveRouter(next, true);
+  async function saveClientConfig(kind: ProviderKind, enabled: boolean) {
+    await run(async () => {
+      const clients = appState?.clients ?? { codex: { enabled: false }, claude: { enabled: false } };
+      const state = await callCommand<AppState>("save_client_configs", {
+        payload: {
+          codex_enabled: kind === "codex" ? enabled : clients.codex.enabled,
+          claude_enabled: kind === "claude" ? enabled : clients.claude.enabled,
+        },
+      });
+      setAppState(state);
+      setRouterDraft(state.router);
+    });
   }
 
   async function applyUsageFilter(patch: Partial<RouteLogFilter>) {
@@ -1363,7 +1492,7 @@ function App() {
               {screen === "dashboard"
                 ? "用量、供应商与请求质量"
                 : screen === "route"
-                  ? "管理 Codex 接管、本地代理与故障转移规则"
+                  ? "管理 Codex、Claude 接管与本地代理"
                 : screen === "providers"
                   ? "管理上游连接、余额监控与路由顺序"
                 : screen === "usage"
@@ -1375,8 +1504,18 @@ function App() {
           </div>
           <div className="top-actions">
             <StatusPill ok={routerOn} />
-            <span className="muted">接管 Codex</span>
-            <Toggle checked={appState.router.enabled} disabled={busy} onChange={toggleRouter} />
+            <span className="muted">Codex</span>
+            <Toggle
+              checked={appState.clients.codex.enabled}
+              disabled={busy}
+              onChange={(checked) => void saveClientConfig("codex", checked)}
+            />
+            <span className="muted">Claude</span>
+            <Toggle
+              checked={appState.clients.claude.enabled}
+              disabled={busy}
+              onChange={(checked) => void saveClientConfig("claude", checked)}
+            />
           </div>
         </header>
 
@@ -1406,6 +1545,7 @@ function App() {
           <RouteScreen
             appState={appState}
             busy={busy}
+            onSaveClientConfig={saveClientConfig}
             routerDraft={routerDraft}
             routerOn={routerOn}
             setRouterDraft={setRouterDraft}
@@ -1416,15 +1556,21 @@ function App() {
         {screen === "providers" && (
           <ProvidersScreen
             busy={busy}
-            onAdd={addProvider}
+            onAdd={providerKind === "claude" ? addClaudeProvider : addProvider}
             onEdit={(provider, tab) => {
-              void openProviderEditor(provider, tab);
+              if (providerKind === "claude") {
+                void openClaudeProviderEditor(provider);
+              } else {
+                void openProviderEditor(provider, tab);
+              }
             }}
-            onRefreshBalance={refreshProviderBalance}
-            onReorder={reorderProviders}
-            onTestLatency={testProviderLatency}
-            onToggle={toggleProvider}
-            providers={appState.providers}
+            onKindChange={setProviderKind}
+            onRefreshBalance={providerKind === "claude" ? async (_provider) => undefined : refreshProviderBalance}
+            onReorder={providerKind === "claude" ? reorderClaudeProviders : reorderProviders}
+            onTestLatency={providerKind === "claude" ? async (_provider) => undefined : testProviderLatency}
+            onToggle={providerKind === "claude" ? toggleClaudeProvider : toggleProvider}
+            providerKind={providerKind}
+            providers={providerKind === "claude" ? appState.claude_providers : appState.providers}
           />
         )}
 
@@ -1479,7 +1625,7 @@ function App() {
         )}
       </section>
 
-      {editorOpen && (
+      {editorOpen && editorKind === "codex" && (
         <ProviderEditor
           balanceQuery={balanceQuery}
           balanceTestStatus={balanceTestStatus}
@@ -1506,6 +1652,7 @@ function App() {
           providerEnabled={providerEnabled}
           providerModels={providerModels}
           providerName={providerName}
+          providerServiceTier={providerServiceTier}
           providerTestModel={providerTestModel}
           providerWireApi={providerWireApi}
           secretVisible={secretVisible}
@@ -1529,10 +1676,48 @@ function App() {
           setModelMappings={setModelMappings}
           setProviderPricing={setProviderPricing}
           setProviderName={setProviderName}
+          setProviderServiceTier={setProviderServiceTier}
           setProviderTestModel={setProviderTestModel}
           setProviderWireApi={setProviderWireApi}
           setSecretVisible={setSecretVisible}
           tab={editorTab}
+        />
+      )}
+      {editorOpen && editorKind === "claude" && (
+        <ClaudeProviderEditor
+          allowedModels={allowedModels}
+          busy={busy}
+          modelMappings={modelMappings}
+          onClose={() => setEditorOpen(false)}
+          onLoadProviderModels={loadClaudeProviderModels}
+          onSave={saveClaudeProvider}
+          providerApiKey={providerApiKey}
+          providerBaseUrl={providerBaseUrl}
+          providerEnabled={providerEnabled}
+          providerModels={providerModels}
+          providerName={providerName}
+          providerPricing={providerPricing}
+          providerTestModel={providerTestModel}
+          secretVisible={secretVisible}
+          setAllowedModels={setAllowedModels}
+          setModelMappings={setModelMappings}
+          setProviderApiKey={(value) => {
+            setProviderApiKey(value);
+            setProviderApiKeyDirty(true);
+            setProviderModels([]);
+            setProviderTestModel("");
+          }}
+          setProviderApiKeyDirty={setProviderApiKeyDirty}
+          setProviderBaseUrl={(value) => {
+            setProviderBaseUrl(value);
+            setProviderModels([]);
+            setProviderTestModel("");
+          }}
+          setProviderEnabled={setProviderEnabled}
+          setProviderName={setProviderName}
+          setProviderPricing={setProviderPricing}
+          setProviderTestModel={setProviderTestModel}
+          setSecretVisible={setSecretVisible}
         />
       )}
     </main>
@@ -1542,6 +1727,7 @@ function App() {
 function RouteScreen({
   appState,
   busy,
+  onSaveClientConfig,
   onSaveRouter,
   routerDraft,
   routerOn,
@@ -1549,37 +1735,12 @@ function RouteScreen({
 }: {
   appState: AppState;
   busy: boolean;
+  onSaveClientConfig: (kind: ProviderKind, enabled: boolean) => Promise<void>;
   onSaveRouter: (nextRouter: RouterConfig, apply?: boolean) => Promise<void>;
   routerDraft: RouterConfig;
   routerOn: boolean;
   setRouterDraft: (router: RouterConfig) => void;
 }) {
-  const modelContextOverrides = routerDraft.model_context_overrides ?? [];
-  const updateModelContextOverride = (index: number, patch: Partial<ModelContextOverride>) => {
-    const next = [...modelContextOverrides];
-    next[index] = { ...next[index], ...patch };
-    setRouterDraft({ ...routerDraft, model_context_overrides: next });
-  };
-  const addModelContextOverride = () => {
-    setRouterDraft({
-      ...routerDraft,
-      model_context_overrides: [
-        ...modelContextOverrides,
-        {
-          model: "",
-          context_window: 1000000,
-          auto_compact_token_limit: 950000,
-        },
-      ],
-    });
-  };
-  const removeModelContextOverride = (index: number) => {
-    setRouterDraft({
-      ...routerDraft,
-      model_context_overrides: modelContextOverrides.filter((_, rowIndex) => rowIndex !== index),
-    });
-  };
-
   return (
     <section className="route-page">
       <div className="section-title">
@@ -1591,9 +1752,9 @@ function RouteScreen({
         <article className="route-card route-codex-card">
           <div className="route-card-head">
             <h3>Codex 接管</h3>
-            <span className={`state-pill ${routerOn ? "ok" : "warn"}`}>
+            <span className={`state-pill ${appState.clients.codex.enabled ? "ok" : "warn"}`}>
               <span />
-              {routerOn ? "已接管" : "未接管"}
+              {appState.clients.codex.enabled ? "已接管" : "未接管"}
             </span>
           </div>
           <label className="compact-field">
@@ -1613,7 +1774,44 @@ function RouteScreen({
           <div className="route-diff-row">
             <span>openai_base_url → 本地代理地址</span>
             <button className="ghost small">查看变更</button>
-            <button className="ghost small warn-text">恢复原配置</button>
+            <Toggle
+              checked={appState.clients.codex.enabled}
+              disabled={busy}
+              onChange={(checked) => void onSaveClientConfig("codex", checked)}
+            />
+          </div>
+        </article>
+
+        <article className="route-card">
+          <div className="route-card-head">
+            <h3>Claude 接管</h3>
+            <span className={`state-pill ${appState.clients.claude.enabled ? "ok" : "warn"}`}>
+              <span />
+              {appState.clients.claude.enabled ? "已接管" : "未接管"}
+            </span>
+          </div>
+          <label className="compact-field">
+            <span>设置文件</span>
+            <div className="copy-field">
+              <strong>{appState.claude_settings_path}</strong>
+              <button className="ghost small">打开文件</button>
+            </div>
+          </label>
+          <label className="compact-field">
+            <span>Claude Base URL</span>
+            <div className="copy-field accent">
+              <strong>{claudeBaseUrl(routerDraft)}</strong>
+              <button className="ghost small">复制</button>
+            </div>
+          </label>
+          <div className="route-diff-row">
+            <span>ANTHROPIC_BASE_URL → 本地代理地址</span>
+            <button className="ghost small">查看变更</button>
+            <Toggle
+              checked={appState.clients.claude.enabled}
+              disabled={busy}
+              onChange={(checked) => void onSaveClientConfig("claude", checked)}
+            />
           </div>
         </article>
 
@@ -1646,56 +1844,6 @@ function RouteScreen({
                 }
               />
             </label>
-          </div>
-          <div className="model-context-box">
-            <div className="mapping-box-head">
-              <div>
-                <strong>模型上下文覆盖</strong>
-                <p>仅覆盖下方模型；未配置的模型保持 Codex 原始上下文。</p>
-              </div>
-              <button className="ghost small" onClick={addModelContextOverride} type="button">
-                添加模型
-              </button>
-            </div>
-            <div className="model-context-grid">
-              <span>模型</span>
-              <span>上下文窗口</span>
-              <span>自动压缩阈值</span>
-              <span />
-              {modelContextOverrides.length === 0 && (
-                <p className="mapping-empty">未配置覆盖，所有模型使用原始 catalog 中的上下文。</p>
-              )}
-              {modelContextOverrides.map((overrideConfig, index) => (
-                <div className="model-context-row" key={index}>
-                  <input
-                    placeholder="deepseek-reasoner"
-                    value={overrideConfig.model}
-                    onChange={(event) => updateModelContextOverride(index, { model: event.currentTarget.value })}
-                  />
-                  <input
-                    inputMode="numeric"
-                    value={String(overrideConfig.context_window)}
-                    onChange={(event) =>
-                      updateModelContextOverride(index, {
-                        context_window: Number(event.currentTarget.value.replace(/\D/g, "")) || 0,
-                      })
-                    }
-                  />
-                  <input
-                    inputMode="numeric"
-                    value={String(overrideConfig.auto_compact_token_limit)}
-                    onChange={(event) =>
-                      updateModelContextOverride(index, {
-                        auto_compact_token_limit: Number(event.currentTarget.value.replace(/\D/g, "")) || 0,
-                      })
-                    }
-                  />
-                  <button className="ghost small" onClick={() => removeModelContextOverride(index)} type="button">
-                    删除
-                  </button>
-                </div>
-              ))}
-            </div>
           </div>
           <div className="route-toggle-line">
             <div>
@@ -2408,19 +2556,23 @@ function ProvidersScreen({
   busy,
   onAdd,
   onEdit,
+  onKindChange,
   onRefreshBalance,
   onReorder,
   onTestLatency,
   onToggle,
+  providerKind,
   providers,
 }: {
   busy: boolean;
   onAdd: () => void;
   onEdit: (provider: ProviderSummary, tab: EditorTab) => void;
+  onKindChange: (kind: ProviderKind) => void;
   onRefreshBalance: (provider: ProviderSummary) => Promise<void>;
   onReorder: (providerIds: string[]) => Promise<void>;
   onTestLatency: (provider: ProviderSummary) => Promise<void>;
   onToggle: (provider: ProviderSummary, enabled: boolean) => void;
+  providerKind: ProviderKind;
   providers: ProviderSummary[];
 }) {
   const [draggingProviderId, setDraggingProviderId] = useState<string | null>(null);
@@ -2486,6 +2638,22 @@ function ProvidersScreen({
   return (
     <section className="providers-page">
       <div className="provider-toolbar">
+        <div className="protocol-switch">
+          <button
+            className={providerKind === "codex" ? "active" : ""}
+            onClick={() => onKindChange("codex")}
+            type="button"
+          >
+            Codex
+          </button>
+          <button
+            className={providerKind === "claude" ? "active" : ""}
+            onClick={() => onKindChange("claude")}
+            type="button"
+          >
+            Claude
+          </button>
+        </div>
         <div className="search-box">
           <span />
           <input placeholder="搜索名称或 Base URL" />
@@ -2500,7 +2668,7 @@ function ProvidersScreen({
 
       <div className="provider-actions">
         <button className="ghost">检查全部</button>
-        <button className="primary" onClick={onAdd}>+ 添加供应商</button>
+        <button className="primary" onClick={onAdd}>+ 添加{providerKind === "claude" ? " Claude" : ""}供应商</button>
       </div>
 
       <article className="provider-table">
@@ -2620,6 +2788,7 @@ function ProviderEditor(props: {
   providerModels: string[];
   providerName: string;
   providerPricing: PricingRule[];
+  providerServiceTier: string;
   providerTestModel: string;
   providerWireApi: ProviderWireApi;
   secretVisible: boolean;
@@ -2631,6 +2800,7 @@ function ProviderEditor(props: {
   setModelMappings: (mappings: ModelMapping[]) => void;
   setProviderPricing: (pricing: PricingRule[]) => void;
   setProviderName: (value: string) => void;
+  setProviderServiceTier: (value: string) => void;
   setProviderTestModel: (value: string) => void;
   setProviderWireApi: (value: ProviderWireApi) => void;
   setSecretVisible: (value: boolean) => void;
@@ -2662,6 +2832,7 @@ function ProviderEditor(props: {
     providerModels,
     providerName,
     providerPricing,
+    providerServiceTier,
     providerTestModel,
     providerWireApi,
     secretVisible,
@@ -2673,6 +2844,7 @@ function ProviderEditor(props: {
     setModelMappings,
     setProviderPricing,
     setProviderName,
+    setProviderServiceTier,
     setProviderTestModel,
     setProviderWireApi,
     setSecretVisible,
@@ -3017,6 +3189,15 @@ function ProviderEditor(props: {
                 </select>
                 <small>DeepSeek、GLM 等不支持 Responses 时选择兼容模式</small>
               </label>
+              <label className="field">
+                <span>强制 service_tier</span>
+                <input
+                  placeholder="例如 priority；留空则跟随客户端"
+                  value={providerServiceTier}
+                  onChange={(event) => setProviderServiceTier(event.currentTarget.value)}
+                />
+                <small>保存后，转发给此供应商的 JSON 请求会覆盖 service_tier。</small>
+              </label>
               <div className="route-box">
                 <strong>故障处理</strong>
                 <div className="form-row">
@@ -3175,6 +3356,326 @@ function ProviderEditor(props: {
 
         <footer>
           <button className="danger">删除</button>
+          <div />
+          <button className="ghost" onClick={onClose}>取消</button>
+          <button className="primary" disabled={busy} onClick={onSave}>保存修改</button>
+        </footer>
+      </aside>
+    </div>
+  );
+}
+
+function ClaudeProviderEditor(props: {
+  allowedModels: string[];
+  busy: boolean;
+  modelMappings: ModelMapping[];
+  onClose: () => void;
+  onLoadProviderModels: () => void;
+  onSave: () => void;
+  providerApiKey: string;
+  providerBaseUrl: string;
+  providerEnabled: boolean;
+  providerModels: string[];
+  providerName: string;
+  providerPricing: PricingRule[];
+  providerTestModel: string;
+  secretVisible: boolean;
+  setAllowedModels: (models: string[]) => void;
+  setModelMappings: (mappings: ModelMapping[]) => void;
+  setProviderApiKey: (value: string) => void;
+  setProviderApiKeyDirty: (dirty: boolean) => void;
+  setProviderBaseUrl: (value: string) => void;
+  setProviderEnabled: (value: boolean) => void;
+  setProviderName: (value: string) => void;
+  setProviderPricing: (pricing: PricingRule[]) => void;
+  setProviderTestModel: (value: string) => void;
+  setSecretVisible: (value: boolean) => void;
+}) {
+  const {
+    allowedModels,
+    busy,
+    modelMappings,
+    onClose,
+    onLoadProviderModels,
+    onSave,
+    providerApiKey,
+    providerBaseUrl,
+    providerEnabled,
+    providerModels,
+    providerName,
+    providerPricing,
+    providerTestModel,
+    secretVisible,
+    setAllowedModels,
+    setModelMappings,
+    setProviderApiKey,
+    setProviderApiKeyDirty,
+    setProviderBaseUrl,
+    setProviderEnabled,
+    setProviderName,
+    setProviderPricing,
+    setProviderTestModel,
+    setSecretVisible,
+  } = props;
+  const [customAllowedModel, setCustomAllowedModel] = useState("");
+  const updateAllowedModels = (models: string[]) => setAllowedModels(normalizeModelNames(models));
+  const allowedModelOptions = normalizeModelNames([...providerModels, ...allowedModels]);
+  const allModelsAllowed = allowedModels.length === 0;
+  const toggleAllowedModel = (model: string, checked: boolean) => {
+    const currentModels = allModelsAllowed ? allowedModelOptions : allowedModels;
+    updateAllowedModels(
+      checked
+        ? [...currentModels, model]
+        : currentModels.filter((current) => current.toLowerCase() !== model.toLowerCase()),
+    );
+  };
+  const addCustomAllowedModel = () => {
+    const model = customAllowedModel.trim();
+    if (!model) return;
+    updateAllowedModels([...(allModelsAllowed ? allowedModelOptions : allowedModels), model]);
+    if (!providerTestModel) setProviderTestModel(model);
+    setCustomAllowedModel("");
+  };
+  const changePricingRule = (index: number, patch: Partial<PricingRule>) => {
+    const next = [...providerPricing];
+    next[index] = { ...next[index], ...patch };
+    setProviderPricing(next);
+  };
+
+  return (
+    <div className="drawer-backdrop">
+      <aside className="provider-drawer">
+        <header>
+          <div>
+            <h2>编辑 Claude 供应商</h2>
+            <p>{providerName || "未命名 Claude 供应商"}</p>
+          </div>
+          <button className="close" onClick={onClose}>×</button>
+        </header>
+
+        <section className="drawer-body">
+          <label className="field">
+            <span>供应商名称</span>
+            <input value={providerName} onChange={(event) => setProviderName(event.currentTarget.value)} />
+          </label>
+          <label className="field">
+            <span>Base URL</span>
+            <input
+              placeholder="https://api.anthropic.com/v1"
+              value={providerBaseUrl}
+              onChange={(event) => setProviderBaseUrl(event.currentTarget.value)}
+            />
+            <small>按填写值原样拼接 /messages 与 /models；需要 /v1 的供应商请写到 Base URL 中。</small>
+          </label>
+          <label className="field">
+            <span>API Key</span>
+            <div className="secret-field">
+              <input
+                type={secretVisible ? "text" : "password"}
+                value={providerApiKey}
+                onChange={(event) => {
+                  setProviderApiKey(event.currentTarget.value);
+                  setProviderApiKeyDirty(true);
+                }}
+                placeholder="留空保持已保存的 API Key"
+              />
+              <button onClick={() => setSecretVisible(!secretVisible)} type="button">
+                {secretVisible ? "隐藏" : "显示"}
+              </button>
+            </div>
+          </label>
+          <div className="switch-row-card">
+            <div>
+              <strong>启用 Claude 供应商</strong>
+              <p>关闭后不会参与 Claude 原生消息路由</p>
+            </div>
+            <Toggle checked={providerEnabled} onChange={setProviderEnabled} />
+          </div>
+          <label className="field">
+            <span>默认测试模型</span>
+            <input
+              placeholder="claude-sonnet-4-5"
+              value={providerTestModel}
+              onChange={(event) => setProviderTestModel(event.currentTarget.value)}
+            />
+          </label>
+          <div className="model-filter-box">
+            <div className="mapping-box-head">
+              <div>
+                <strong>允许模型</strong>
+                <p>{allowedModels.length ? `仅接收 ${allowedModels.length} 个 Claude 模型` : "当前接收所有 Claude 模型"}</p>
+              </div>
+              <div className="test-actions">
+                <button className="ghost small" disabled={busy} onClick={onLoadProviderModels} type="button">
+                  刷新模型
+                </button>
+                <button className="ghost small" onClick={() => updateAllowedModels([])} type="button">
+                  全部模型
+                </button>
+              </div>
+            </div>
+            <div className="model-option-grid">
+              {allowedModelOptions.length === 0 && (
+                <p className="mapping-empty">刷新远端模型，或在下方手动添加 Claude 模型名。未配置允许模型时，此供应商接收所有 Claude 请求模型。</p>
+              )}
+              {allowedModelOptions.map((model) => {
+                const checked = allModelsAllowed || allowedModels.some((current) => current.toLowerCase() === model.toLowerCase());
+                return (
+                  <label className={checked ? "model-option selected" : "model-option"} key={model}>
+                    <input
+                      checked={checked}
+                      onChange={(event) => toggleAllowedModel(model, event.currentTarget.checked)}
+                      type="checkbox"
+                    />
+                    <span>{model}</span>
+                  </label>
+                );
+              })}
+            </div>
+            <div className="custom-model-row">
+              <input
+                placeholder="手动输入模型，例如 claude-sonnet-4-5"
+                value={customAllowedModel}
+                onChange={(event) => setCustomAllowedModel(event.currentTarget.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    addCustomAllowedModel();
+                  }
+                }}
+              />
+              <button className="ghost small" onClick={addCustomAllowedModel} type="button">
+                添加
+              </button>
+            </div>
+          </div>
+          <div className="mapping-box">
+            <div className="mapping-box-head">
+              <div>
+                <strong>模型映射</strong>
+                <p>只替换 Anthropic 请求体顶层 model 字段</p>
+              </div>
+              <button
+                className="ghost small"
+                onClick={() => setModelMappings([...modelMappings, { source: "", target: "" }])}
+                type="button"
+              >
+                添加映射
+              </button>
+            </div>
+            <div className="mapping-grid">
+              <span>客户端模型</span>
+              <span>上游模型</span>
+              <span />
+              {modelMappings.length === 0 && (
+                <p className="mapping-empty">未配置映射时，请求模型将原样转发。</p>
+              )}
+              {modelMappings.map((mapping, index) => (
+                <div className="mapping-row" key={index}>
+                  <input
+                    placeholder="claude-sonnet-4-5"
+                    value={mapping.source}
+                    onChange={(event) => {
+                      const next = [...modelMappings];
+                      next[index] = { ...mapping, source: event.currentTarget.value };
+                      setModelMappings(next);
+                    }}
+                  />
+                  <input
+                    placeholder="claude-3-5-sonnet-latest"
+                    value={mapping.target}
+                    onChange={(event) => {
+                      const next = [...modelMappings];
+                      next[index] = { ...mapping, target: event.currentTarget.value };
+                      setModelMappings(next);
+                    }}
+                  />
+                  <button
+                    aria-label="删除映射"
+                    className="icon-button"
+                    onClick={() => setModelMappings(modelMappings.filter((_, rowIndex) => rowIndex !== index))}
+                    title="删除映射"
+                    type="button"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="pricing-box">
+            <div className="mapping-box-head">
+              <div>
+                <strong>供应商计价</strong>
+                <p>阶段 3 接入 Claude 日志统计后用于费用估算</p>
+              </div>
+              <button
+                className="ghost small"
+                onClick={() => setProviderPricing([...providerPricing, defaultPricingRule()])}
+                type="button"
+              >
+                添加价格
+              </button>
+            </div>
+            <div className="pricing-grid">
+              <span>上游模型</span>
+              <span>输入 / 1M</span>
+              <span>缓存 / 1M</span>
+              <span>输出 / 1M</span>
+              <span>请求 / 次</span>
+              <span>币种</span>
+              <span />
+              {providerPricing.length === 0 && (
+                <p className="mapping-empty">未配置价格时，暂不估算 Claude 供应商消耗。</p>
+              )}
+              {providerPricing.map((rule, index) => (
+                <div className="pricing-row" key={rule.id || index}>
+                  <input
+                    placeholder="claude-*"
+                    value={rule.model_match}
+                    onChange={(event) => changePricingRule(index, { model_match: event.currentTarget.value })}
+                  />
+                  <input
+                    inputMode="decimal"
+                    value={String(rule.input_per_million)}
+                    onChange={(event) => changePricingRule(index, { input_per_million: Number(event.currentTarget.value) || 0 })}
+                  />
+                  <input
+                    inputMode="decimal"
+                    value={String(rule.cached_input_per_million)}
+                    onChange={(event) => changePricingRule(index, { cached_input_per_million: Number(event.currentTarget.value) || 0 })}
+                  />
+                  <input
+                    inputMode="decimal"
+                    value={String(rule.output_per_million)}
+                    onChange={(event) => changePricingRule(index, { output_per_million: Number(event.currentTarget.value) || 0 })}
+                  />
+                  <input
+                    inputMode="decimal"
+                    value={String(rule.request_price ?? 0)}
+                    onChange={(event) => changePricingRule(index, { request_price: Number(event.currentTarget.value) || 0 })}
+                  />
+                  <input
+                    value={rule.currency}
+                    onChange={(event) => changePricingRule(index, { currency: event.currentTarget.value.toUpperCase() })}
+                  />
+                  <button
+                    aria-label="删除价格"
+                    className="icon-button"
+                    onClick={() => setProviderPricing(providerPricing.filter((_, rowIndex) => rowIndex !== index))}
+                    title="删除价格"
+                    type="button"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        <footer>
+          <button className="danger" disabled>删除</button>
           <div />
           <button className="ghost" onClick={onClose}>取消</button>
           <button className="primary" disabled={busy} onClick={onSave}>保存修改</button>

@@ -723,11 +723,36 @@ button:disabled {
 
 .provider-toolbar {
   display: grid;
-  grid-template-columns: minmax(280px, 1fr) auto minmax(180px, 0.5fr) auto;
+  grid-template-columns: auto minmax(280px, 1fr) auto minmax(180px, 0.5fr) auto;
   align-items: center;
   gap: 14px;
   min-height: 70px;
   padding: 16px 20px;
+}
+
+.protocol-switch {
+  display: inline-flex;
+  height: 36px;
+  align-items: center;
+  border: 1px solid #24364a;
+  border-radius: 10px;
+  background: #0e151f;
+  padding: 3px;
+}
+
+.protocol-switch button {
+  height: 28px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #8794a7;
+  padding: 0 12px;
+}
+
+.protocol-switch button.active {
+  background: #25344a;
+  color: #f7f9fd;
+  font-weight: 800;
 }
 
 .provider-actions {
@@ -1486,7 +1511,7 @@ button.danger {
 
 .route-config-grid {
   display: grid;
-  grid-template-columns: 1.1fr 0.82fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 18px;
 }
 
@@ -1615,43 +1640,6 @@ button.danger {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
-}
-
-.model-context-box {
-  border: 1px solid #26394f;
-  border-radius: 14px;
-  background: #151f2d;
-  margin-top: 20px;
-  padding: 18px;
-}
-
-.model-context-grid {
-  display: grid;
-  grid-template-columns: minmax(140px, 1fr) minmax(100px, 0.7fr) minmax(100px, 0.7fr) auto;
-  gap: 10px;
-  margin-top: 16px;
-}
-
-.model-context-grid > span {
-  color: #8390a4;
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.model-context-row {
-  display: contents;
-}
-
-.model-context-row input {
-  width: 100%;
-  height: 38px;
-  min-width: 0;
-  border: 1px solid #24364a;
-  border-radius: 10px;
-  background: #0e151f;
-  color: #f7f9fd;
-  outline: none;
-  padding: 0 12px;
 }
 
 .route-toggle-line,

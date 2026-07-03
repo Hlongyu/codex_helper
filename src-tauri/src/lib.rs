@@ -34,8 +34,9 @@ const DEFAULT_ROUTER_HOST: &str = "127.0.0.1";
 const DEFAULT_ROUTER_PORT: u16 = 18080;
 const DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
 const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
-const DEFAULT_MODEL_CONTEXT_OVERRIDE_WINDOW: i64 = 1_000_000;
-const FALLBACK_CODEX_MODEL_CONTEXT_WINDOW: i64 = 272_000;
+const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
+const CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT: i64 = 243_200;
+const CODEX_MODEL_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
 static ROUTE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_NEW_API_QUOTA_PER_USD: f64 = 500_000.0;
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -51,6 +52,8 @@ struct ProviderConfig {
     #[serde(default)]
     wire_api: ProviderWireApi,
     #[serde(default)]
+    service_tier: String,
+    #[serde(default)]
     connection_test_model: String,
     #[serde(default)]
     allowed_models: Vec<String>,
@@ -64,6 +67,25 @@ struct ProviderConfig {
     balance_query: BalanceQueryConfig,
     #[serde(default)]
     balance_status: Option<BalanceStatus>,
+    #[serde(default)]
+    connection_status: Option<ConnectionStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaudeProviderConfig {
+    id: String,
+    name: String,
+    enabled: bool,
+    base_url: String,
+    api_key: String,
+    #[serde(default)]
+    connection_test_model: String,
+    #[serde(default)]
+    allowed_models: Vec<String>,
+    #[serde(default)]
+    model_mappings: Vec<ModelMapping>,
+    #[serde(default)]
+    provider_pricing: Vec<PricingRule>,
     #[serde(default)]
     connection_status: Option<ConnectionStatus>,
 }
@@ -157,16 +179,6 @@ struct ModelMapping {
     target: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ModelContextOverride {
-    #[serde(default)]
-    model: String,
-    #[serde(default)]
-    context_window: i64,
-    #[serde(default)]
-    auto_compact_token_limit: i64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ProviderWireApi {
@@ -198,8 +210,20 @@ struct RouterConfig {
     port: u16,
     #[serde(default = "default_router_token")]
     local_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ClientTargetConfig {
     #[serde(default)]
-    model_context_overrides: Vec<ModelContextOverride>,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ClientConfigs {
+    #[serde(default)]
+    codex: ClientTargetConfig,
+    #[serde(default)]
+    claude: ClientTargetConfig,
 }
 
 impl Default for RouterConfig {
@@ -209,7 +233,6 @@ impl Default for RouterConfig {
             host: default_router_host(),
             port: default_router_port(),
             local_token: default_router_token(),
-            model_context_overrides: Vec::new(),
         }
     }
 }
@@ -229,6 +252,10 @@ struct ManagerState {
     base_template_name: String,
     base: Value,
     providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    active_claude_provider_id: String,
+    #[serde(default)]
+    claude_providers: Vec<ClaudeProviderConfig>,
     last_applied: Option<Value>,
     #[serde(default)]
     applied_history: Vec<AppliedProviderSnapshot>,
@@ -237,7 +264,11 @@ struct ManagerState {
     #[serde(default)]
     router: RouterConfig,
     #[serde(default)]
+    clients: ClientConfigs,
+    #[serde(default)]
     router_backup: Option<RouterApplyBackup>,
+    #[serde(default)]
+    claude_backup: Option<ClaudeApplyBackup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -248,6 +279,20 @@ struct RouterApplyBackup {
     custom_base_url: RouterFieldBackup,
     #[serde(default)]
     custom_token: RouterFieldBackup,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ClaudeApplyBackup {
+    #[serde(default)]
+    base_url: RouterFieldBackup,
+    #[serde(default)]
+    auth_token: RouterFieldBackup,
+    #[serde(default)]
+    api_key: RouterFieldBackup,
+    #[serde(default)]
+    gateway_model_discovery: RouterFieldBackup,
+    #[serde(default)]
+    default_fable_model: RouterFieldBackup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -490,15 +535,19 @@ struct DiffEntry {
 struct AppState {
     app_version: String,
     codex_config_path: String,
+    claude_settings_path: String,
     manager_dir: String,
     current_config_raw: String,
     current_config_exists: bool,
     active_provider_id: String,
+    active_claude_provider_id: String,
     base_template_name: String,
     base_toml: String,
     base: Value,
     providers: Vec<ProviderSummary>,
+    claude_providers: Vec<ProviderSummary>,
     active_provider: Option<ProviderConfig>,
+    active_claude_provider: Option<ClaudeProviderConfig>,
     active_provider_toml: String,
     desired: Value,
     final_preview_toml: String,
@@ -506,6 +555,7 @@ struct AppState {
     diffs: Vec<DiffEntry>,
     marker_present: bool,
     router: RouterConfig,
+    clients: ClientConfigs,
     router_status: RouterStatus,
 }
 
@@ -521,14 +571,34 @@ struct SaveProviderPayload {
     model_mappings: Option<Vec<ModelMapping>>,
     provider_pricing: Option<Vec<PricingRule>>,
     wire_api: Option<ProviderWireApi>,
+    service_tier: Option<String>,
     enabled: Option<bool>,
     base_url: Option<String>,
     api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+struct SaveClaudeProviderPayload {
+    provider_id: String,
+    provider_name: Option<String>,
+    enabled: Option<bool>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    connection_test_model: Option<String>,
+    allowed_models: Option<Vec<String>>,
+    model_mappings: Option<Vec<ModelMapping>>,
+    provider_pricing: Option<Vec<PricingRule>>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ReorderProvidersPayload {
     provider_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveClientConfigsPayload {
+    codex_enabled: bool,
+    claude_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -543,7 +613,6 @@ struct SaveRouterPayload {
     host: String,
     port: u16,
     local_token: String,
-    model_context_overrides: Option<Vec<ModelContextOverride>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -829,6 +898,13 @@ struct UpstreamCandidate {
     route_order: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ClaudeUpstreamCandidate {
+    provider: ClaudeProviderConfig,
+    base_url: String,
+    token: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RouteRequestLog {
     id: String,
@@ -1042,73 +1118,6 @@ fn default_router_token() -> String {
     random_router_token()
 }
 
-fn default_model_context_override_window() -> i64 {
-    DEFAULT_MODEL_CONTEXT_OVERRIDE_WINDOW
-}
-
-fn normalized_model_context_window(value: i64) -> i64 {
-    if value > 0 {
-        value
-    } else {
-        default_model_context_override_window()
-    }
-}
-
-fn default_auto_compact_for_context(context_window: i64) -> i64 {
-    ((context_window as f64) * 0.95).round().max(1.0) as i64
-}
-
-fn normalized_model_auto_compact_token_limit(value: i64, context_window: i64) -> i64 {
-    if value > 0 && value <= context_window {
-        value
-    } else {
-        default_auto_compact_for_context(context_window)
-    }
-}
-
-fn normalize_model_context_overrides(
-    overrides: Vec<ModelContextOverride>,
-) -> Vec<ModelContextOverride> {
-    let mut seen = BTreeSet::new();
-    let mut normalized = Vec::new();
-    for override_config in overrides {
-        let model = override_config.model.trim();
-        if model.is_empty() {
-            continue;
-        }
-        let key = model.to_lowercase();
-        if !seen.insert(key) {
-            continue;
-        }
-        let context_window = normalized_model_context_window(override_config.context_window);
-        let auto_compact_token_limit = normalized_model_auto_compact_token_limit(
-            override_config.auto_compact_token_limit,
-            context_window,
-        );
-        normalized.push(ModelContextOverride {
-            model: model.to_string(),
-            context_window,
-            auto_compact_token_limit,
-        });
-    }
-    normalized
-}
-
-fn normalize_router_model_context_overrides(router: &mut RouterConfig) {
-    router.model_context_overrides =
-        normalize_model_context_overrides(std::mem::take(&mut router.model_context_overrides));
-}
-
-fn router_model_context_override<'a>(
-    router: &'a RouterConfig,
-    model: &str,
-) -> Option<&'a ModelContextOverride> {
-    router
-        .model_context_overrides
-        .iter()
-        .find(|override_config| override_config.model.eq_ignore_ascii_case(model))
-}
-
 fn default_currency() -> String {
     "USD".to_string()
 }
@@ -1140,6 +1149,10 @@ fn router_address(config: &RouterConfig) -> String {
 
 fn router_base_url(config: &RouterConfig) -> String {
     format!("http://{}/v1", router_address(config))
+}
+
+fn claude_router_base_url(config: &RouterConfig) -> String {
+    format!("http://{}", router_address(config))
 }
 
 fn default_balance_path_for(
@@ -1182,6 +1195,14 @@ fn codex_home() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".codex"))
 }
 
+fn claude_home() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+
+    Ok(home_dir()?.join(".claude"))
+}
+
 fn manager_dir() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("config-manager"))
 }
@@ -1198,6 +1219,10 @@ fn codex_config_path() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("config.toml"))
 }
 
+fn claude_settings_path() -> Result<PathBuf, String> {
+    Ok(claude_home()?.join("settings.json"))
+}
+
 fn sessions_dir() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("sessions"))
 }
@@ -1209,11 +1234,15 @@ fn default_state() -> ManagerState {
         base_template_name: "默认模板".to_string(),
         base: json!({}),
         providers: vec![],
+        active_claude_provider_id: String::new(),
+        claude_providers: vec![],
         last_applied: None,
         applied_history: vec![],
         pricing: default_pricing_rules(),
         router: RouterConfig::default(),
+        clients: ClientConfigs::default(),
         router_backup: None,
+        claude_backup: None,
     }
 }
 
@@ -1286,12 +1315,27 @@ fn ensure_state_file() -> Result<(), String> {
     Ok(())
 }
 
+fn migrate_legacy_clients_if_missing(
+    mut state: ManagerState,
+    clients_missing: bool,
+) -> ManagerState {
+    if clients_missing {
+        state.clients.codex.enabled = state.router.enabled;
+        state.clients.claude.enabled = false;
+    }
+    state
+}
+
 fn load_state_file() -> Result<ManagerState, String> {
     ensure_state_file()?;
     let raw =
         fs::read_to_string(state_path()?).map_err(|err| format!("无法读取状态文件: {err}"))?;
-    let state: ManagerState =
+    let state_value: Value =
         serde_json::from_str(&raw).map_err(|err| format!("状态文件 JSON 无效: {err}"))?;
+    let clients_missing = state_value.get("clients").is_none();
+    let state: ManagerState = serde_json::from_value(state_value.clone())
+        .map_err(|err| format!("状态文件 JSON 无效: {err}"))?;
+    let state = migrate_legacy_clients_if_missing(state, clients_missing);
 
     if is_legacy_seed_state(&state) {
         let state = default_state();
@@ -1321,12 +1365,22 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
         provider.provider_pricing =
             normalize_provider_pricing(std::mem::take(&mut provider.provider_pricing));
     }
+    for provider in &mut state.claude_providers {
+        provider.allowed_models =
+            normalize_model_names(std::mem::take(&mut provider.allowed_models));
+        provider.model_mappings =
+            normalize_model_mappings(std::mem::take(&mut provider.model_mappings));
+        provider.provider_pricing =
+            normalize_provider_pricing(std::mem::take(&mut provider.provider_pricing));
+    }
     if state.router.local_token.trim().is_empty()
         || state.router.local_token == DEFAULT_ROUTER_TOKEN
     {
         state.router.local_token = random_router_token();
     }
-    normalize_router_model_context_overrides(&mut state.router);
+    if state.clients.codex.enabled || state.clients.claude.enabled {
+        state.router.enabled = true;
+    }
     let provider_exists = |provider_id: &str| {
         state
             .providers
@@ -1372,6 +1426,20 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
         state.active_provider_id = state
             .providers
             .first()
+            .map(|provider| provider.id.clone())
+            .unwrap_or_default();
+    }
+    if state.active_claude_provider_id.trim().is_empty()
+        || !state
+            .claude_providers
+            .iter()
+            .any(|provider| provider.id == state.active_claude_provider_id)
+    {
+        state.active_claude_provider_id = state
+            .claude_providers
+            .iter()
+            .find(|provider| provider.enabled)
+            .or_else(|| state.claude_providers.first())
             .map(|provider| provider.id.clone())
             .unwrap_or_default();
     }
@@ -2050,6 +2118,33 @@ fn mapped_model_for_provider(provider: &ProviderConfig, requested_model: &str) -
         .filter(|target| !target.is_empty() && target != requested)
 }
 
+fn claude_provider_accepts_model(provider: &ClaudeProviderConfig, requested_model: &str) -> bool {
+    let requested = requested_model.trim();
+    if requested.is_empty() || requested == "未知模型" || provider.allowed_models.is_empty() {
+        return true;
+    }
+    provider
+        .allowed_models
+        .iter()
+        .any(|model| model.trim().eq_ignore_ascii_case(requested))
+}
+
+fn mapped_model_for_claude_provider(
+    provider: &ClaudeProviderConfig,
+    requested_model: &str,
+) -> Option<String> {
+    let requested = requested_model.trim();
+    if requested.is_empty() || requested == "未知模型" {
+        return None;
+    }
+    provider
+        .model_mappings
+        .iter()
+        .find(|mapping| mapping.source.trim() == requested)
+        .map(|mapping| mapping.target.trim().to_string())
+        .filter(|target| !target.is_empty() && target != requested)
+}
+
 fn redacted_provider(mut provider: ProviderConfig) -> ProviderConfig {
     if let Err(err) = set_json_path(
         &mut provider.config,
@@ -2059,6 +2154,11 @@ fn redacted_provider(mut provider: ProviderConfig) -> ProviderConfig {
         eprintln!("无法脱敏供应商 Token: {err}");
     }
     provider.balance_query.query_token.clear();
+    provider
+}
+
+fn redacted_claude_provider(mut provider: ClaudeProviderConfig) -> ClaudeProviderConfig {
+    provider.api_key.clear();
     provider
 }
 
@@ -2242,6 +2342,24 @@ fn apply_provider_connection_draft(
     Ok(())
 }
 
+fn apply_claude_provider_connection_draft(
+    provider: &mut ClaudeProviderConfig,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    if let Some(base_url) = base_url {
+        let base_url = base_url.trim();
+        if base_url.is_empty() {
+            return Err("Base URL 不能为空".to_string());
+        }
+        provider.base_url = base_url.to_string();
+    }
+    if let Some(api_key) = api_key {
+        provider.api_key = api_key.trim().to_string();
+    }
+    Ok(())
+}
+
 fn status_step(
     key: &str,
     label: &str,
@@ -2286,6 +2404,116 @@ fn models_from_response_value(value: &Value) -> Vec<String> {
     models.sort();
     models.dedup();
     models
+}
+
+fn claude_model_value_from_id(model: &str) -> Value {
+    let model = model.trim();
+    json!({
+        "id": model,
+        "type": "model",
+        "display_name": model,
+        "created_at": "1970-01-01T00:00:00Z",
+    })
+}
+
+fn claude_model_value_from_value(value: &Value) -> Option<Value> {
+    let id = model_id_from_value(value)?;
+    let mut model = match value {
+        Value::Object(object) => Value::Object(object.clone()),
+        _ => Value::Object(Map::new()),
+    };
+    let object = model.as_object_mut()?;
+    object.insert("id".to_string(), Value::String(id.clone()));
+    object
+        .entry("type".to_string())
+        .or_insert_with(|| Value::String("model".to_string()));
+    object
+        .entry("display_name".to_string())
+        .or_insert_with(|| Value::String(id.clone()));
+    object
+        .entry("created_at".to_string())
+        .or_insert_with(|| Value::String("1970-01-01T00:00:00Z".to_string()));
+    Some(model)
+}
+
+fn push_claude_model_value(models: &mut Vec<Value>, seen: &mut BTreeSet<String>, model: Value) {
+    let Some(id) = model_id_from_value(&model) else {
+        return;
+    };
+    if seen.insert(id.to_lowercase()) {
+        models.push(model);
+    }
+}
+
+fn claude_model_values_from_response_value(value: &Value) -> Vec<Value> {
+    let model_values = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .unwrap_or(value);
+    let mut seen = BTreeSet::new();
+    let mut models = Vec::new();
+    for value in model_values.as_array().into_iter().flatten() {
+        if let Some(model) = claude_model_value_from_value(value) {
+            push_claude_model_value(&mut models, &mut seen, model);
+        }
+    }
+    models
+}
+
+fn claude_route_model_values(
+    provider: &ClaudeProviderConfig,
+    upstream_models: &[Value],
+) -> Vec<Value> {
+    let mut seen = BTreeSet::new();
+    let mut models = Vec::new();
+
+    if provider.allowed_models.is_empty() {
+        for model in upstream_models {
+            push_claude_model_value(&mut models, &mut seen, model.clone());
+        }
+        for mapping in &provider.model_mappings {
+            if !mapping.source.trim().is_empty() && !mapping.target.trim().is_empty() {
+                push_claude_model_value(
+                    &mut models,
+                    &mut seen,
+                    claude_model_value_from_id(&mapping.source),
+                );
+            }
+        }
+        return models;
+    }
+
+    for allowed_model in &provider.allowed_models {
+        let allowed_model = allowed_model.trim();
+        if allowed_model.is_empty() {
+            continue;
+        }
+        let upstream_model = upstream_models.iter().find(|model| {
+            model_id_from_value(model).is_some_and(|id| id.eq_ignore_ascii_case(allowed_model))
+        });
+        push_claude_model_value(
+            &mut models,
+            &mut seen,
+            upstream_model
+                .cloned()
+                .unwrap_or_else(|| claude_model_value_from_id(allowed_model)),
+        );
+    }
+
+    models
+}
+
+fn claude_models_value(models: Vec<Value>) -> Value {
+    let ids = models
+        .iter()
+        .filter_map(model_id_from_value)
+        .collect::<Vec<_>>();
+    json!({
+        "data": models,
+        "first_id": ids.first().cloned(),
+        "last_id": ids.last().cloned(),
+        "has_more": false,
+    })
 }
 
 async fn run_provider_connection_test(
@@ -2490,6 +2718,61 @@ async fn fetch_provider_models(provider: &ProviderConfig) -> Result<(Vec<String>
         .await
         .map_err(|err| format!("/models 响应不是有效 JSON: {err}"))?;
     Ok((models_from_response_value(&value), latency_ms))
+}
+
+async fn fetch_claude_provider_model_values(
+    client: &reqwest::Client,
+    provider: &ClaudeProviderConfig,
+) -> Result<(Vec<Value>, u64), String> {
+    let base_url = provider.base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err("Base URL 为空".to_string());
+    }
+    let token = provider.api_key.trim();
+    if token.is_empty() {
+        return Err("API Key 为空".to_string());
+    }
+
+    let upstream_path = claude_upstream_path("models");
+    let models_url = join_url(base_url, &upstream_path);
+    let started = Instant::now();
+    let response = client
+        .get(&models_url)
+        .header("x-api-key", token)
+        .header("anthropic-version", "2023-06-01")
+        .header("accept", "application/json")
+        .send()
+        .await
+        .map_err(|err| format!("请求 Claude 模型列表失败: {err}"))?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(format!("鉴权失败 HTTP {}", status.as_u16()));
+    }
+    if !status.is_success() {
+        return Err(format!("Claude 模型列表返回 HTTP {}", status.as_u16()));
+    }
+
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|err| format!("Claude 模型列表响应不是有效 JSON: {err}"))?;
+    Ok((claude_model_values_from_response_value(&value), latency_ms))
+}
+
+async fn fetch_claude_provider_models(
+    provider: &ClaudeProviderConfig,
+) -> Result<(Vec<String>, u64), String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|err| format!("创建 HTTP 客户端失败: {err}"))?;
+    let (models, latency_ms) = fetch_claude_provider_model_values(&client, provider).await?;
+    Ok((
+        models.iter().filter_map(model_id_from_value).collect(),
+        latency_ms,
+    ))
 }
 
 fn connection_latency_from_test(result: &ProviderConnectionTestResult) -> Option<u64> {
@@ -2863,8 +3146,192 @@ fn router_patch_matches_current(current_json: &Value, router: &RouterConfig) -> 
         .all(|(path, desired)| current_flat.get(path) == Some(desired))
 }
 
+fn read_claude_settings() -> Result<(Value, String, bool), String> {
+    let path = claude_settings_path()?;
+    if !path.exists() {
+        return Ok((Value::Object(Map::new()), String::new(), false));
+    }
+
+    let raw = fs::read_to_string(&path).map_err(|err| format!("无法读取 Claude 设置: {err}"))?;
+    let settings = serde_json::from_str::<Value>(&raw)
+        .map_err(|err| format!("Claude 设置 JSON 无效: {err}"))?;
+    if !settings.is_object() {
+        return Err("Claude 设置 JSON 顶层必须是对象".to_string());
+    }
+    Ok((settings, raw, true))
+}
+
+fn json_env_value(settings: &Value, key: &str) -> Option<Value> {
+    settings
+        .get("env")
+        .and_then(Value::as_object)
+        .and_then(|env| env.get(key))
+        .cloned()
+}
+
+fn capture_json_env_field(settings: &Value, key: &str) -> RouterFieldBackup {
+    let value = json_env_value(settings, key);
+    RouterFieldBackup {
+        existed: value.is_some(),
+        value,
+    }
+}
+
+fn ensure_settings_object(value: &mut Value) -> Result<&mut Map<String, Value>, String> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| "Claude 设置 JSON 顶层必须是对象".to_string())
+}
+
+fn ensure_env_object(settings: &mut Value) -> Result<&mut Map<String, Value>, String> {
+    let settings = ensure_settings_object(settings)?;
+    let entry = settings
+        .entry("env".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(Map::new());
+    }
+    entry
+        .as_object_mut()
+        .ok_or_else(|| "Claude 设置 env 必须是对象".to_string())
+}
+
+fn set_json_env_field(settings: &mut Value, key: &str, value: Value) -> Result<(), String> {
+    ensure_env_object(settings)?.insert(key.to_string(), value);
+    Ok(())
+}
+
+fn restore_json_env_field(
+    settings: &mut Value,
+    key: &str,
+    backup: &RouterFieldBackup,
+) -> Result<(), String> {
+    if backup.existed {
+        if let Some(value) = backup.value.as_ref() {
+            set_json_env_field(settings, key, value.clone())?;
+        } else {
+            ensure_env_object(settings)?.remove(key);
+        }
+    } else {
+        ensure_env_object(settings)?.remove(key);
+    }
+    Ok(())
+}
+
+fn capture_claude_backup(settings: &Value) -> ClaudeApplyBackup {
+    ClaudeApplyBackup {
+        base_url: capture_json_env_field(settings, "ANTHROPIC_BASE_URL"),
+        auth_token: capture_json_env_field(settings, "ANTHROPIC_AUTH_TOKEN"),
+        api_key: capture_json_env_field(settings, "ANTHROPIC_API_KEY"),
+        gateway_model_discovery: capture_json_env_field(
+            settings,
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+        ),
+        default_fable_model: capture_json_env_field(settings, "ANTHROPIC_DEFAULT_FABLE_MODEL"),
+    }
+}
+
+fn claude_patch_desired(router: &RouterConfig) -> Value {
+    json!({
+        "ANTHROPIC_BASE_URL": claude_router_base_url(router),
+        "ANTHROPIC_API_KEY": router.local_token,
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5",
+    })
+}
+
+fn claude_patch_matches_current(settings: &Value, router: &RouterConfig) -> bool {
+    if json_env_value(settings, "ANTHROPIC_AUTH_TOKEN").is_some() {
+        return false;
+    }
+    let desired = claude_patch_desired(router);
+    let Some(desired) = desired.as_object() else {
+        return false;
+    };
+    desired
+        .iter()
+        .all(|(key, value)| json_env_value(settings, key) == Some(value.clone()))
+}
+
+fn render_claude_patch_json(mut settings: Value, router: &RouterConfig) -> Result<String, String> {
+    set_json_env_field(
+        &mut settings,
+        "ANTHROPIC_BASE_URL",
+        Value::String(claude_router_base_url(router)),
+    )?;
+    ensure_env_object(&mut settings)?.remove("ANTHROPIC_AUTH_TOKEN");
+    set_json_env_field(
+        &mut settings,
+        "ANTHROPIC_API_KEY",
+        Value::String(router.local_token.clone()),
+    )?;
+    set_json_env_field(
+        &mut settings,
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+        Value::String("1".to_string()),
+    )?;
+    set_json_env_field(
+        &mut settings,
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        Value::String("claude-fable-5".to_string()),
+    )?;
+    serde_json::to_string_pretty(&settings).map_err(|err| format!("无法生成 Claude 设置: {err}"))
+}
+
+fn restore_claude_backup_json(
+    mut settings: Value,
+    backup: Option<&ClaudeApplyBackup>,
+    router: &RouterConfig,
+) -> Result<String, String> {
+    if let Some(backup) = backup {
+        restore_json_env_field(&mut settings, "ANTHROPIC_BASE_URL", &backup.base_url)?;
+        restore_json_env_field(&mut settings, "ANTHROPIC_AUTH_TOKEN", &backup.auth_token)?;
+        restore_json_env_field(&mut settings, "ANTHROPIC_API_KEY", &backup.api_key)?;
+        restore_json_env_field(
+            &mut settings,
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+            &backup.gateway_model_discovery,
+        )?;
+        restore_json_env_field(
+            &mut settings,
+            "ANTHROPIC_DEFAULT_FABLE_MODEL",
+            &backup.default_fable_model,
+        )?;
+    } else {
+        let desired = claude_patch_desired(router);
+        if json_env_value(&settings, "ANTHROPIC_BASE_URL")
+            == desired.get("ANTHROPIC_BASE_URL").cloned()
+        {
+            ensure_env_object(&mut settings)?.remove("ANTHROPIC_BASE_URL");
+        }
+        if json_env_value(&settings, "ANTHROPIC_AUTH_TOKEN")
+            == Some(Value::String(router.local_token.clone()))
+        {
+            ensure_env_object(&mut settings)?.remove("ANTHROPIC_AUTH_TOKEN");
+        }
+        if json_env_value(&settings, "ANTHROPIC_API_KEY")
+            == desired.get("ANTHROPIC_API_KEY").cloned()
+        {
+            ensure_env_object(&mut settings)?.remove("ANTHROPIC_API_KEY");
+        }
+        if json_env_value(&settings, "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY")
+            == desired
+                .get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY")
+                .cloned()
+        {
+            ensure_env_object(&mut settings)?.remove("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY");
+        }
+        if json_env_value(&settings, "ANTHROPIC_DEFAULT_FABLE_MODEL")
+            == desired.get("ANTHROPIC_DEFAULT_FABLE_MODEL").cloned()
+        {
+            ensure_env_object(&mut settings)?.remove("ANTHROPIC_DEFAULT_FABLE_MODEL");
+        }
+    }
+    serde_json::to_string_pretty(&settings).map_err(|err| format!("无法生成 Claude 设置: {err}"))
+}
+
 fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String> {
-    if !state.router.enabled {
+    if !state.clients.codex.enabled {
         return Ok(false);
     }
 
@@ -2890,6 +3357,35 @@ fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String
     state.last_applied = Some(desired);
     state.applied_provider_id = None;
     Ok(true)
+}
+
+fn ensure_claude_config_applied(state: &mut ManagerState) -> Result<bool, String> {
+    if !state.clients.claude.enabled {
+        return Ok(false);
+    }
+
+    let (settings, _, _) = read_claude_settings()?;
+    if claude_patch_matches_current(&settings, &state.router) {
+        return Ok(false);
+    }
+
+    if state.claude_backup.is_none() {
+        state.claude_backup = Some(capture_claude_backup(&settings));
+    }
+    fs::create_dir_all(claude_home()?).map_err(|err| format!("无法创建 Claude 设置目录: {err}"))?;
+    let raw = render_claude_patch_json(settings, &state.router)?;
+    fs::write(claude_settings_path()?, raw)
+        .map_err(|err| format!("无法写入 Claude 设置: {err}"))?;
+    Ok(true)
+}
+
+fn ensure_client_configs_applied(state: &mut ManagerState) -> Result<bool, String> {
+    if state.clients.codex.enabled || state.clients.claude.enabled {
+        state.router.enabled = true;
+    }
+    let codex_changed = ensure_router_config_applied(state)?;
+    let claude_changed = ensure_claude_config_applied(state)?;
+    Ok(codex_changed || claude_changed)
 }
 
 fn compute_diffs(
@@ -2994,13 +3490,45 @@ fn upstream_candidates() -> Result<(RouterConfig, Vec<UpstreamCandidate>), Strin
     Ok((state.router, candidates))
 }
 
+fn upstream_claude_candidates() -> Result<(RouterConfig, Vec<ClaudeUpstreamCandidate>), String> {
+    let state = load_state_file()?;
+    if !state.router.enabled {
+        return Err("本地路由未启用".to_string());
+    }
+    if !state.clients.claude.enabled {
+        return Err("Claude 接管未启用".to_string());
+    }
+    let candidates = state
+        .claude_providers
+        .iter()
+        .filter(|provider| provider.enabled)
+        .filter_map(|provider| {
+            let base_url = provider.base_url.trim().trim_end_matches('/');
+            let token = provider.api_key.trim();
+            if base_url.is_empty() || token.is_empty() {
+                return None;
+            }
+            Some(ClaudeUpstreamCandidate {
+                provider: provider.clone(),
+                base_url: base_url.to_string(),
+                token: token.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return Err("没有已启用且配置完整的 Claude 供应商".to_string());
+    }
+    Ok((state.router, candidates))
+}
+
 fn configured_route_models(candidates: &[UpstreamCandidate]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut models = Vec::new();
     for candidate in candidates {
         for model in &candidate.provider.allowed_models {
             let model = model.trim();
-            if model.is_empty() {
+            if model.is_empty() || model.eq_ignore_ascii_case("gpt-image-2") {
                 continue;
             }
             let key = model.to_lowercase();
@@ -3101,7 +3629,26 @@ fn fallback_codex_model_catalog_entry(model: &str) -> Value {
     })
 }
 
-fn codex_model_catalog_entry(model: &str, templates: &[Value], router: &RouterConfig) -> Value {
+fn apply_codex_model_context_fields(object: &mut Map<String, Value>) {
+    object.insert(
+        "context_window".to_string(),
+        Value::Number(CODEX_MODEL_CONTEXT_WINDOW.into()),
+    );
+    object.insert(
+        "max_context_window".to_string(),
+        Value::Number(CODEX_MODEL_CONTEXT_WINDOW.into()),
+    );
+    object.insert(
+        "auto_compact_token_limit".to_string(),
+        Value::Number(CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT.into()),
+    );
+    object.insert(
+        "effective_context_window_percent".to_string(),
+        Value::Number(CODEX_MODEL_EFFECTIVE_CONTEXT_WINDOW_PERCENT.into()),
+    );
+}
+
+fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Value {
     let mut entry = templates
         .iter()
         .find(|entry| {
@@ -3128,52 +3675,7 @@ fn codex_model_catalog_entry(model: &str, templates: &[Value], router: &RouterCo
     if let Some(object) = entry.as_object_mut() {
         object.insert("slug".to_string(), Value::String(model.to_string()));
         object.insert("display_name".to_string(), Value::String(model.to_string()));
-        if let Some(override_config) = router_model_context_override(router, model) {
-            let context_window = normalized_model_context_window(override_config.context_window);
-            let auto_compact_token_limit = normalized_model_auto_compact_token_limit(
-                override_config.auto_compact_token_limit,
-                context_window,
-            );
-            object.insert(
-                "context_window".to_string(),
-                Value::Number(context_window.into()),
-            );
-            object.insert(
-                "max_context_window".to_string(),
-                Value::Number(context_window.into()),
-            );
-            object.insert(
-                "auto_compact_token_limit".to_string(),
-                Value::Number(auto_compact_token_limit.into()),
-            );
-            let effective_context_window_percent =
-                ((auto_compact_token_limit as f64 / context_window as f64) * 100.0)
-                    .round()
-                    .clamp(1.0, 100.0) as i64;
-            object.insert(
-                "effective_context_window_percent".to_string(),
-                Value::Number(effective_context_window_percent.into()),
-            );
-        } else if !object.contains_key("context_window") {
-            object.insert(
-                "context_window".to_string(),
-                Value::Number(FALLBACK_CODEX_MODEL_CONTEXT_WINDOW.into()),
-            );
-            object.insert(
-                "max_context_window".to_string(),
-                Value::Number(FALLBACK_CODEX_MODEL_CONTEXT_WINDOW.into()),
-            );
-            object.insert(
-                "auto_compact_token_limit".to_string(),
-                Value::Number(
-                    default_auto_compact_for_context(FALLBACK_CODEX_MODEL_CONTEXT_WINDOW).into(),
-                ),
-            );
-            object.insert(
-                "effective_context_window_percent".to_string(),
-                Value::Number(95.into()),
-            );
-        }
+        apply_codex_model_context_fields(object);
         object.insert("visibility".to_string(), Value::String("list".to_string()));
         object.insert("supported_in_api".to_string(), Value::Bool(true));
     }
@@ -3181,21 +3683,17 @@ fn codex_model_catalog_entry(model: &str, templates: &[Value], router: &RouterCo
     entry
 }
 
-fn codex_models_catalog_value_with_templates(
-    models: Vec<String>,
-    templates: &[Value],
-    router: &RouterConfig,
-) -> Value {
+fn codex_models_catalog_value_with_templates(models: Vec<String>, templates: &[Value]) -> Value {
     let models = models
         .into_iter()
-        .map(|model| codex_model_catalog_entry(&model, templates, router))
+        .map(|model| codex_model_catalog_entry(&model, templates))
         .collect::<Vec<_>>();
     json!({ "models": models })
 }
 
-fn codex_models_catalog_value(models: Vec<String>, router: &RouterConfig) -> Value {
+fn codex_models_catalog_value(models: Vec<String>) -> Value {
     let templates = load_codex_model_catalog_templates();
-    codex_models_catalog_value_with_templates(models, &templates, router)
+    codex_models_catalog_value_with_templates(models, &templates)
 }
 
 fn json_response(value: Value) -> Response {
@@ -3210,8 +3708,12 @@ fn models_response(models: Vec<String>) -> Response {
     json_response(openai_models_value(models))
 }
 
-fn codex_models_response(models: Vec<String>, router: &RouterConfig) -> Response {
-    json_response(codex_models_catalog_value(models, router))
+fn codex_models_response(models: Vec<String>) -> Response {
+    json_response(codex_models_catalog_value(models))
+}
+
+fn claude_models_response(models: Vec<Value>) -> Response {
+    json_response(claude_models_value(models))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -3219,6 +3721,16 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     value
         .strip_prefix("Bearer ")
         .or_else(|| value.strip_prefix("bearer "))
+}
+
+fn local_proxy_token(headers: &HeaderMap) -> Option<&str> {
+    bearer_token(headers).or_else(|| headers.get("x-api-key")?.to_str().ok().map(str::trim))
+}
+
+fn claude_models_request(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-api-key")
+        || headers.contains_key("anthropic-version")
+        || headers.contains_key("anthropic-beta")
 }
 
 fn model_from_request_body(body: &[u8]) -> String {
@@ -3234,23 +3746,36 @@ fn model_from_request_body(body: &[u8]) -> String {
         .unwrap_or_else(|| "未知模型".to_string())
 }
 
-fn body_with_mapped_model(body: &[u8], mapped_model: Option<&str>) -> Bytes {
-    let Some(mapped_model) = mapped_model
+fn body_with_provider_overrides(
+    body: &[u8],
+    mapped_model: Option<&str>,
+    service_tier: Option<&str>,
+) -> Bytes {
+    let mapped_model = mapped_model
         .map(str::trim)
-        .filter(|model| !model.is_empty())
-    else {
+        .filter(|model| !model.is_empty());
+    let service_tier = service_tier.map(str::trim).filter(|tier| !tier.is_empty());
+    if mapped_model.is_none() && service_tier.is_none() {
         return Bytes::copy_from_slice(body);
-    };
+    }
     let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
         return Bytes::copy_from_slice(body);
     };
     let Some(object) = value.as_object_mut() else {
         return Bytes::copy_from_slice(body);
     };
-    if !object.get("model").is_some_and(Value::is_string) {
-        return Bytes::copy_from_slice(body);
+    if let Some(mapped_model) = mapped_model {
+        if !object.get("model").is_some_and(Value::is_string) {
+            return Bytes::copy_from_slice(body);
+        }
+        object.insert("model".to_string(), Value::String(mapped_model.to_string()));
     }
-    object.insert("model".to_string(), Value::String(mapped_model.to_string()));
+    if let Some(service_tier) = service_tier {
+        object.insert(
+            "service_tier".to_string(),
+            Value::String(service_tier.to_string()),
+        );
+    }
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .unwrap_or_else(|_| Bytes::copy_from_slice(body))
@@ -3264,10 +3789,12 @@ fn prepare_upstream_request(
     requested_model: &str,
 ) -> Result<PreparedUpstreamRequest, String> {
     let upstream_model = mapped_model_for_provider(provider, requested_model);
+    let service_tier = provider.service_tier.as_str();
     if provider.wire_api == ProviderWireApi::ChatCompletions
         && path.trim_matches('/') == "responses"
     {
-        let (body, tool_context) = responses_to_chat_request_body(body, upstream_model.as_deref())?;
+        let (body, tool_context) =
+            responses_to_chat_request_body(body, upstream_model.as_deref(), Some(service_tier))?;
         Ok(PreparedUpstreamRequest {
             path: "chat/completions".to_string(),
             query: String::new(),
@@ -3280,7 +3807,7 @@ fn prepare_upstream_request(
         Ok(PreparedUpstreamRequest {
             path: path.to_string(),
             query: query.to_string(),
-            body: body_with_mapped_model(body, upstream_model.as_deref()),
+            body: body_with_provider_overrides(body, upstream_model.as_deref(), Some(service_tier)),
             adapter: ResponseAdapter::Passthrough,
             upstream_model,
             tool_context: CodexToolContext::default(),
@@ -3897,6 +4424,7 @@ fn responses_tool_choice_to_chat(
 fn responses_to_chat_request_body(
     body: &[u8],
     mapped_model: Option<&str>,
+    service_tier: Option<&str>,
 ) -> Result<(Bytes, CodexToolContext), String> {
     let mut value = serde_json::from_slice::<Value>(body)
         .map_err(|err| format!("Responses 请求体不是有效 JSON: {err}"))?;
@@ -3949,10 +4477,17 @@ fn responses_to_chat_request_body(
         ("presence_penalty", "presence_penalty"),
         ("frequency_penalty", "frequency_penalty"),
         ("seed", "seed"),
+        ("service_tier", "service_tier"),
     ] {
         if let Some(value) = object.get(from) {
             chat.insert(to.to_string(), value.clone());
         }
+    }
+    if let Some(service_tier) = service_tier.map(str::trim).filter(|tier| !tier.is_empty()) {
+        chat.insert(
+            "service_tier".to_string(),
+            Value::String(service_tier.to_string()),
+        );
     }
     if object
         .get("stream")
@@ -5112,6 +5647,197 @@ impl futures_util::Stream for ChatToResponsesStreamState {
     }
 }
 
+fn claude_upstream_path(path: &str) -> String {
+    path.trim().trim_start_matches('/').to_string()
+}
+
+fn copy_upstream_headers(builder: &mut axum::http::response::Builder, headers: &HeaderMap) {
+    if let Some(headers_mut) = builder.headers_mut() {
+        for (name, value) in headers.iter() {
+            if name == CONTENT_LENGTH || is_hop_by_hop_header(name) {
+                continue;
+            }
+            if let (Ok(header_name), Ok(header_value)) = (
+                HeaderName::from_bytes(name.as_str().as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                headers_mut.insert(header_name, header_value);
+            }
+        }
+    }
+}
+
+async fn proxy_claude_models(proxy_state: Arc<ProxyState>, headers: HeaderMap) -> Response {
+    let (router, candidates) = match upstream_claude_candidates() {
+        Ok(config) => config,
+        Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
+    };
+    if local_proxy_token(&headers) != Some(router.local_token.trim()) {
+        return proxy_error(StatusCode::UNAUTHORIZED, "本地路由 Token 无效");
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut models = Vec::new();
+    let mut last_error = String::new();
+    let mut upstream_success = false;
+
+    for candidate in candidates {
+        let upstream_models = match fetch_claude_provider_model_values(
+            &proxy_state.client,
+            &candidate.provider,
+        )
+        .await
+        {
+            Ok((models, _)) => {
+                upstream_success = true;
+                models
+            }
+            Err(err) => {
+                last_error = format!("读取 {} 模型失败: {err}", candidate.provider.name);
+                Vec::new()
+            }
+        };
+
+        for model in claude_route_model_values(&candidate.provider, &upstream_models) {
+            push_claude_model_value(&mut models, &mut seen, model);
+        }
+    }
+
+    if models.is_empty() && !upstream_success && !last_error.is_empty() {
+        return proxy_error(StatusCode::BAD_GATEWAY, last_error);
+    }
+
+    claude_models_response(models)
+}
+
+async fn proxy_claude_request(
+    proxy_state: Arc<ProxyState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    path: String,
+    body: Body,
+) -> Response {
+    let (router, candidates) = match upstream_claude_candidates() {
+        Ok(config) => config,
+        Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
+    };
+    if local_proxy_token(&headers) != Some(router.local_token.trim()) {
+        return proxy_error(StatusCode::UNAUTHORIZED, "本地路由 Token 无效");
+    }
+
+    let query = uri
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    let body_bytes = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
+    };
+    let model = model_from_request_body(&body_bytes);
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("请求方法无效: {err}")),
+    };
+    let candidates = candidates
+        .iter()
+        .filter(|candidate| claude_provider_accepts_model(&candidate.provider, &model))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return proxy_error(
+            StatusCode::BAD_GATEWAY,
+            if model.trim().is_empty() || model == "未知模型" {
+                "没有可用的 Claude 上游供应商".to_string()
+            } else {
+                format!("没有可用的 Claude 上游供应商支持模型: {model}")
+            },
+        );
+    }
+
+    let mut last_error = String::new();
+    for (attempt_index, candidate) in candidates.iter().enumerate() {
+        let upstream_model = mapped_model_for_claude_provider(&candidate.provider, &model);
+        let prepared_body =
+            body_with_provider_overrides(&body_bytes, upstream_model.as_deref(), None);
+        let upstream_path = claude_upstream_path(&path);
+        let upstream_url = join_url(&candidate.base_url, &upstream_path) + &query;
+        let mut request = proxy_state
+            .client
+            .request(reqwest_method.clone(), upstream_url)
+            .body(prepared_body);
+
+        for (name, value) in headers.iter() {
+            if name == AUTHORIZATION
+                || name == HOST
+                || name == CONTENT_LENGTH
+                || name.as_str().eq_ignore_ascii_case("x-api-key")
+                || is_hop_by_hop_header(name)
+            {
+                continue;
+            }
+            request = request.header(name.as_str(), value.as_bytes());
+        }
+        request = request.header("x-api-key", candidate.token.clone());
+
+        let upstream = match request.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                last_error = format!("转发到 {} 失败: {err}", candidate.provider.name);
+                if attempt_index + 1 < candidates.len() {
+                    continue;
+                }
+                return proxy_error(StatusCode::BAD_GATEWAY, last_error);
+            }
+        };
+
+        let status =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let should_retry =
+            matches!(status.as_u16(), 429 | 500..=599) && attempt_index + 1 < candidates.len();
+        if should_retry {
+            last_error = format!("{} 返回 {}", candidate.provider.name, status.as_u16());
+            continue;
+        }
+
+        let content_type = upstream
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_lowercase();
+        let response_headers = upstream.headers().clone();
+        let mut builder = Response::builder().status(status);
+        copy_upstream_headers(&mut builder, &response_headers);
+        if content_type.contains("text/event-stream") {
+            let stream = upstream
+                .bytes_stream()
+                .map(|result| result.map_err(std::io::Error::other));
+            return builder
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"));
+        }
+
+        let bytes = match upstream.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return proxy_error(StatusCode::BAD_GATEWAY, format!("读取上游响应失败: {err}"));
+            }
+        };
+        return builder
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"));
+    }
+
+    proxy_error(
+        StatusCode::BAD_GATEWAY,
+        if last_error.is_empty() {
+            "没有可用的 Claude 上游供应商".to_string()
+        } else {
+            last_error
+        },
+    )
+}
+
 async fn proxy_request(
     AxumState(proxy_state): AxumState<Arc<ProxyState>>,
     method: Method,
@@ -5120,6 +5846,16 @@ async fn proxy_request(
     Path(path): Path<String>,
     body: Body,
 ) -> Response {
+    if method == Method::GET
+        && path.trim_matches('/') == "models"
+        && claude_models_request(&headers)
+    {
+        return proxy_claude_models(proxy_state, headers).await;
+    }
+    if path.trim_matches('/') == "messages" {
+        return proxy_claude_request(proxy_state, method, uri, headers, path, body).await;
+    }
+
     let request_started = Instant::now();
     let request_started_at_ms = current_epoch_ms().unwrap_or_default();
     let (router, candidates) = match upstream_candidates() {
@@ -5133,7 +5869,7 @@ async fn proxy_request(
         let models = configured_route_models(&candidates);
         if !models.is_empty() {
             return if codex_model_catalog_requested(uri.query()) {
-                codex_models_response(models, &router)
+                codex_models_response(models)
             } else {
                 models_response(models)
             };
@@ -7322,7 +8058,13 @@ fn build_usage_stats_from_cache(
 fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppState, String> {
     let provider = active_provider(&state);
     let redacted_active_provider = provider.clone().map(redacted_provider);
-    let desired = if state.router.enabled {
+    let redacted_active_claude_provider = state
+        .claude_providers
+        .iter()
+        .find(|provider| provider.id == state.active_claude_provider_id)
+        .cloned()
+        .map(redacted_claude_provider);
+    let desired = if state.clients.codex.enabled {
         router_patch_desired(&state.router)
     } else {
         provider
@@ -7332,7 +8074,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
     };
     let (doc, marker_present, current_config_raw, current_config_exists) = read_current_toml()?;
     let current_json = toml_doc_to_json(&doc);
-    let final_preview_toml = if state.router.enabled {
+    let final_preview_toml = if state.clients.codex.enabled {
         render_router_patch_toml(doc, marker_present, &state.router)?
     } else {
         current_config_raw.clone()
@@ -7361,7 +8103,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
         .iter()
         .enumerate()
         .map(|(index, provider)| {
-            let provider_desired = if state.router.enabled {
+            let provider_desired = if state.clients.codex.enabled {
                 desired.clone()
             } else {
                 desired_config(&state, Some(provider))
@@ -7404,29 +8146,67 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
         })
         .collect();
 
+    let claude_providers = state
+        .claude_providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| {
+            let connection_status = provider.connection_status.as_ref();
+            ProviderSummary {
+                id: provider.id.clone(),
+                name: provider.name.clone(),
+                enabled: provider.enabled,
+                pending_changes: 0,
+                base_url: provider.base_url.clone(),
+                provider_type: "Claude".to_string(),
+                route_order: index + 1,
+                balance_label: "不适用".to_string(),
+                balance_error: None,
+                latency_ms: connection_status.and_then(|status| status.latency_ms),
+                latency_label: connection_status
+                    .and_then(|status| status.latency_ms)
+                    .map(|latency_ms| format!("{latency_ms} ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+                latency_error: connection_status.and_then(|status| status.error.clone()),
+                provider_today_cost: 0.0,
+                provider_month_cost: 0.0,
+                provider_currency: default_currency(),
+                provider_pricing_count: provider.provider_pricing.len(),
+                pricing_sync_ok: false,
+                pricing_sync_label: "未同步".to_string(),
+                pricing_sync_error: None,
+            }
+        })
+        .collect();
+
     Ok(AppState {
         app_version: env!("CODEX_HELPER_VERSION").to_string(),
         codex_config_path: codex_config_path()?.display().to_string(),
+        claude_settings_path: claude_settings_path()?.display().to_string(),
         manager_dir: manager_dir()?.display().to_string(),
         current_config_raw: redacted_toml_text(&current_config_raw),
         current_config_exists,
         active_provider_id: state.active_provider_id,
+        active_claude_provider_id: state.active_claude_provider_id,
         base_template_name: state.base_template_name,
         base_toml: redacted_toml_text(&json_to_toml_text(&state.base)?),
         base: redacted_config_value(state.base),
         providers,
+        claude_providers,
         active_provider_toml: redacted_active_provider
             .as_ref()
             .map(|provider| json_to_toml_text(&provider.config))
             .transpose()?
             .unwrap_or_default(),
         active_provider: redacted_active_provider,
+        active_claude_provider: redacted_active_claude_provider,
         desired: redacted_config_value(desired.clone()),
         final_preview_toml: redacted_toml_text(&final_preview_toml),
         summary,
         diffs: redacted_diffs,
         marker_present,
         router: state.router.clone(),
+        clients: state.clients.clone(),
         router_status: router_status(runtime, &state.router),
     })
 }
@@ -7434,7 +8214,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
 #[tauri::command]
 fn load_app_state(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState, String> {
     let mut state = load_state_file()?;
-    if ensure_router_config_applied(&mut state)? {
+    if ensure_client_configs_applied(&mut state)? {
         save_state(&state)?;
     }
     build_app_state(state, &router_runtime)
@@ -7470,6 +8250,16 @@ fn get_provider(provider_id: String) -> Result<ProviderConfig, String> {
 }
 
 #[tauri::command]
+fn get_claude_provider(provider_id: String) -> Result<ClaudeProviderConfig, String> {
+    load_state_file()?
+        .claude_providers
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
+        .map(redacted_claude_provider)
+        .ok_or_else(|| "Claude 供应商不存在".to_string())
+}
+
+#[tauri::command]
 fn save_provider(
     payload: SaveProviderPayload,
     router_runtime: tauri::State<RouterRuntime>,
@@ -7501,6 +8291,9 @@ fn save_provider(
     if let Some(wire_api) = payload.wire_api {
         provider.wire_api = wire_api;
     }
+    if let Some(service_tier) = payload.service_tier {
+        provider.service_tier = service_tier.trim().to_string();
+    }
     if let Some(model_mappings) = payload.model_mappings {
         provider.model_mappings = normalize_model_mappings(model_mappings);
     }
@@ -7527,7 +8320,52 @@ fn save_provider(
                 .flatten()
         });
     }
-    ensure_router_config_applied(&mut state)?;
+    ensure_client_configs_applied(&mut state)?;
+    save_state(&state)?;
+    build_app_state(state, &router_runtime)
+}
+
+#[tauri::command]
+fn save_claude_provider(
+    payload: SaveClaudeProviderPayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
+    let provider = state
+        .claude_providers
+        .iter_mut()
+        .find(|provider| provider.id == payload.provider_id)
+        .ok_or_else(|| "Claude 供应商不存在".to_string())?;
+
+    if let Some(name) = payload.provider_name.as_deref() {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("Claude 供应商名称不能为空".to_string());
+        }
+        provider.name = trimmed.to_string();
+    }
+    if let Some(enabled) = payload.enabled {
+        provider.enabled = enabled;
+    }
+    if let Some(base_url) = payload.base_url {
+        provider.base_url = base_url.trim().trim_end_matches('/').to_string();
+    }
+    if let Some(api_key) = payload.api_key {
+        provider.api_key = api_key.trim().to_string();
+    }
+    if let Some(connection_test_model) = payload.connection_test_model {
+        provider.connection_test_model = connection_test_model.trim().to_string();
+    }
+    if let Some(allowed_models) = payload.allowed_models {
+        provider.allowed_models = normalize_model_names(allowed_models);
+    }
+    if let Some(model_mappings) = payload.model_mappings {
+        provider.model_mappings = normalize_model_mappings(model_mappings);
+    }
+    if let Some(provider_pricing) = payload.provider_pricing {
+        provider.provider_pricing = normalize_provider_pricing(provider_pricing);
+    }
+
     save_state(&state)?;
     build_app_state(state, &router_runtime)
 }
@@ -7576,6 +8414,49 @@ fn reorder_providers(
 }
 
 #[tauri::command]
+fn reorder_claude_providers(
+    payload: ReorderProvidersPayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
+    if payload.provider_ids.len() != state.claude_providers.len() {
+        return Err("Claude 供应商顺序与当前列表不匹配".to_string());
+    }
+
+    let current_ids = state
+        .claude_providers
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect::<BTreeSet<_>>();
+    let requested_ids = payload
+        .provider_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if current_ids != requested_ids || requested_ids.len() != payload.provider_ids.len() {
+        return Err("Claude 供应商顺序包含未知或重复项".to_string());
+    }
+
+    let mut providers_by_id = state
+        .claude_providers
+        .into_iter()
+        .map(|provider| (provider.id.clone(), provider))
+        .collect::<BTreeMap<_, _>>();
+    state.claude_providers = payload
+        .provider_ids
+        .into_iter()
+        .map(|provider_id| {
+            providers_by_id
+                .remove(&provider_id)
+                .ok_or_else(|| "Claude 供应商不存在".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    save_state(&state)?;
+    build_app_state(state, &router_runtime)
+}
+
+#[tauri::command]
 fn preview_provider(
     payload: SaveProviderPayload,
     router_runtime: tauri::State<RouterRuntime>,
@@ -7602,6 +8483,9 @@ fn preview_provider(
     }
     if let Some(wire_api) = payload.wire_api {
         provider.wire_api = wire_api;
+    }
+    if let Some(service_tier) = payload.service_tier {
+        provider.service_tier = service_tier.trim().to_string();
     }
     if let Some(model_mappings) = payload.model_mappings {
         provider.model_mappings = normalize_model_mappings(model_mappings);
@@ -7655,6 +8539,7 @@ fn add_provider(
         name: trimmed.to_string(),
         enabled: true,
         wire_api: ProviderWireApi::Responses,
+        service_tier: String::new(),
         connection_test_model: String::new(),
         allowed_models: Vec::new(),
         model_mappings: Vec::new(),
@@ -7685,6 +8570,59 @@ fn save_base_template(
 }
 
 #[tauri::command]
+fn add_claude_provider(
+    name: String,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Claude 供应商名称不能为空".to_string());
+    }
+
+    let id_base = trimmed
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let id_base = if id_base.is_empty() {
+        "claude-provider".to_string()
+    } else {
+        id_base
+    };
+
+    let mut id = id_base.clone();
+    let mut index = 2;
+    while state
+        .claude_providers
+        .iter()
+        .any(|provider| provider.id == id)
+    {
+        id = format!("{id_base}-{index}");
+        index += 1;
+    }
+
+    state.active_claude_provider_id = id.clone();
+    state.claude_providers.push(ClaudeProviderConfig {
+        id: id.clone(),
+        name: trimmed.to_string(),
+        enabled: true,
+        base_url: String::new(),
+        api_key: String::new(),
+        connection_test_model: String::new(),
+        allowed_models: Vec::new(),
+        model_mappings: Vec::new(),
+        provider_pricing: Vec::new(),
+        connection_status: None,
+    });
+
+    save_state(&state)?;
+    build_app_state(state, &router_runtime)
+}
+
+#[tauri::command]
 fn save_router_config(
     payload: SaveRouterPayload,
     router_runtime: tauri::State<RouterRuntime>,
@@ -7701,9 +8639,6 @@ fn save_router_config(
     if payload.enabled && local_token.is_empty() {
         return Err("本地路由 Token 不能为空".to_string());
     }
-    let model_context_overrides =
-        normalize_model_context_overrides(payload.model_context_overrides.unwrap_or_default());
-
     state.router = RouterConfig {
         enabled: payload.enabled,
         host: if host.is_empty() {
@@ -7717,12 +8652,26 @@ fn save_router_config(
         } else {
             local_token.to_string()
         },
-        model_context_overrides,
     };
-    ensure_router_config_applied(&mut state)?;
+    ensure_client_configs_applied(&mut state)?;
     save_state(&state)?;
     ensure_router(&router_runtime, &state.router)?;
     build_app_state(state, &router_runtime)
+}
+
+#[tauri::command]
+fn save_client_configs(
+    payload: SaveClientConfigsPayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
+    state.clients.codex.enabled = payload.codex_enabled;
+    state.clients.claude.enabled = payload.claude_enabled;
+    if state.clients.codex.enabled || state.clients.claude.enabled {
+        state.router.enabled = true;
+    }
+    save_state(&state)?;
+    apply_config(router_runtime)
 }
 
 #[tauri::command]
@@ -7730,9 +8679,12 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
     let mut state = load_state_file()?;
     let config_path = codex_config_path()?;
 
-    fs::create_dir_all(codex_home()?).map_err(|err| format!("无法创建 Codex 目录: {err}"))?;
+    if state.clients.codex.enabled || state.clients.claude.enabled {
+        state.router.enabled = true;
+    }
 
-    if state.router.enabled {
+    if state.clients.codex.enabled {
+        fs::create_dir_all(codex_home()?).map_err(|err| format!("无法创建 Codex 目录: {err}"))?;
         if config_path.exists() {
             let backup_name = format!(
                 "config.toml.{}.bak",
@@ -7768,6 +8720,48 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
         fs::write(&config_path, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
         state.last_applied = None;
         state.router_backup = None;
+    }
+
+    let claude_path = claude_settings_path()?;
+    if state.clients.claude.enabled {
+        fs::create_dir_all(claude_home()?)
+            .map_err(|err| format!("无法创建 Claude 设置目录: {err}"))?;
+        if claude_path.exists() {
+            let backup_name = format!(
+                "claude-settings.{}.json.bak",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|err| format!("系统时间异常: {err}"))?
+                    .as_secs()
+            );
+            fs::copy(&claude_path, manager_dir()?.join(backup_name))
+                .map_err(|err| format!("无法备份现有 Claude 设置: {err}"))?;
+        }
+        let (settings, _, _) = read_claude_settings()?;
+        if state.claude_backup.is_none() {
+            state.claude_backup = Some(capture_claude_backup(&settings));
+        }
+        let raw = render_claude_patch_json(settings, &state.router)?;
+        fs::write(&claude_path, raw).map_err(|err| format!("无法写入 Claude 设置: {err}"))?;
+    } else if claude_path.exists() || state.claude_backup.is_some() {
+        let (settings, _, exists) = read_claude_settings()?;
+        if exists {
+            let backup_name = format!(
+                "claude-settings.{}.json.bak",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|err| format!("系统时间异常: {err}"))?
+                    .as_secs()
+            );
+            fs::copy(&claude_path, manager_dir()?.join(backup_name))
+                .map_err(|err| format!("无法备份现有 Claude 设置: {err}"))?;
+        }
+        let raw =
+            restore_claude_backup_json(settings, state.claude_backup.as_ref(), &state.router)?;
+        fs::create_dir_all(claude_home()?)
+            .map_err(|err| format!("无法创建 Claude 设置目录: {err}"))?;
+        fs::write(&claude_path, raw).map_err(|err| format!("无法写入 Claude 设置: {err}"))?;
+        state.claude_backup = None;
     }
     state.applied_provider_id = None;
     save_state(&state)?;
@@ -7840,6 +8834,27 @@ async fn load_provider_models(
         payload.api_key.as_deref(),
     )?;
     let (models, _) = fetch_provider_models(&test_provider).await?;
+    Ok(ProviderModelsResponse { models })
+}
+
+#[tauri::command]
+async fn load_claude_provider_models(
+    payload: LoadProviderModelsPayload,
+) -> Result<ProviderModelsResponse, String> {
+    let state = load_state_file()?;
+    let provider = state
+        .claude_providers
+        .iter()
+        .find(|provider| provider.id == payload.provider_id)
+        .cloned()
+        .ok_or_else(|| "Claude 供应商不存在".to_string())?;
+    let mut test_provider = provider.clone();
+    apply_claude_provider_connection_draft(
+        &mut test_provider,
+        payload.base_url.as_deref(),
+        payload.api_key.as_deref(),
+    )?;
+    let (models, _) = fetch_claude_provider_models(&test_provider).await?;
     Ok(ProviderModelsResponse { models })
 }
 
@@ -8069,14 +9084,14 @@ pub fn run() {
             tray_builder.build(app)?;
 
             let mut state = load_state_file()?;
-            match ensure_router_config_applied(&mut state) {
+            match ensure_client_configs_applied(&mut state) {
                 Ok(true) => {
                     if let Err(err) = save_state(&state) {
                         eprintln!("{err}");
                     }
                 }
                 Ok(false) => {}
-                Err(err) => eprintln!("Codex 接管配置检查失败: {err}"),
+                Err(err) => eprintln!("客户端接管配置检查失败: {err}"),
             }
             let router_runtime = app.state::<RouterRuntime>();
             if let Err(err) = ensure_router(&router_runtime, &state.router) {
@@ -8098,17 +9113,23 @@ pub fn run() {
             load_app_state,
             select_provider,
             get_provider,
+            get_claude_provider,
             save_provider,
+            save_claude_provider,
             reorder_providers,
+            reorder_claude_providers,
             preview_provider,
             add_provider,
+            add_claude_provider,
             save_base_template,
             save_router_config,
+            save_client_configs,
             apply_config,
             load_usage_stats,
             load_route_logs,
             load_route_usage_stats,
             load_provider_models,
+            load_claude_provider_models,
             sync_provider_pricing,
             query_provider_balance,
             test_provider_connection,
@@ -8187,6 +9208,153 @@ mod tests {
                 &mut self.usage,
             )
         }
+    }
+
+    #[test]
+    fn migrates_legacy_router_enabled_to_codex_client() {
+        let mut state = default_state();
+        state.router.enabled = true;
+
+        let migrated = migrate_legacy_clients_if_missing(state, true);
+
+        assert!(migrated.clients.codex.enabled);
+        assert!(!migrated.clients.claude.enabled);
+        assert!(migrated.router.enabled);
+    }
+
+    #[test]
+    fn preserves_existing_clients_when_state_is_not_legacy() {
+        let mut state = default_state();
+        state.router.enabled = true;
+        state.clients.codex.enabled = false;
+        state.clients.claude.enabled = true;
+
+        let migrated = migrate_legacy_clients_if_missing(state, false);
+
+        assert!(!migrated.clients.codex.enabled);
+        assert!(migrated.clients.claude.enabled);
+    }
+
+    #[test]
+    fn patches_and_restores_claude_settings_env_fields() {
+        let settings = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://old.example",
+                "ANTHROPIC_AUTH_TOKEN": "old-token",
+                "ANTHROPIC_API_KEY": "old-api-key",
+                "OTHER_ENV": "kept"
+            },
+            "permissions": {
+                "allow": ["Bash(ls)"]
+            }
+        });
+        let backup = capture_claude_backup(&settings);
+        let router = RouterConfig {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 18080,
+            local_token: "local-token".to_string(),
+        };
+
+        let patched = render_claude_patch_json(settings, &router).unwrap();
+        let patched = serde_json::from_str::<Value>(&patched).unwrap();
+        assert_eq!(
+            json_env_value(&patched, "ANTHROPIC_BASE_URL"),
+            Some(Value::String("http://127.0.0.1:18080".to_string()))
+        );
+        assert_eq!(json_env_value(&patched, "ANTHROPIC_AUTH_TOKEN"), None);
+        assert_eq!(
+            json_env_value(&patched, "ANTHROPIC_API_KEY"),
+            Some(Value::String("local-token".to_string()))
+        );
+        assert_eq!(
+            json_env_value(&patched, "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
+            Some(Value::String("1".to_string()))
+        );
+        assert_eq!(
+            json_env_value(&patched, "ANTHROPIC_DEFAULT_FABLE_MODEL"),
+            Some(Value::String("claude-fable-5".to_string()))
+        );
+        assert_eq!(
+            json_env_value(&patched, "OTHER_ENV"),
+            Some(Value::String("kept".to_string()))
+        );
+
+        let restored = restore_claude_backup_json(patched, Some(&backup), &router).unwrap();
+        let restored = serde_json::from_str::<Value>(&restored).unwrap();
+        assert_eq!(
+            json_env_value(&restored, "ANTHROPIC_BASE_URL"),
+            Some(Value::String("https://old.example".to_string()))
+        );
+        assert_eq!(
+            json_env_value(&restored, "ANTHROPIC_AUTH_TOKEN"),
+            Some(Value::String("old-token".to_string()))
+        );
+        assert_eq!(
+            json_env_value(&restored, "ANTHROPIC_API_KEY"),
+            Some(Value::String("old-api-key".to_string()))
+        );
+        assert_eq!(
+            json_env_value(&restored, "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
+            None
+        );
+        assert_eq!(
+            json_env_value(&restored, "ANTHROPIC_DEFAULT_FABLE_MODEL"),
+            None
+        );
+        assert_eq!(
+            json_env_value(&restored, "OTHER_ENV"),
+            Some(Value::String("kept".to_string()))
+        );
+    }
+
+    #[test]
+    fn maps_and_filters_claude_provider_models() {
+        let provider = ClaudeProviderConfig {
+            id: "anthropic".to_string(),
+            name: "Anthropic".to_string(),
+            enabled: true,
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "sk-ant".to_string(),
+            connection_test_model: String::new(),
+            allowed_models: vec!["claude-sonnet-4-5".to_string()],
+            model_mappings: vec![ModelMapping {
+                source: "claude-sonnet-4-5".to_string(),
+                target: "claude-3-5-sonnet-latest".to_string(),
+            }],
+            provider_pricing: vec![],
+            connection_status: None,
+        };
+
+        assert!(claude_provider_accepts_model(
+            &provider,
+            "CLAUDE-SONNET-4-5"
+        ));
+        assert!(!claude_provider_accepts_model(&provider, "claude-opus-4-1"));
+        assert_eq!(
+            mapped_model_for_claude_provider(&provider, "claude-sonnet-4-5"),
+            Some("claude-3-5-sonnet-latest".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_upstream_path_does_not_inject_v1() {
+        assert_eq!(claude_upstream_path("messages"), "messages");
+        assert_eq!(claude_upstream_path("/models"), "models");
+        assert_eq!(
+            join_url(
+                "https://provider.example",
+                &claude_upstream_path("messages")
+            ),
+            "https://provider.example/messages"
+        );
+        assert_eq!(
+            join_url(
+                "https://provider.example/v1",
+                &claude_upstream_path("messages")
+            ),
+            "https://provider.example/v1/messages"
+        );
     }
 
     #[test]
@@ -8380,6 +9548,7 @@ mod tests {
                 }
             }),
             wire_api: ProviderWireApi::Responses,
+            service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: Vec::new(),
             model_mappings: Vec::new(),
@@ -8414,6 +9583,7 @@ mod tests {
             enabled: true,
             config: json!({}),
             wire_api: ProviderWireApi::Responses,
+            service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: vec!["gpt-5.5".to_string(), "gpt-5.4".to_string()],
             model_mappings: vec![
@@ -8434,7 +9604,7 @@ mod tests {
         };
         let body = br#"{"model":"gpt-5.5","input":"hello"}"#;
         let mapped = mapped_model_for_provider(&provider, "gpt-5.5");
-        let rewritten = body_with_mapped_model(body, mapped.as_deref());
+        let rewritten = body_with_provider_overrides(body, mapped.as_deref(), None);
         let value = serde_json::from_slice::<Value>(&rewritten).expect("mapped body is json");
 
         assert_eq!(mapped.as_deref(), Some("deepseek-v4-pro"));
@@ -8678,8 +9848,13 @@ mod tests {
                     enabled: true,
                     config: json!({}),
                     wire_api: ProviderWireApi::Responses,
+                    service_tier: String::new(),
                     connection_test_model: String::new(),
-                    allowed_models: vec!["gpt-5.5".to_string(), "gpt-5.4".to_string()],
+                    allowed_models: vec![
+                        "gpt-5.5".to_string(),
+                        "gpt-image-2".to_string(),
+                        "gpt-5.4".to_string(),
+                    ],
                     model_mappings: Vec::new(),
                     provider_pricing: Vec::new(),
                     pricing_sync_status: None,
@@ -8698,6 +9873,7 @@ mod tests {
                     enabled: true,
                     config: json!({}),
                     wire_api: ProviderWireApi::ChatCompletions,
+                    service_tier: String::new(),
                     connection_test_model: String::new(),
                     allowed_models: vec!["GPT-5.4".to_string(), "gpt-5.3".to_string()],
                     model_mappings: Vec::new(),
@@ -8727,6 +9903,7 @@ mod tests {
             enabled: true,
             config: json!({}),
             wire_api: ProviderWireApi::ChatCompletions,
+            service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: vec!["gpt-5.2".to_string()],
             model_mappings: vec![ModelMapping {
@@ -8752,6 +9929,47 @@ mod tests {
     }
 
     #[test]
+    fn forces_provider_service_tier_on_forwarded_requests() {
+        let mut provider = ProviderConfig {
+            id: "provider-a".to_string(),
+            name: "Provider A".to_string(),
+            enabled: true,
+            config: json!({}),
+            wire_api: ProviderWireApi::Responses,
+            service_tier: "priority".to_string(),
+            connection_test_model: String::new(),
+            allowed_models: Vec::new(),
+            model_mappings: Vec::new(),
+            provider_pricing: Vec::new(),
+            pricing_sync_status: None,
+            balance_query: BalanceQueryConfig::default(),
+            balance_status: None,
+            connection_status: None,
+        };
+        let body = br#"{"model":"gpt-5.2","input":"hello","service_tier":"default"}"#;
+
+        let prepared = prepare_upstream_request(&provider, "responses", "", body, "gpt-5.2")
+            .expect("request prepares");
+        let value = serde_json::from_slice::<Value>(&prepared.body).expect("prepared body is json");
+
+        assert_eq!(
+            value.get("service_tier").and_then(Value::as_str),
+            Some("priority")
+        );
+
+        provider.wire_api = ProviderWireApi::ChatCompletions;
+        let prepared = prepare_upstream_request(&provider, "responses", "", body, "gpt-5.2")
+            .expect("chat request prepares");
+        let value = serde_json::from_slice::<Value>(&prepared.body).expect("prepared body is json");
+
+        assert_eq!(
+            value.get("service_tier").and_then(Value::as_str),
+            Some("priority")
+        );
+        assert_eq!(prepared.path, "chat/completions");
+    }
+
+    #[test]
     fn converts_responses_request_to_chat_completions() {
         let body = json!({
             "model": "gpt-5.5",
@@ -8768,8 +9986,9 @@ mod tests {
         })
         .to_string();
 
-        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
-            .expect("request converts");
+        let (converted, _) =
+            responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"), None)
+                .expect("request converts");
         let value = serde_json::from_slice::<Value>(&converted).expect("converted json");
 
         assert_eq!(
@@ -8809,8 +10028,9 @@ mod tests {
         })
         .to_string();
 
-        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
-            .expect("request converts");
+        let (converted, _) =
+            responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"), None)
+                .expect("request converts");
         let value = serde_json::from_slice::<Value>(&converted).expect("converted json");
 
         assert_eq!(
@@ -8840,7 +10060,7 @@ mod tests {
         .to_string();
 
         let (converted, context) =
-            responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
+            responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"), None)
                 .expect("request converts");
         let value = serde_json::from_slice::<Value>(&converted).expect("converted json");
 
@@ -9017,7 +10237,7 @@ mod tests {
         })
         .to_string();
         let (converted_request, _) =
-            responses_to_chat_request_body(next_request.as_bytes(), Some("deepseek-chat"))
+            responses_to_chat_request_body(next_request.as_bytes(), Some("deepseek-chat"), None)
                 .expect("request converts");
         let request = serde_json::from_slice::<Value>(&converted_request).expect("request json");
 
@@ -9056,8 +10276,9 @@ mod tests {
         })
         .to_string();
 
-        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
-            .expect("request converts");
+        let (converted, _) =
+            responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"), None)
+                .expect("request converts");
         let request = serde_json::from_slice::<Value>(&converted).expect("request json");
 
         assert_eq!(
@@ -9087,8 +10308,9 @@ mod tests {
         })
         .to_string();
 
-        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
-            .expect("request converts");
+        let (converted, _) =
+            responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"), None)
+                .expect("request converts");
         let request = serde_json::from_slice::<Value>(&converted).expect("request json");
 
         assert_eq!(
@@ -9098,7 +10320,7 @@ mod tests {
             Some(MISSING_REASONING_CONTENT_FALLBACK)
         );
 
-        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("glm-5.2"))
+        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("glm-5.2"), None)
             .expect("request converts");
         let request = serde_json::from_slice::<Value>(&converted).expect("request json");
         assert!(request.pointer("/messages/0/reasoning_content").is_none());
@@ -9129,8 +10351,9 @@ mod tests {
         })
         .to_string();
 
-        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"))
-            .expect("request converts");
+        let (converted, _) =
+            responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"), None)
+                .expect("request converts");
         let request = serde_json::from_slice::<Value>(&converted).expect("request json");
 
         assert_eq!(
@@ -9178,7 +10401,7 @@ mod tests {
         .to_string();
 
         let (converted, context) =
-            responses_to_chat_request_body(body.as_bytes(), None).expect("request converts");
+            responses_to_chat_request_body(body.as_bytes(), None, None).expect("request converts");
         let value = serde_json::from_slice::<Value>(&converted).expect("converted json");
 
         assert_eq!(
@@ -9218,7 +10441,7 @@ mod tests {
         })
         .to_string();
 
-        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), None)
+        let (converted, _) = responses_to_chat_request_body(body.as_bytes(), None, None)
             .expect("unsupported tools are filtered");
         let value = serde_json::from_slice::<Value>(&converted).expect("converted json");
 
@@ -9445,6 +10668,80 @@ mod tests {
     }
 
     #[test]
+    fn parses_claude_model_objects_from_models_response() {
+        let models = claude_model_values_from_response_value(&json!({
+            "data": [
+                {
+                    "id": "claude-fable-5",
+                    "type": "model",
+                    "display_name": "Claude Fable 5",
+                    "created_at": "2026-01-01T00:00:00Z"
+                },
+                { "id": "claude-fable-5" },
+                "claude-sonnet-5"
+            ],
+            "has_more": false
+        }));
+
+        let ids = models
+            .iter()
+            .filter_map(model_id_from_value)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["claude-fable-5", "claude-sonnet-5"]);
+        assert_eq!(
+            models[0].get("display_name").and_then(Value::as_str),
+            Some("Claude Fable 5")
+        );
+    }
+
+    #[test]
+    fn claude_route_models_respect_allowed_models() {
+        let mut provider = ClaudeProviderConfig {
+            id: "anthropic".to_string(),
+            name: "Anthropic".to_string(),
+            enabled: true,
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "sk-ant".to_string(),
+            connection_test_model: String::new(),
+            allowed_models: vec!["claude-fable-5".to_string(), "local-alias".to_string()],
+            model_mappings: vec![ModelMapping {
+                source: "local-alias".to_string(),
+                target: "claude-sonnet-5".to_string(),
+            }],
+            provider_pricing: vec![],
+            connection_status: None,
+        };
+        let upstream = claude_model_values_from_response_value(&json!({
+            "data": [
+                { "id": "claude-sonnet-5" },
+                { "id": "claude-fable-5", "display_name": "Claude Fable 5" }
+            ]
+        }));
+
+        let models = claude_route_model_values(&provider, &upstream);
+        let ids = models
+            .iter()
+            .filter_map(model_id_from_value)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["claude-fable-5", "local-alias"]);
+        assert_eq!(
+            models[0].get("display_name").and_then(Value::as_str),
+            Some("Claude Fable 5")
+        );
+
+        provider.allowed_models.clear();
+        let models = claude_route_model_values(&provider, &upstream);
+        let ids = models
+            .iter()
+            .filter_map(model_id_from_value)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["claude-sonnet-5", "claude-fable-5", "local-alias"]
+        );
+    }
+
+    #[test]
     fn parses_model_ids_from_codex_catalog_response() {
         let models = models_from_response_value(&json!({
             "models": [
@@ -9471,8 +10768,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_catalog_preserves_template_context_without_override() {
-        let router = RouterConfig::default();
+    fn codex_catalog_restores_default_context_fields() {
         let template = json!({
             "slug": "gpt-5.4",
             "display_name": "GPT-5.4",
@@ -9480,14 +10776,13 @@ mod tests {
             "base_instructions": "keep template instructions",
             "context_window": 272000,
             "max_context_window": 1000000,
+            "auto_compact_token_limit": 950000,
+            "effective_context_window_percent": 95,
             "supported_in_api": true,
             "visibility": "list"
         });
-        let catalog = codex_models_catalog_value_with_templates(
-            vec!["gpt-5.5".to_string()],
-            &[template],
-            &router,
-        );
+        let catalog =
+            codex_models_catalog_value_with_templates(vec!["gpt-5.5".to_string()], &[template]);
         let model = catalog
             .pointer("/models/0")
             .and_then(Value::as_object)
@@ -9500,57 +10795,17 @@ mod tests {
         );
         assert_eq!(
             model.get("context_window").and_then(Value::as_i64),
-            Some(272_000)
+            Some(256_000)
         );
         assert_eq!(
             model.get("max_context_window").and_then(Value::as_i64),
-            Some(1_000_000)
+            Some(256_000)
         );
         assert_eq!(
             model
                 .get("auto_compact_token_limit")
                 .and_then(Value::as_i64),
-            None
-        );
-    }
-
-    #[test]
-    fn codex_catalog_uses_configured_model_context_override() {
-        let router = RouterConfig {
-            model_context_overrides: vec![ModelContextOverride {
-                model: "deepseek-reasoner".to_string(),
-                context_window: 1_000_000,
-                auto_compact_token_limit: 950_000,
-            }],
-            ..RouterConfig::default()
-        };
-        let catalog = codex_models_catalog_value_with_templates(
-            vec!["deepseek-reasoner".to_string()],
-            &[],
-            &router,
-        );
-        let model = catalog
-            .pointer("/models/0")
-            .and_then(Value::as_object)
-            .expect("catalog model");
-
-        assert_eq!(
-            model.get("slug").and_then(Value::as_str),
-            Some("deepseek-reasoner")
-        );
-        assert_eq!(
-            model.get("context_window").and_then(Value::as_i64),
-            Some(1_000_000)
-        );
-        assert_eq!(
-            model.get("max_context_window").and_then(Value::as_i64),
-            Some(1_000_000)
-        );
-        assert_eq!(
-            model
-                .get("auto_compact_token_limit")
-                .and_then(Value::as_i64),
-            Some(950_000)
+            Some(243_200)
         );
         assert_eq!(
             model
