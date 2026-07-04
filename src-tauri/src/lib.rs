@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
@@ -38,6 +38,8 @@ const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
 const CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT: i64 = 243_200;
 const CODEX_MODEL_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
 static ROUTE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static PROVIDER_HEALTH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const AUTO_DISABLE_FAILURE_THRESHOLD: u32 = 3;
 const DEFAULT_NEW_API_QUOTA_PER_USD: f64 = 500_000.0;
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_SHOW_ID: &str = "show";
@@ -47,7 +49,17 @@ const TRAY_QUIT_ID: &str = "quit";
 struct ProviderConfig {
     id: String,
     name: String,
+    #[serde(default)]
+    status: ProviderStatus,
     enabled: bool,
+    #[serde(default)]
+    consecutive_failure_count: u32,
+    #[serde(default)]
+    auto_disabled_day: Option<String>,
+    #[serde(default)]
+    last_failure_reason: Option<String>,
+    #[serde(default)]
+    last_failure_at_ms: Option<i64>,
     config: Value,
     #[serde(default)]
     wire_api: ProviderWireApi,
@@ -75,7 +87,17 @@ struct ProviderConfig {
 struct ClaudeProviderConfig {
     id: String,
     name: String,
+    #[serde(default)]
+    status: ProviderStatus,
     enabled: bool,
+    #[serde(default)]
+    consecutive_failure_count: u32,
+    #[serde(default)]
+    auto_disabled_day: Option<String>,
+    #[serde(default)]
+    last_failure_reason: Option<String>,
+    #[serde(default)]
+    last_failure_at_ms: Option<i64>,
     base_url: String,
     api_key: String,
     #[serde(default)]
@@ -88,6 +110,20 @@ struct ClaudeProviderConfig {
     provider_pricing: Vec<PricingRule>,
     #[serde(default)]
     connection_status: Option<ConnectionStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderStatus {
+    Enabled,
+    Disabled,
+    AutoDisabled,
+}
+
+impl Default for ProviderStatus {
+    fn default() -> Self {
+        Self::Enabled
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -495,7 +531,12 @@ struct UsageStats {
 struct ProviderSummary {
     id: String,
     name: String,
+    status: ProviderStatus,
     enabled: bool,
+    consecutive_failure_count: u32,
+    auto_disabled_day: Option<String>,
+    last_failure_reason: Option<String>,
+    last_failure_at_ms: Option<i64>,
     pending_changes: usize,
     base_url: String,
     provider_type: String,
@@ -997,6 +1038,44 @@ struct RouteLogsResponse {
     available_days: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderKind {
+    Codex,
+    Claude,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderFailureKind {
+    Network,
+    RateLimit,
+    UpstreamServer,
+    Authentication,
+    ResponseRead,
+    Stream,
+    Protocol,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderFailureEvent {
+    id: String,
+    request_id: String,
+    started_at_ms: i64,
+    day: String,
+    provider_kind: ProviderKind,
+    provider_id: String,
+    provider_name: String,
+    model: String,
+    path: String,
+    failure_kind: ProviderFailureKind,
+    status_code: Option<u16>,
+    error: String,
+    counted: bool,
+    consecutive_failure_count: u32,
+    auto_disabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RouteUsageBucket {
     label: String,
@@ -1099,6 +1178,19 @@ struct ChatToResponsesStreamState {
     completed: bool,
     usage_seen: bool,
     usage: TokenUsage,
+    finished: bool,
+}
+
+struct ClaudeStreamState {
+    stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    provider_id: String,
+    provider_name: String,
+    request_id: String,
+    started_at_ms: i64,
+    path: String,
+    model: String,
+    status_success: bool,
+    status_code: Option<u16>,
     finished: bool,
 }
 
@@ -1215,6 +1307,10 @@ fn route_logs_path() -> Result<PathBuf, String> {
     Ok(manager_dir()?.join("route-logs.jsonl"))
 }
 
+fn provider_failure_events_path() -> Result<PathBuf, String> {
+    Ok(manager_dir()?.join("provider-failure-events.jsonl"))
+}
+
 fn codex_config_path() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("config.toml"))
 }
@@ -1243,6 +1339,51 @@ fn default_state() -> ManagerState {
         clients: ClientConfigs::default(),
         router_backup: None,
         claude_backup: None,
+    }
+}
+
+fn provider_day_now() -> String {
+    let now = Local::now();
+    format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day())
+}
+
+fn provider_enabled_from_status(status: ProviderStatus) -> bool {
+    matches!(status, ProviderStatus::Enabled)
+}
+
+fn normalize_provider_status(
+    status: ProviderStatus,
+    enabled: bool,
+    auto_disabled_day: &Option<String>,
+    today: &str,
+) -> ProviderStatus {
+    match status {
+        ProviderStatus::AutoDisabled if auto_disabled_day.as_deref() == Some(today) => {
+            ProviderStatus::AutoDisabled
+        }
+        ProviderStatus::AutoDisabled => ProviderStatus::Enabled,
+        ProviderStatus::Enabled if !enabled => ProviderStatus::Disabled,
+        other => other,
+    }
+}
+
+fn set_provider_status_fields(
+    status: ProviderStatus,
+    enabled: &mut bool,
+    consecutive_failure_count: &mut u32,
+    auto_disabled_day: &mut Option<String>,
+    last_failure_reason: &mut Option<String>,
+    last_failure_at_ms: &mut Option<i64>,
+) {
+    *enabled = provider_enabled_from_status(status);
+    match status {
+        ProviderStatus::Enabled | ProviderStatus::Disabled => {
+            *consecutive_failure_count = 0;
+            *auto_disabled_day = None;
+            *last_failure_reason = None;
+            *last_failure_at_ms = None;
+        }
+        ProviderStatus::AutoDisabled => {}
     }
 }
 
@@ -1357,7 +1498,25 @@ fn load_state_file() -> Result<ManagerState, String> {
 
 fn normalize_state(mut state: ManagerState) -> ManagerState {
     state.pricing = default_pricing_rules();
+    let today = provider_day_now();
     for provider in &mut state.providers {
+        let previous_status = provider.status;
+        provider.status = normalize_provider_status(
+            provider.status,
+            provider.enabled,
+            &provider.auto_disabled_day,
+            &today,
+        );
+        provider.enabled = provider_enabled_from_status(provider.status);
+        if provider.status == ProviderStatus::Disabled
+            || (previous_status == ProviderStatus::AutoDisabled
+                && provider.status == ProviderStatus::Enabled)
+        {
+            provider.consecutive_failure_count = 0;
+            provider.auto_disabled_day = None;
+            provider.last_failure_reason = None;
+            provider.last_failure_at_ms = None;
+        }
         provider.allowed_models =
             normalize_model_names(std::mem::take(&mut provider.allowed_models));
         provider.model_mappings =
@@ -1366,6 +1525,23 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
             normalize_provider_pricing(std::mem::take(&mut provider.provider_pricing));
     }
     for provider in &mut state.claude_providers {
+        let previous_status = provider.status;
+        provider.status = normalize_provider_status(
+            provider.status,
+            provider.enabled,
+            &provider.auto_disabled_day,
+            &today,
+        );
+        provider.enabled = provider_enabled_from_status(provider.status);
+        if provider.status == ProviderStatus::Disabled
+            || (previous_status == ProviderStatus::AutoDisabled
+                && provider.status == ProviderStatus::Enabled)
+        {
+            provider.consecutive_failure_count = 0;
+            provider.auto_disabled_day = None;
+            provider.last_failure_reason = None;
+            provider.last_failure_at_ms = None;
+        }
         provider.allowed_models =
             normalize_model_names(std::mem::take(&mut provider.allowed_models));
         provider.model_mappings =
@@ -1395,7 +1571,7 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
             state
                 .providers
                 .iter()
-                .find(|provider| provider.enabled)
+                .find(|provider| provider.status == ProviderStatus::Enabled)
                 .map(|provider| provider.id.clone())
         })
         .or_else(|| {
@@ -1438,7 +1614,7 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
         state.active_claude_provider_id = state
             .claude_providers
             .iter()
-            .find(|provider| provider.enabled)
+            .find(|provider| provider.status == ProviderStatus::Enabled)
             .or_else(|| state.claude_providers.first())
             .map(|provider| provider.id.clone())
             .unwrap_or_default();
@@ -3466,11 +3642,19 @@ fn upstream_candidates() -> Result<(RouterConfig, Vec<UpstreamCandidate>), Strin
     if !state.router.enabled {
         return Err("本地路由未启用".to_string());
     }
+    let has_enabled = state
+        .providers
+        .iter()
+        .any(|provider| provider.status == ProviderStatus::Enabled);
+    let has_auto_disabled = state
+        .providers
+        .iter()
+        .any(|provider| provider.status == ProviderStatus::AutoDisabled);
     let candidates = state
         .providers
         .iter()
         .enumerate()
-        .filter(|(_, provider)| provider.enabled)
+        .filter(|(_, provider)| provider.status == ProviderStatus::Enabled)
         .filter_map(|(index, provider)| {
             let base_url =
                 custom_provider_base_url(provider).filter(|value| !value.trim().is_empty())?;
@@ -3484,6 +3668,12 @@ fn upstream_candidates() -> Result<(RouterConfig, Vec<UpstreamCandidate>), Strin
         })
         .collect::<Vec<_>>();
 
+    if candidates.is_empty() && !has_enabled && has_auto_disabled {
+        return Err("所有供应商今日已自动禁用".to_string());
+    }
+    if candidates.is_empty() && !has_enabled {
+        return Err("没有已启用的供应商".to_string());
+    }
     if candidates.is_empty() {
         return Err("没有已启用且配置完整的供应商".to_string());
     }
@@ -3498,10 +3688,18 @@ fn upstream_claude_candidates() -> Result<(RouterConfig, Vec<ClaudeUpstreamCandi
     if !state.clients.claude.enabled {
         return Err("Claude 接管未启用".to_string());
     }
+    let has_enabled = state
+        .claude_providers
+        .iter()
+        .any(|provider| provider.status == ProviderStatus::Enabled);
+    let has_auto_disabled = state
+        .claude_providers
+        .iter()
+        .any(|provider| provider.status == ProviderStatus::AutoDisabled);
     let candidates = state
         .claude_providers
         .iter()
-        .filter(|provider| provider.enabled)
+        .filter(|provider| provider.status == ProviderStatus::Enabled)
         .filter_map(|provider| {
             let base_url = provider.base_url.trim().trim_end_matches('/');
             let token = provider.api_key.trim();
@@ -3516,10 +3714,43 @@ fn upstream_claude_candidates() -> Result<(RouterConfig, Vec<ClaudeUpstreamCandi
         })
         .collect::<Vec<_>>();
 
+    if candidates.is_empty() && !has_enabled && has_auto_disabled {
+        return Err("所有 Claude 供应商今日已自动禁用".to_string());
+    }
+    if candidates.is_empty() && !has_enabled {
+        return Err("没有已启用的 Claude 供应商".to_string());
+    }
     if candidates.is_empty() {
         return Err("没有已启用且配置完整的 Claude 供应商".to_string());
     }
     Ok((state.router, candidates))
+}
+
+fn auto_disabled_codex_provider_supports_model(model: &str) -> bool {
+    load_state_file()
+        .map(|state| {
+            state.providers.iter().any(|provider| {
+                provider.status == ProviderStatus::AutoDisabled
+                    && provider_accepts_model(provider, model)
+                    && custom_provider_base_url(provider)
+                        .is_some_and(|value| !value.trim().is_empty())
+                    && custom_provider_token(provider).is_some_and(|value| !value.trim().is_empty())
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn auto_disabled_claude_provider_supports_model(model: &str) -> bool {
+    load_state_file()
+        .map(|state| {
+            state.claude_providers.iter().any(|provider| {
+                provider.status == ProviderStatus::AutoDisabled
+                    && claude_provider_accepts_model(provider, model)
+                    && !provider.base_url.trim().is_empty()
+                    && !provider.api_key.trim().is_empty()
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn configured_route_models(candidates: &[UpstreamCandidate]) -> Vec<String> {
@@ -5444,6 +5675,7 @@ fn finish_route_log(
 }
 
 fn build_pending_route_log(
+    id: String,
     started_at_ms: i64,
     start: Instant,
     candidate: &UpstreamCandidate,
@@ -5457,7 +5689,7 @@ fn build_pending_route_log(
     error: Option<String>,
 ) -> PendingRouteLog {
     PendingRouteLog {
-        id: request_id(started_at_ms),
+        id,
         started_at_ms,
         method: method.as_str().to_string(),
         path: format!("/v1/{path}"),
@@ -5510,6 +5742,18 @@ impl futures_util::Stream for RouteStreamState {
                 if !self.finished {
                     self.finished = true;
                     self.pending.error = Some(format!("读取上游流失败: {err}"));
+                    record_provider_failure(
+                        ProviderKind::Codex,
+                        &self.pending.provider_id,
+                        &self.pending.provider_name,
+                        &self.pending.id,
+                        self.pending.started_at_ms,
+                        &self.pending.path,
+                        &self.pending.model,
+                        ProviderFailureKind::Stream,
+                        self.pending.status_code,
+                        format!("读取上游流失败: {err}"),
+                    );
                     route_stream_finish_usage(&mut self);
                     let pending = self.pending.clone();
                     let usage = self.usage.clone();
@@ -5524,6 +5768,26 @@ impl futures_util::Stream for RouteStreamState {
                     let pending = self.pending.clone();
                     let usage = self.usage.clone();
                     finish_route_log(pending, self.status_success, usage, self.first_byte_ms);
+                    if self.status_success {
+                        record_provider_success(ProviderKind::Codex, &self.pending.provider_id);
+                    } else if matches!(self.pending.status_code, Some(401 | 403 | 429 | 500..=599))
+                    {
+                        record_provider_failure(
+                            ProviderKind::Codex,
+                            &self.pending.provider_id,
+                            &self.pending.provider_name,
+                            &self.pending.id,
+                            self.pending.started_at_ms,
+                            &self.pending.path,
+                            &self.pending.model,
+                            provider_failure_kind_for_status(self.pending.status_code),
+                            self.pending.status_code,
+                            self.pending
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "上游流式响应失败".to_string()),
+                        );
+                    }
                 }
                 std::task::Poll::Ready(None)
             }
@@ -5612,6 +5876,18 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                     if !self.finished {
                         self.finished = true;
                         self.pending.error = Some(format!("读取上游流失败: {err}"));
+                        record_provider_failure(
+                            ProviderKind::Codex,
+                            &self.pending.provider_id,
+                            &self.pending.provider_name,
+                            &self.pending.id,
+                            self.pending.started_at_ms,
+                            &self.pending.path,
+                            &self.pending.model,
+                            ProviderFailureKind::Stream,
+                            self.pending.status_code,
+                            format!("读取上游流失败: {err}"),
+                        );
                         let pending = self.pending.clone();
                         let usage = self.usage.clone();
                         finish_route_log(pending, false, usage, self.first_byte_ms);
@@ -5638,11 +5914,89 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                         let pending = self.pending.clone();
                         let usage = self.usage.clone();
                         finish_route_log(pending, self.status_success, usage, self.first_byte_ms);
+                        if self.status_success {
+                            record_provider_success(ProviderKind::Codex, &self.pending.provider_id);
+                        } else if matches!(
+                            self.pending.status_code,
+                            Some(401 | 403 | 429 | 500..=599)
+                        ) {
+                            record_provider_failure(
+                                ProviderKind::Codex,
+                                &self.pending.provider_id,
+                                &self.pending.provider_name,
+                                &self.pending.id,
+                                self.pending.started_at_ms,
+                                &self.pending.path,
+                                &self.pending.model,
+                                provider_failure_kind_for_status(self.pending.status_code),
+                                self.pending.status_code,
+                                self.pending
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "上游流式响应失败".to_string()),
+                            );
+                        }
                     }
                     return std::task::Poll::Ready(None);
                 }
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             }
+        }
+    }
+}
+
+impl futures_util::Stream for ClaudeStreamState {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.stream.poll_next_unpin(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => std::task::Poll::Ready(Some(Ok(bytes))),
+            std::task::Poll::Ready(Some(Err(err))) => {
+                if !self.finished {
+                    self.finished = true;
+                    record_provider_failure(
+                        ProviderKind::Claude,
+                        &self.provider_id,
+                        &self.provider_name,
+                        &self.request_id,
+                        self.started_at_ms,
+                        &self.path,
+                        &self.model,
+                        ProviderFailureKind::Stream,
+                        self.status_code,
+                        format!("读取上游流失败: {err}"),
+                    );
+                }
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(err))))
+            }
+            std::task::Poll::Ready(None) => {
+                if !self.finished {
+                    self.finished = true;
+                    if self.status_success {
+                        record_provider_success(ProviderKind::Claude, &self.provider_id);
+                    } else if matches!(self.status_code, Some(401 | 403 | 429 | 500..=599)) {
+                        record_provider_failure(
+                            ProviderKind::Claude,
+                            &self.provider_id,
+                            &self.provider_name,
+                            &self.request_id,
+                            self.started_at_ms,
+                            &self.path,
+                            &self.model,
+                            provider_failure_kind_for_status(self.status_code),
+                            self.status_code,
+                            self.status_code
+                                .map(|status| format!("{} 返回 {}", self.provider_name, status))
+                                .unwrap_or_else(|| "上游流式响应失败".to_string()),
+                        );
+                    }
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -5718,6 +6072,8 @@ async fn proxy_claude_request(
     path: String,
     body: Body,
 ) -> Response {
+    let request_started_at_ms = current_epoch_ms().unwrap_or_default();
+    let route_request_id = request_id(request_started_at_ms);
     let (router, candidates) = match upstream_claude_candidates() {
         Ok(config) => config,
         Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
@@ -5744,9 +6100,14 @@ async fn proxy_claude_request(
         .filter(|candidate| claude_provider_accepts_model(&candidate.provider, &model))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
+        let auto_disabled_supports_model = !model.trim().is_empty()
+            && model != "未知模型"
+            && auto_disabled_claude_provider_supports_model(&model);
         return proxy_error(
             StatusCode::BAD_GATEWAY,
-            if model.trim().is_empty() || model == "未知模型" {
+            if auto_disabled_supports_model {
+                format!("支持模型 {model} 的 Claude 供应商今日已自动禁用")
+            } else if model.trim().is_empty() || model == "未知模型" {
                 "没有可用的 Claude 上游供应商".to_string()
             } else {
                 format!("没有可用的 Claude 上游供应商支持模型: {model}")
@@ -5783,6 +6144,18 @@ async fn proxy_claude_request(
             Ok(response) => response,
             Err(err) => {
                 last_error = format!("转发到 {} 失败: {err}", candidate.provider.name);
+                record_provider_failure(
+                    ProviderKind::Claude,
+                    &candidate.provider.id,
+                    &candidate.provider.name,
+                    &route_request_id,
+                    request_started_at_ms,
+                    &format!("/{path}"),
+                    &model,
+                    ProviderFailureKind::Network,
+                    None,
+                    last_error.clone(),
+                );
                 if attempt_index + 1 < candidates.len() {
                     continue;
                 }
@@ -5796,6 +6169,22 @@ async fn proxy_claude_request(
             matches!(status.as_u16(), 429 | 500..=599) && attempt_index + 1 < candidates.len();
         if should_retry {
             last_error = format!("{} 返回 {}", candidate.provider.name, status.as_u16());
+            record_provider_failure(
+                ProviderKind::Claude,
+                &candidate.provider.id,
+                &candidate.provider.name,
+                &route_request_id,
+                request_started_at_ms,
+                &format!("/{path}"),
+                &model,
+                if status.as_u16() == 429 {
+                    ProviderFailureKind::RateLimit
+                } else {
+                    ProviderFailureKind::UpstreamServer
+                },
+                Some(status.as_u16()),
+                last_error.clone(),
+            );
             continue;
         }
 
@@ -5809,9 +6198,18 @@ async fn proxy_claude_request(
         let mut builder = Response::builder().status(status);
         copy_upstream_headers(&mut builder, &response_headers);
         if content_type.contains("text/event-stream") {
-            let stream = upstream
-                .bytes_stream()
-                .map(|result| result.map_err(std::io::Error::other));
+            let stream = ClaudeStreamState {
+                stream: upstream.bytes_stream().boxed(),
+                provider_id: candidate.provider.id.clone(),
+                provider_name: candidate.provider.name.clone(),
+                request_id: route_request_id.clone(),
+                started_at_ms: request_started_at_ms,
+                path: format!("/{path}"),
+                model: model.clone(),
+                status_success: status.is_success(),
+                status_code: Some(status.as_u16()),
+                finished: false,
+            };
             return builder
                 .body(Body::from_stream(stream))
                 .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"));
@@ -5820,9 +6218,37 @@ async fn proxy_claude_request(
         let bytes = match upstream.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
+                record_provider_failure(
+                    ProviderKind::Claude,
+                    &candidate.provider.id,
+                    &candidate.provider.name,
+                    &route_request_id,
+                    request_started_at_ms,
+                    &format!("/{path}"),
+                    &model,
+                    ProviderFailureKind::ResponseRead,
+                    Some(status.as_u16()),
+                    format!("读取上游响应失败: {err}"),
+                );
                 return proxy_error(StatusCode::BAD_GATEWAY, format!("读取上游响应失败: {err}"));
             }
         };
+        if status.is_success() {
+            record_provider_success(ProviderKind::Claude, &candidate.provider.id);
+        } else if matches!(status.as_u16(), 401 | 403 | 429 | 500..=599) {
+            record_provider_failure(
+                ProviderKind::Claude,
+                &candidate.provider.id,
+                &candidate.provider.name,
+                &route_request_id,
+                request_started_at_ms,
+                &format!("/{path}"),
+                &model,
+                provider_failure_kind_for_status(Some(status.as_u16())),
+                Some(status.as_u16()),
+                format!("{} 返回 {}", candidate.provider.name, status.as_u16()),
+            );
+        }
         return builder
             .body(Body::from(bytes))
             .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"));
@@ -5858,6 +6284,7 @@ async fn proxy_request(
 
     let request_started = Instant::now();
     let request_started_at_ms = current_epoch_ms().unwrap_or_default();
+    let route_request_id = request_id(request_started_at_ms);
     let (router, candidates) = match upstream_candidates() {
         Ok(config) => config,
         Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
@@ -5896,9 +6323,14 @@ async fn proxy_request(
         .filter(|candidate| provider_accepts_model(&candidate.provider, &model))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
+        let auto_disabled_supports_model = !model.trim().is_empty()
+            && model != "未知模型"
+            && auto_disabled_codex_provider_supports_model(&model);
         return proxy_error(
             StatusCode::BAD_GATEWAY,
-            if model.trim().is_empty() || model == "未知模型" {
+            if auto_disabled_supports_model {
+                format!("支持模型 {model} 的供应商今日已自动禁用")
+            } else if model.trim().is_empty() || model == "未知模型" {
                 "没有可用的上游供应商".to_string()
             } else {
                 format!("没有可用的上游供应商支持模型: {model}")
@@ -5940,10 +6372,23 @@ async fn proxy_request(
             Ok(response) => response,
             Err(err) => {
                 last_error = format!("转发到 {} 失败: {err}", candidate.provider.name);
+                record_provider_failure(
+                    ProviderKind::Codex,
+                    &candidate.provider.id,
+                    &candidate.provider.name,
+                    &route_request_id,
+                    request_started_at_ms,
+                    &format!("/v1/{path}"),
+                    &model,
+                    ProviderFailureKind::Network,
+                    None,
+                    last_error.clone(),
+                );
                 if attempt_index + 1 < candidates.len() {
                     continue;
                 }
                 let pending = build_pending_route_log(
+                    route_request_id.clone(),
                     request_started_at_ms,
                     request_started,
                     candidate,
@@ -5967,10 +6412,27 @@ async fn proxy_request(
             matches!(status.as_u16(), 429 | 500..=599) && attempt_index + 1 < candidates.len();
         if should_retry {
             last_error = format!("{} 返回 {}", candidate.provider.name, status.as_u16());
+            record_provider_failure(
+                ProviderKind::Codex,
+                &candidate.provider.id,
+                &candidate.provider.name,
+                &route_request_id,
+                request_started_at_ms,
+                &format!("/v1/{path}"),
+                &model,
+                if status.as_u16() == 429 {
+                    ProviderFailureKind::RateLimit
+                } else {
+                    ProviderFailureKind::UpstreamServer
+                },
+                Some(status.as_u16()),
+                last_error.clone(),
+            );
             continue;
         }
 
         let pending = build_pending_route_log(
+            route_request_id.clone(),
             request_started_at_ms,
             request_started,
             candidate,
@@ -6066,6 +6528,18 @@ async fn proxy_request(
             Err(err) => {
                 let mut failed = pending;
                 failed.error = Some(format!("读取上游响应失败: {err}"));
+                record_provider_failure(
+                    ProviderKind::Codex,
+                    &candidate.provider.id,
+                    &candidate.provider.name,
+                    &route_request_id,
+                    request_started_at_ms,
+                    &format!("/v1/{path}"),
+                    &model,
+                    ProviderFailureKind::ResponseRead,
+                    Some(status.as_u16()),
+                    format!("读取上游响应失败: {err}"),
+                );
                 finish_route_log(failed, false, TokenUsage::default(), first_byte_ms);
                 return proxy_error(StatusCode::BAD_GATEWAY, format!("读取上游响应失败: {err}"));
             }
@@ -6078,6 +6552,18 @@ async fn proxy_request(
                     Err(err) => {
                         let mut failed = pending;
                         failed.error = Some(err.clone());
+                        record_provider_failure(
+                            ProviderKind::Codex,
+                            &candidate.provider.id,
+                            &candidate.provider.name,
+                            &route_request_id,
+                            request_started_at_ms,
+                            &format!("/v1/{path}"),
+                            &model,
+                            ProviderFailureKind::Protocol,
+                            Some(status.as_u16()),
+                            err.clone(),
+                        );
                         finish_route_log(failed, false, TokenUsage::default(), first_byte_ms);
                         return proxy_error(StatusCode::BAD_GATEWAY, err);
                     }
@@ -6086,6 +6572,28 @@ async fn proxy_request(
         };
         let usage = usage_from_response_text(&String::from_utf8_lossy(&response_bytes));
         finish_route_log(pending, status_success, usage, first_byte_ms);
+        if status_success {
+            record_provider_success(ProviderKind::Codex, &candidate.provider.id);
+        } else if matches!(status.as_u16(), 401 | 403 | 429 | 500..=599) {
+            record_provider_failure(
+                ProviderKind::Codex,
+                &candidate.provider.id,
+                &candidate.provider.name,
+                &route_request_id,
+                request_started_at_ms,
+                &format!("/v1/{path}"),
+                &model,
+                if matches!(status.as_u16(), 401 | 403) {
+                    ProviderFailureKind::Authentication
+                } else if status.as_u16() == 429 {
+                    ProviderFailureKind::RateLimit
+                } else {
+                    ProviderFailureKind::UpstreamServer
+                },
+                Some(status.as_u16()),
+                format!("{} 返回 {}", candidate.provider.name, status.as_u16()),
+            );
+        }
 
         let mut builder = Response::builder().status(status);
         if let Some(headers_mut) = builder.headers_mut() {
@@ -6923,6 +7431,187 @@ fn append_route_log(log: &RouteRequestLog) -> Result<(), String> {
         .open(&path)
         .map_err(|err| format!("无法写入路由日志 {}: {err}", path.display()))?;
     writeln!(file, "{line}").map_err(|err| format!("无法写入路由日志: {err}"))
+}
+
+fn append_provider_failure_event(event: &ProviderFailureEvent) -> Result<(), String> {
+    fs::create_dir_all(manager_dir()?).map_err(|err| format!("无法创建管理目录: {err}"))?;
+    let line =
+        serde_json::to_string(event).map_err(|err| format!("无法序列化供应商失败事件: {err}"))?;
+    let path = provider_failure_events_path()?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| format!("无法写入供应商失败事件 {}: {err}", path.display()))?;
+    writeln!(file, "{line}").map_err(|err| format!("无法写入供应商失败事件: {err}"))
+}
+
+fn provider_failure_kind_for_status(status_code: Option<u16>) -> ProviderFailureKind {
+    match status_code {
+        Some(401 | 403) => ProviderFailureKind::Authentication,
+        Some(429) => ProviderFailureKind::RateLimit,
+        Some(500..=599) => ProviderFailureKind::UpstreamServer,
+        _ => ProviderFailureKind::Protocol,
+    }
+}
+
+fn record_provider_success(provider_kind: ProviderKind, provider_id: &str) {
+    let lock = PROVIDER_HEALTH_LOCK.get_or_init(|| Mutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+    let Ok(mut state) = load_state_file() else {
+        return;
+    };
+    let changed = match provider_kind {
+        ProviderKind::Codex => state
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == provider_id)
+            .map(clear_provider_failure_state)
+            .unwrap_or(false),
+        ProviderKind::Claude => state
+            .claude_providers
+            .iter_mut()
+            .find(|provider| provider.id == provider_id)
+            .map(clear_claude_provider_failure_state)
+            .unwrap_or(false),
+    };
+    if changed {
+        let _ = save_state(&state);
+    }
+}
+
+fn clear_provider_failure_state(provider: &mut ProviderConfig) -> bool {
+    let changed = provider.consecutive_failure_count != 0
+        || provider.auto_disabled_day.is_some()
+        || provider.last_failure_reason.is_some()
+        || provider.last_failure_at_ms.is_some()
+        || provider.status == ProviderStatus::AutoDisabled;
+    if changed {
+        provider.status = ProviderStatus::Enabled;
+        provider.enabled = true;
+        provider.consecutive_failure_count = 0;
+        provider.auto_disabled_day = None;
+        provider.last_failure_reason = None;
+        provider.last_failure_at_ms = None;
+    }
+    changed
+}
+
+fn clear_claude_provider_failure_state(provider: &mut ClaudeProviderConfig) -> bool {
+    let changed = provider.consecutive_failure_count != 0
+        || provider.auto_disabled_day.is_some()
+        || provider.last_failure_reason.is_some()
+        || provider.last_failure_at_ms.is_some()
+        || provider.status == ProviderStatus::AutoDisabled;
+    if changed {
+        provider.status = ProviderStatus::Enabled;
+        provider.enabled = true;
+        provider.consecutive_failure_count = 0;
+        provider.auto_disabled_day = None;
+        provider.last_failure_reason = None;
+        provider.last_failure_at_ms = None;
+    }
+    changed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_provider_failure(
+    provider_kind: ProviderKind,
+    provider_id: &str,
+    provider_name: &str,
+    route_request_id: &str,
+    started_at_ms: i64,
+    path: &str,
+    model: &str,
+    failure_kind: ProviderFailureKind,
+    status_code: Option<u16>,
+    error: String,
+) {
+    let lock = PROVIDER_HEALTH_LOCK.get_or_init(|| Mutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+    let (day, _) = timestamp_to_route_parts(started_at_ms);
+    let mut consecutive_failure_count = 1;
+    let mut auto_disabled = false;
+    let mut counted = true;
+
+    if let Ok(mut state) = load_state_file() {
+        match provider_kind {
+            ProviderKind::Codex => {
+                if let Some(provider) = state
+                    .providers
+                    .iter_mut()
+                    .find(|provider| provider.id == provider_id)
+                {
+                    if provider.status == ProviderStatus::Disabled {
+                        counted = false;
+                        consecutive_failure_count = provider.consecutive_failure_count;
+                    } else {
+                        provider.consecutive_failure_count =
+                            provider.consecutive_failure_count.saturating_add(1);
+                        provider.last_failure_reason = Some(error.clone());
+                        provider.last_failure_at_ms = Some(started_at_ms);
+                        if provider.consecutive_failure_count >= AUTO_DISABLE_FAILURE_THRESHOLD {
+                            provider.status = ProviderStatus::AutoDisabled;
+                            provider.enabled = false;
+                            provider.auto_disabled_day = Some(day.clone());
+                            auto_disabled = true;
+                        }
+                        consecutive_failure_count = provider.consecutive_failure_count;
+                    }
+                }
+            }
+            ProviderKind::Claude => {
+                if let Some(provider) = state
+                    .claude_providers
+                    .iter_mut()
+                    .find(|provider| provider.id == provider_id)
+                {
+                    if provider.status == ProviderStatus::Disabled {
+                        counted = false;
+                        consecutive_failure_count = provider.consecutive_failure_count;
+                    } else {
+                        provider.consecutive_failure_count =
+                            provider.consecutive_failure_count.saturating_add(1);
+                        provider.last_failure_reason = Some(error.clone());
+                        provider.last_failure_at_ms = Some(started_at_ms);
+                        if provider.consecutive_failure_count >= AUTO_DISABLE_FAILURE_THRESHOLD {
+                            provider.status = ProviderStatus::AutoDisabled;
+                            provider.enabled = false;
+                            provider.auto_disabled_day = Some(day.clone());
+                            auto_disabled = true;
+                        }
+                        consecutive_failure_count = provider.consecutive_failure_count;
+                    }
+                }
+            }
+        }
+        let _ = save_state(&state);
+    }
+
+    let event = ProviderFailureEvent {
+        id: request_id(current_epoch_ms().unwrap_or(started_at_ms)),
+        request_id: route_request_id.to_string(),
+        started_at_ms,
+        day,
+        provider_kind,
+        provider_id: provider_id.to_string(),
+        provider_name: provider_name.to_string(),
+        model: model.to_string(),
+        path: path.to_string(),
+        failure_kind,
+        status_code,
+        error,
+        counted,
+        consecutive_failure_count,
+        auto_disabled,
+    };
+    if let Err(err) = append_provider_failure_event(&event) {
+        eprintln!("{err}");
+    }
 }
 
 fn usage_from_route_log(log: &RouteRequestLog) -> TokenUsage {
@@ -8118,7 +8807,12 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
             ProviderSummary {
                 id: provider.id.clone(),
                 name: provider.name.clone(),
+                status: provider.status,
                 enabled: provider.enabled,
+                consecutive_failure_count: provider.consecutive_failure_count,
+                auto_disabled_day: provider.auto_disabled_day.clone(),
+                last_failure_reason: provider.last_failure_reason.clone(),
+                last_failure_at_ms: provider.last_failure_at_ms,
                 pending_changes,
                 base_url: custom_provider_base_url(provider).unwrap_or_default(),
                 provider_type: provider_type(provider),
@@ -8155,7 +8849,12 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
             ProviderSummary {
                 id: provider.id.clone(),
                 name: provider.name.clone(),
+                status: provider.status,
                 enabled: provider.enabled,
+                consecutive_failure_count: provider.consecutive_failure_count,
+                auto_disabled_day: provider.auto_disabled_day.clone(),
+                last_failure_reason: provider.last_failure_reason.clone(),
+                last_failure_at_ms: provider.last_failure_at_ms,
                 pending_changes: 0,
                 base_url: provider.base_url.clone(),
                 provider_type: "Claude".to_string(),
@@ -8280,7 +8979,20 @@ fn save_provider(
     }
 
     if let Some(enabled) = payload.enabled {
-        provider.enabled = enabled;
+        let status = if enabled {
+            ProviderStatus::Enabled
+        } else {
+            ProviderStatus::Disabled
+        };
+        provider.status = status;
+        set_provider_status_fields(
+            status,
+            &mut provider.enabled,
+            &mut provider.consecutive_failure_count,
+            &mut provider.auto_disabled_day,
+            &mut provider.last_failure_reason,
+            &mut provider.last_failure_at_ms,
+        );
     }
     if let Some(connection_test_model) = payload.connection_test_model {
         provider.connection_test_model = connection_test_model.trim().to_string();
@@ -8345,7 +9057,20 @@ fn save_claude_provider(
         provider.name = trimmed.to_string();
     }
     if let Some(enabled) = payload.enabled {
-        provider.enabled = enabled;
+        let status = if enabled {
+            ProviderStatus::Enabled
+        } else {
+            ProviderStatus::Disabled
+        };
+        provider.status = status;
+        set_provider_status_fields(
+            status,
+            &mut provider.enabled,
+            &mut provider.consecutive_failure_count,
+            &mut provider.auto_disabled_day,
+            &mut provider.last_failure_reason,
+            &mut provider.last_failure_at_ms,
+        );
     }
     if let Some(base_url) = payload.base_url {
         provider.base_url = base_url.trim().trim_end_matches('/').to_string();
@@ -8537,7 +9262,12 @@ fn add_provider(
     state.providers.push(ProviderConfig {
         id: id.clone(),
         name: trimmed.to_string(),
+        status: ProviderStatus::Enabled,
         enabled: true,
+        consecutive_failure_count: 0,
+        auto_disabled_day: None,
+        last_failure_reason: None,
+        last_failure_at_ms: None,
         wire_api: ProviderWireApi::Responses,
         service_tier: String::new(),
         connection_test_model: String::new(),
@@ -8608,7 +9338,12 @@ fn add_claude_provider(
     state.claude_providers.push(ClaudeProviderConfig {
         id: id.clone(),
         name: trimmed.to_string(),
+        status: ProviderStatus::Enabled,
         enabled: true,
+        consecutive_failure_count: 0,
+        auto_disabled_day: None,
+        last_failure_reason: None,
+        last_failure_at_ms: None,
         base_url: String::new(),
         api_key: String::new(),
         connection_test_model: String::new(),
@@ -9143,6 +9878,30 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    fn test_provider_config(id: &str, status: ProviderStatus, enabled: bool) -> ProviderConfig {
+        ProviderConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            status,
+            enabled,
+            consecutive_failure_count: 0,
+            auto_disabled_day: None,
+            last_failure_reason: None,
+            last_failure_at_ms: None,
+            config: json!({}),
+            wire_api: ProviderWireApi::Responses,
+            service_tier: String::new(),
+            connection_test_model: String::new(),
+            allowed_models: Vec::new(),
+            model_mappings: Vec::new(),
+            provider_pricing: Vec::new(),
+            pricing_sync_status: None,
+            balance_query: BalanceQueryConfig::default(),
+            balance_status: None,
+            connection_status: None,
+        }
+    }
+
     struct ChatStreamTestState {
         buffer: String,
         response_id: String,
@@ -9236,6 +9995,99 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_legacy_disabled_provider_to_disabled_status() {
+        let mut state = default_state();
+        state.providers = vec![test_provider_config(
+            "provider-a",
+            ProviderStatus::Enabled,
+            false,
+        )];
+
+        let normalized = normalize_state(state);
+
+        assert_eq!(normalized.providers[0].status, ProviderStatus::Disabled);
+        assert!(!normalized.providers[0].enabled);
+    }
+
+    #[test]
+    fn keeps_auto_disabled_provider_for_current_day() {
+        let mut provider = test_provider_config("provider-a", ProviderStatus::AutoDisabled, false);
+        provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD;
+        provider.auto_disabled_day = Some(provider_day_now());
+        provider.last_failure_reason = Some("upstream failed".to_string());
+        provider.last_failure_at_ms = Some(1);
+        let mut state = default_state();
+        state.providers = vec![provider];
+
+        let normalized = normalize_state(state);
+
+        assert_eq!(normalized.providers[0].status, ProviderStatus::AutoDisabled);
+        assert!(!normalized.providers[0].enabled);
+        assert_eq!(
+            normalized.providers[0].consecutive_failure_count,
+            AUTO_DISABLE_FAILURE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn keeps_enabled_provider_failure_sequence_across_normalization() {
+        let mut provider = test_provider_config("provider-a", ProviderStatus::Enabled, true);
+        provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD - 1;
+        provider.last_failure_reason = Some("upstream failed".to_string());
+        provider.last_failure_at_ms = Some(1);
+        let mut state = default_state();
+        state.providers = vec![provider];
+
+        let normalized = normalize_state(state);
+
+        assert_eq!(normalized.providers[0].status, ProviderStatus::Enabled);
+        assert!(normalized.providers[0].enabled);
+        assert_eq!(
+            normalized.providers[0].consecutive_failure_count,
+            AUTO_DISABLE_FAILURE_THRESHOLD - 1
+        );
+        assert_eq!(
+            normalized.providers[0].last_failure_reason.as_deref(),
+            Some("upstream failed")
+        );
+    }
+
+    #[test]
+    fn recovers_auto_disabled_provider_after_provider_day_changes() {
+        let mut provider = test_provider_config("provider-a", ProviderStatus::AutoDisabled, false);
+        provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD;
+        provider.auto_disabled_day = Some("1900-01-01".to_string());
+        provider.last_failure_reason = Some("upstream failed".to_string());
+        provider.last_failure_at_ms = Some(1);
+        let mut state = default_state();
+        state.providers = vec![provider];
+
+        let normalized = normalize_state(state);
+
+        assert_eq!(normalized.providers[0].status, ProviderStatus::Enabled);
+        assert!(normalized.providers[0].enabled);
+        assert_eq!(normalized.providers[0].consecutive_failure_count, 0);
+        assert_eq!(normalized.providers[0].auto_disabled_day, None);
+        assert_eq!(normalized.providers[0].last_failure_reason, None);
+    }
+
+    #[test]
+    fn provider_success_clears_auto_disabled_state() {
+        let mut provider = test_provider_config("provider-a", ProviderStatus::AutoDisabled, false);
+        provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD;
+        provider.auto_disabled_day = Some(provider_day_now());
+        provider.last_failure_reason = Some("upstream failed".to_string());
+        provider.last_failure_at_ms = Some(1);
+
+        assert!(clear_provider_failure_state(&mut provider));
+        assert_eq!(provider.status, ProviderStatus::Enabled);
+        assert!(provider.enabled);
+        assert_eq!(provider.consecutive_failure_count, 0);
+        assert_eq!(provider.auto_disabled_day, None);
+        assert_eq!(provider.last_failure_reason, None);
+    }
+
+    #[test]
     fn patches_and_restores_claude_settings_env_fields() {
         let settings = json!({
             "env": {
@@ -9313,7 +10165,12 @@ mod tests {
         let provider = ClaudeProviderConfig {
             id: "anthropic".to_string(),
             name: "Anthropic".to_string(),
+            status: ProviderStatus::Enabled,
             enabled: true,
+            consecutive_failure_count: 0,
+            auto_disabled_day: None,
+            last_failure_reason: None,
+            last_failure_at_ms: None,
             base_url: "https://api.anthropic.com".to_string(),
             api_key: "sk-ant".to_string(),
             connection_test_model: String::new(),
@@ -9537,7 +10394,12 @@ mod tests {
         let provider = ProviderConfig {
             id: "provider-a".to_string(),
             name: "Provider A".to_string(),
+            status: ProviderStatus::Enabled,
             enabled: true,
+            consecutive_failure_count: 0,
+            auto_disabled_day: None,
+            last_failure_reason: None,
+            last_failure_at_ms: None,
             config: json!({
                 "model_provider": "custom",
                 "model_providers": {
@@ -9580,7 +10442,12 @@ mod tests {
         let provider = ProviderConfig {
             id: "provider-a".to_string(),
             name: "Provider A".to_string(),
+            status: ProviderStatus::Enabled,
             enabled: true,
+            consecutive_failure_count: 0,
+            auto_disabled_day: None,
+            last_failure_reason: None,
+            last_failure_at_ms: None,
             config: json!({}),
             wire_api: ProviderWireApi::Responses,
             service_tier: String::new(),
@@ -9845,7 +10712,12 @@ mod tests {
                 provider: ProviderConfig {
                     id: "provider-a".to_string(),
                     name: "Provider A".to_string(),
+                    status: ProviderStatus::Enabled,
                     enabled: true,
+                    consecutive_failure_count: 0,
+                    auto_disabled_day: None,
+                    last_failure_reason: None,
+                    last_failure_at_ms: None,
                     config: json!({}),
                     wire_api: ProviderWireApi::Responses,
                     service_tier: String::new(),
@@ -9870,7 +10742,12 @@ mod tests {
                 provider: ProviderConfig {
                     id: "provider-b".to_string(),
                     name: "Provider B".to_string(),
+                    status: ProviderStatus::Enabled,
                     enabled: true,
+                    consecutive_failure_count: 0,
+                    auto_disabled_day: None,
+                    last_failure_reason: None,
+                    last_failure_at_ms: None,
                     config: json!({}),
                     wire_api: ProviderWireApi::ChatCompletions,
                     service_tier: String::new(),
@@ -9900,7 +10777,12 @@ mod tests {
         let provider = ProviderConfig {
             id: "provider-b".to_string(),
             name: "Provider B".to_string(),
+            status: ProviderStatus::Enabled,
             enabled: true,
+            consecutive_failure_count: 0,
+            auto_disabled_day: None,
+            last_failure_reason: None,
+            last_failure_at_ms: None,
             config: json!({}),
             wire_api: ProviderWireApi::ChatCompletions,
             service_tier: String::new(),
@@ -9933,7 +10815,12 @@ mod tests {
         let mut provider = ProviderConfig {
             id: "provider-a".to_string(),
             name: "Provider A".to_string(),
+            status: ProviderStatus::Enabled,
             enabled: true,
+            consecutive_failure_count: 0,
+            auto_disabled_day: None,
+            last_failure_reason: None,
+            last_failure_at_ms: None,
             config: json!({}),
             wire_api: ProviderWireApi::Responses,
             service_tier: "priority".to_string(),
@@ -10699,7 +11586,12 @@ mod tests {
         let mut provider = ClaudeProviderConfig {
             id: "anthropic".to_string(),
             name: "Anthropic".to_string(),
+            status: ProviderStatus::Enabled,
             enabled: true,
+            consecutive_failure_count: 0,
+            auto_disabled_day: None,
+            last_failure_reason: None,
+            last_failure_at_ms: None,
             base_url: "https://api.anthropic.com".to_string(),
             api_key: "sk-ant".to_string(),
             connection_test_model: String::new(),

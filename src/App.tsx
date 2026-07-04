@@ -14,6 +14,7 @@ type BalanceQueryType = "disabled" | "new_api" | "sub2_api";
 type NewApiBalanceTarget = "token_quota" | "account_balance";
 type BalanceAuthMode = "provider_token" | "separate_token";
 type ProviderWireApi = "responses" | "chat_completions";
+type ProviderStatus = "enabled" | "disabled" | "auto_disabled";
 
 type BalanceQueryConfig = {
   enabled: boolean;
@@ -106,7 +107,12 @@ type RouterStatus = {
 type ProviderConfig = {
   id: string;
   name: string;
+  status: ProviderStatus;
   enabled: boolean;
+  consecutive_failure_count: number;
+  auto_disabled_day?: string | null;
+  last_failure_reason?: string | null;
+  last_failure_at_ms?: number | null;
   config: JsonValue;
   wire_api: ProviderWireApi;
   service_tier: string;
@@ -123,7 +129,12 @@ type ProviderConfig = {
 type ClaudeProviderConfig = {
   id: string;
   name: string;
+  status: ProviderStatus;
   enabled: boolean;
+  consecutive_failure_count: number;
+  auto_disabled_day?: string | null;
+  last_failure_reason?: string | null;
+  last_failure_at_ms?: number | null;
   base_url: string;
   api_key: string;
   connection_test_model: string;
@@ -136,7 +147,12 @@ type ClaudeProviderConfig = {
 type ProviderSummary = {
   id: string;
   name: string;
+  status: ProviderStatus;
   enabled: boolean;
+  consecutive_failure_count: number;
+  auto_disabled_day?: string | null;
+  last_failure_reason?: string | null;
+  last_failure_at_ms?: number | null;
   pending_changes: number;
   base_url: string;
   provider_type: string;
@@ -637,7 +653,8 @@ function formatBalanceForCard(label: string) {
 }
 
 function providerStatus(provider: ProviderSummary) {
-  if (!provider.enabled) return { label: "不可用", tone: "danger" };
+  if (provider.status === "auto_disabled") return { label: "自动禁用", tone: "danger" };
+  if (provider.status === "disabled" || !provider.enabled) return { label: "禁用", tone: "danger" };
   if (provider.latency_error) return { label: "异常", tone: "warn" };
   if (provider.latency_ms == null) return { label: "未测试", tone: "warn" };
   if (provider.latency_ms != null && provider.latency_ms > 500) {
@@ -870,6 +887,7 @@ function App() {
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerApiKeyDirty, setProviderApiKeyDirty] = useState(false);
   const [providerEnabled, setProviderEnabled] = useState(true);
+  const [providerEnabledDirty, setProviderEnabledDirty] = useState(false);
   const [providerWireApi, setProviderWireApi] = useState<ProviderWireApi>("responses");
   const [providerServiceTier, setProviderServiceTier] = useState("");
   const [connectionTestResult, setConnectionTestResult] = useState<ProviderConnectionTestResult | null>(null);
@@ -1009,7 +1027,8 @@ function App() {
     setProviderBaseUrl(summary?.base_url || fields.baseUrl);
     setProviderApiKey(fields.apiKey);
     setProviderApiKeyDirty(false);
-    setProviderEnabled(summary?.enabled ?? targetFull.enabled ?? true);
+    setProviderEnabled((summary?.status ?? targetFull.status) === "enabled");
+    setProviderEnabledDirty(false);
     setProviderWireApi(targetFull.wire_api ?? "responses");
     setProviderServiceTier(targetFull.service_tier ?? "");
     setProviderTestModel(targetFull.connection_test_model ?? "");
@@ -1038,7 +1057,8 @@ function App() {
     setProviderBaseUrl(summary?.base_url || targetFull.base_url || "");
     setProviderApiKey(targetFull.api_key || "");
     setProviderApiKeyDirty(false);
-    setProviderEnabled(summary?.enabled ?? targetFull.enabled ?? true);
+    setProviderEnabled((summary?.status ?? targetFull.status) === "enabled");
+    setProviderEnabledDirty(false);
     setProviderTestModel(targetFull.connection_test_model ?? "");
     setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
     setAllowedModels(targetFull.allowed_models ?? []);
@@ -1116,7 +1136,6 @@ function App() {
         provider_name: providerName,
         config_toml: "",
         base_url: providerBaseUrl,
-        enabled: providerEnabled,
         wire_api: providerWireApi,
         service_tier: providerServiceTier,
         balance_query: nextBalance,
@@ -1128,6 +1147,9 @@ function App() {
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
+      }
+      if (providerEnabledDirty) {
+        payload.enabled = providerEnabled;
       }
       const state = await callCommand<AppState>("save_provider", {
         payload,
@@ -1144,7 +1166,6 @@ function App() {
         provider_id: editingId,
         provider_name: providerName,
         base_url: providerBaseUrl,
-        enabled: providerEnabled,
         connection_test_model: providerTestModel,
         allowed_models: allowedModels,
         model_mappings: modelMappings,
@@ -1152,6 +1173,9 @@ function App() {
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
+      }
+      if (providerEnabledDirty) {
+        payload.enabled = providerEnabled;
       }
       const state = await callCommand<AppState>("save_claude_provider", {
         payload,
@@ -1671,7 +1695,10 @@ function App() {
             setProviderModels([]);
             setProviderTestModel("");
           }}
-          setProviderEnabled={setProviderEnabled}
+          setProviderEnabled={(value) => {
+            setProviderEnabled(value);
+            setProviderEnabledDirty(true);
+          }}
           setAllowedModels={setAllowedModels}
           setModelMappings={setModelMappings}
           setProviderPricing={setProviderPricing}
@@ -1713,7 +1740,10 @@ function App() {
             setProviderModels([]);
             setProviderTestModel("");
           }}
-          setProviderEnabled={setProviderEnabled}
+          setProviderEnabled={(value) => {
+            setProviderEnabled(value);
+            setProviderEnabledDirty(true);
+          }}
           setProviderName={setProviderName}
           setProviderPricing={setProviderPricing}
           setProviderTestModel={setProviderTestModel}
@@ -2686,7 +2716,7 @@ function ProvidersScreen({
           const status = providerStatus(provider);
           return (
             <div
-              className={`provider-line ${provider.enabled ? "selected" : ""} ${draggingProviderId === provider.id ? "dragging" : ""}`}
+              className={`provider-line ${provider.status === "enabled" ? "selected" : ""} ${draggingProviderId === provider.id ? "dragging" : ""}`}
               data-provider-row-id={provider.id}
               key={provider.id}
             >
@@ -2741,7 +2771,7 @@ function ProvidersScreen({
               >
                 {provider.latency_label}
               </b>
-              <Toggle checked={provider.enabled} disabled={busy} onChange={(checked) => onToggle(provider, checked)} />
+              <Toggle checked={provider.status === "enabled"} disabled={busy} onChange={(checked) => onToggle(provider, checked)} />
               <div className="provider-toolbox">
                 <button aria-label="设置" className="icon-button" disabled={busy} onClick={() => onEdit(provider, "base")} title="设置" type="button">
                   <ToolIcon type="settings" />
