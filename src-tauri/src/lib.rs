@@ -37,6 +37,8 @@ const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
 const CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT: i64 = 243_200;
 const CODEX_MODEL_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
+const PI_PROVIDER_ID: &str = "codex-helper";
+const PI_PROVIDER_API: &str = "openai-responses";
 static ROUTE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROVIDER_HEALTH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const AUTO_DISABLE_FAILURE_THRESHOLD: u32 = 3;
@@ -260,6 +262,8 @@ struct ClientConfigs {
     codex: ClientTargetConfig,
     #[serde(default)]
     claude: ClientTargetConfig,
+    #[serde(default)]
+    pi: ClientTargetConfig,
 }
 
 impl Default for RouterConfig {
@@ -305,6 +309,8 @@ struct ManagerState {
     router_backup: Option<RouterApplyBackup>,
     #[serde(default)]
     claude_backup: Option<ClaudeApplyBackup>,
+    #[serde(default)]
+    pi_backup: Option<PiApplyBackup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -329,6 +335,12 @@ struct ClaudeApplyBackup {
     gateway_model_discovery: RouterFieldBackup,
     #[serde(default)]
     default_fable_model: RouterFieldBackup,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PiApplyBackup {
+    #[serde(default)]
+    provider: RouterFieldBackup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -577,6 +589,7 @@ struct AppState {
     app_version: String,
     codex_config_path: String,
     claude_settings_path: String,
+    pi_models_path: String,
     manager_dir: String,
     current_config_raw: String,
     current_config_exists: bool,
@@ -640,6 +653,7 @@ struct ReorderProvidersPayload {
 struct SaveClientConfigsPayload {
     codex_enabled: bool,
     claude_enabled: bool,
+    pi_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1319,6 +1333,10 @@ fn claude_settings_path() -> Result<PathBuf, String> {
     Ok(claude_home()?.join("settings.json"))
 }
 
+fn pi_models_path() -> Result<PathBuf, String> {
+    Ok(home_dir()?.join(".pi").join("agent").join("models.json"))
+}
+
 fn sessions_dir() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("sessions"))
 }
@@ -1339,6 +1357,7 @@ fn default_state() -> ManagerState {
         clients: ClientConfigs::default(),
         router_backup: None,
         claude_backup: None,
+        pi_backup: None,
     }
 }
 
@@ -1554,7 +1573,7 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
     {
         state.router.local_token = random_router_token();
     }
-    if state.clients.codex.enabled || state.clients.claude.enabled {
+    if state.clients.codex.enabled || state.clients.claude.enabled || state.clients.pi.enabled {
         state.router.enabled = true;
     }
     let provider_exists = |provider_id: &str| {
@@ -3506,6 +3525,146 @@ fn restore_claude_backup_json(
     serde_json::to_string_pretty(&settings).map_err(|err| format!("无法生成 Claude 设置: {err}"))
 }
 
+fn read_pi_models_config() -> Result<(Value, String, bool), String> {
+    let path = pi_models_path()?;
+    if !path.exists() {
+        return Ok((Value::Object(Map::new()), String::new(), false));
+    }
+
+    let raw = fs::read_to_string(&path).map_err(|err| format!("无法读取 Pi 模型配置: {err}"))?;
+    let config = serde_json::from_str::<Value>(&raw)
+        .map_err(|err| format!("Pi 模型配置 JSON 无效: {err}"))?;
+    if !config.is_object() {
+        return Err("Pi 模型配置 JSON 顶层必须是对象".to_string());
+    }
+    Ok((config, raw, true))
+}
+
+fn ensure_json_object<'a>(
+    value: &'a mut Value,
+    label: &str,
+) -> Result<&'a mut Map<String, Value>, String> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| format!("{label} 必须是对象"))
+}
+
+fn ensure_pi_providers_object(config: &mut Value) -> Result<&mut Map<String, Value>, String> {
+    let config = ensure_json_object(config, "Pi 模型配置 JSON 顶层")?;
+    let entry = config
+        .entry("providers".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(Map::new());
+    }
+    entry
+        .as_object_mut()
+        .ok_or_else(|| "Pi providers 必须是对象".to_string())
+}
+
+fn capture_pi_backup(config: &Value) -> PiApplyBackup {
+    let provider = config
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get(PI_PROVIDER_ID))
+        .cloned();
+    PiApplyBackup {
+        provider: RouterFieldBackup {
+            existed: provider.is_some(),
+            value: provider,
+        },
+    }
+}
+
+fn route_models_for_pi(state: &ManagerState) -> Vec<String> {
+    let candidates = state
+        .providers
+        .iter()
+        .enumerate()
+        .filter(|(_, provider)| provider.status == ProviderStatus::Enabled)
+        .filter_map(|(index, provider)| {
+            let base_url =
+                custom_provider_base_url(provider).filter(|value| !value.trim().is_empty())?;
+            let token = custom_provider_token(provider).filter(|value| !value.trim().is_empty())?;
+            Some(UpstreamCandidate {
+                provider: provider.clone(),
+                base_url,
+                token,
+                route_order: index + 1,
+            })
+        })
+        .collect::<Vec<_>>();
+    configured_route_models(&candidates)
+}
+
+fn pi_provider_value(router: &RouterConfig, models: &[String]) -> Value {
+    json!({
+        "baseUrl": router_base_url(router),
+        "api": PI_PROVIDER_API,
+        "apiKey": router.local_token,
+        "models": models
+            .iter()
+            .map(|model| {
+                json!({
+                    "id": model,
+                    "contextWindow": CODEX_MODEL_CONTEXT_WINDOW,
+                    "reasoning": true,
+                    "thinkingLevelMap": {
+                        "off": null,
+                        "minimal": null,
+                        "low": "low",
+                        "medium": "medium",
+                        "high": "high",
+                        "xhigh": "xhigh"
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+fn render_pi_models_config(
+    mut config: Value,
+    router: &RouterConfig,
+    models: &[String],
+) -> Result<String, String> {
+    let providers = ensure_pi_providers_object(&mut config)?;
+    providers.insert(
+        PI_PROVIDER_ID.to_string(),
+        pi_provider_value(router, models),
+    );
+    serde_json::to_string_pretty(&config).map_err(|err| format!("无法生成 Pi 模型配置: {err}"))
+}
+
+fn restore_pi_models_config(
+    mut config: Value,
+    backup: Option<&PiApplyBackup>,
+) -> Result<String, String> {
+    let providers = ensure_pi_providers_object(&mut config)?;
+    if let Some(backup) = backup {
+        if backup.provider.existed {
+            if let Some(value) = backup.provider.value.as_ref() {
+                providers.insert(PI_PROVIDER_ID.to_string(), value.clone());
+            } else {
+                providers.remove(PI_PROVIDER_ID);
+            }
+        } else {
+            providers.remove(PI_PROVIDER_ID);
+        }
+    } else {
+        providers.remove(PI_PROVIDER_ID);
+    }
+    serde_json::to_string_pretty(&config).map_err(|err| format!("无法生成 Pi 模型配置: {err}"))
+}
+
+fn pi_patch_matches_current(config: &Value, router: &RouterConfig, models: &[String]) -> bool {
+    config
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get(PI_PROVIDER_ID))
+        == Some(&pi_provider_value(router, models))
+}
+
 fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String> {
     if !state.clients.codex.enabled {
         return Ok(false);
@@ -3555,13 +3714,43 @@ fn ensure_claude_config_applied(state: &mut ManagerState) -> Result<bool, String
     Ok(true)
 }
 
+fn ensure_pi_config_applied(state: &mut ManagerState) -> Result<bool, String> {
+    if !state.clients.pi.enabled {
+        return Ok(false);
+    }
+
+    let models = route_models_for_pi(state);
+    if models.is_empty() {
+        return Err("Pi 接管需要至少一个已启用且配置完整的 Codex 供应商路由模型".to_string());
+    }
+
+    let (config, _, _) = read_pi_models_config()?;
+    if pi_patch_matches_current(&config, &state.router, &models) {
+        return Ok(false);
+    }
+
+    if state.pi_backup.is_none() {
+        state.pi_backup = Some(capture_pi_backup(&config));
+    }
+    fs::create_dir_all(
+        pi_models_path()?
+            .parent()
+            .ok_or_else(|| "无法定位 Pi 模型配置目录".to_string())?,
+    )
+    .map_err(|err| format!("无法创建 Pi 模型配置目录: {err}"))?;
+    let raw = render_pi_models_config(config, &state.router, &models)?;
+    fs::write(pi_models_path()?, raw).map_err(|err| format!("无法写入 Pi 模型配置: {err}"))?;
+    Ok(true)
+}
+
 fn ensure_client_configs_applied(state: &mut ManagerState) -> Result<bool, String> {
-    if state.clients.codex.enabled || state.clients.claude.enabled {
+    if state.clients.codex.enabled || state.clients.claude.enabled || state.clients.pi.enabled {
         state.router.enabled = true;
     }
     let codex_changed = ensure_router_config_applied(state)?;
     let claude_changed = ensure_claude_config_applied(state)?;
-    Ok(codex_changed || claude_changed)
+    let pi_changed = ensure_pi_config_applied(state)?;
+    Ok(codex_changed || claude_changed || pi_changed)
 }
 
 fn compute_diffs(
@@ -8882,6 +9071,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
         app_version: env!("CODEX_HELPER_VERSION").to_string(),
         codex_config_path: codex_config_path()?.display().to_string(),
         claude_settings_path: claude_settings_path()?.display().to_string(),
+        pi_models_path: pi_models_path()?.display().to_string(),
         manager_dir: manager_dir()?.display().to_string(),
         current_config_raw: redacted_toml_text(&current_config_raw),
         current_config_exists,
@@ -9402,7 +9592,11 @@ fn save_client_configs(
     let mut state = load_state_file()?;
     state.clients.codex.enabled = payload.codex_enabled;
     state.clients.claude.enabled = payload.claude_enabled;
-    if state.clients.codex.enabled || state.clients.claude.enabled {
+    state.clients.pi.enabled = payload.pi_enabled;
+    if state.clients.pi.enabled && route_models_for_pi(&state).is_empty() {
+        return Err("Pi 接管需要至少一个已启用且配置完整的 Codex 供应商路由模型".to_string());
+    }
+    if state.clients.codex.enabled || state.clients.claude.enabled || state.clients.pi.enabled {
         state.router.enabled = true;
     }
     save_state(&state)?;
@@ -9414,7 +9608,7 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
     let mut state = load_state_file()?;
     let config_path = codex_config_path()?;
 
-    if state.clients.codex.enabled || state.clients.claude.enabled {
+    if state.clients.codex.enabled || state.clients.claude.enabled || state.clients.pi.enabled {
         state.router.enabled = true;
     }
 
@@ -9497,6 +9691,59 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
             .map_err(|err| format!("无法创建 Claude 设置目录: {err}"))?;
         fs::write(&claude_path, raw).map_err(|err| format!("无法写入 Claude 设置: {err}"))?;
         state.claude_backup = None;
+    }
+
+    let pi_path = pi_models_path()?;
+    if state.clients.pi.enabled {
+        let models = route_models_for_pi(&state);
+        if models.is_empty() {
+            return Err("Pi 接管需要至少一个已启用且配置完整的 Codex 供应商路由模型".to_string());
+        }
+        fs::create_dir_all(
+            pi_path
+                .parent()
+                .ok_or_else(|| "无法定位 Pi 模型配置目录".to_string())?,
+        )
+        .map_err(|err| format!("无法创建 Pi 模型配置目录: {err}"))?;
+        if pi_path.exists() {
+            let backup_name = format!(
+                "pi-models.{}.json.bak",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|err| format!("系统时间异常: {err}"))?
+                    .as_secs()
+            );
+            fs::copy(&pi_path, manager_dir()?.join(backup_name))
+                .map_err(|err| format!("无法备份现有 Pi 模型配置: {err}"))?;
+        }
+        let (config, _, _) = read_pi_models_config()?;
+        if state.pi_backup.is_none() {
+            state.pi_backup = Some(capture_pi_backup(&config));
+        }
+        let raw = render_pi_models_config(config, &state.router, &models)?;
+        fs::write(&pi_path, raw).map_err(|err| format!("无法写入 Pi 模型配置: {err}"))?;
+    } else if pi_path.exists() || state.pi_backup.is_some() {
+        let (config, _, exists) = read_pi_models_config()?;
+        if exists {
+            let backup_name = format!(
+                "pi-models.{}.json.bak",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|err| format!("系统时间异常: {err}"))?
+                    .as_secs()
+            );
+            fs::copy(&pi_path, manager_dir()?.join(backup_name))
+                .map_err(|err| format!("无法备份现有 Pi 模型配置: {err}"))?;
+        }
+        let raw = restore_pi_models_config(config, state.pi_backup.as_ref())?;
+        fs::create_dir_all(
+            pi_path
+                .parent()
+                .ok_or_else(|| "无法定位 Pi 模型配置目录".to_string())?,
+        )
+        .map_err(|err| format!("无法创建 Pi 模型配置目录: {err}"))?;
+        fs::write(&pi_path, raw).map_err(|err| format!("无法写入 Pi 模型配置: {err}"))?;
+        state.pi_backup = None;
     }
     state.applied_provider_id = None;
     save_state(&state)?;
@@ -11704,6 +11951,120 @@ mod tests {
                 .get("effective_context_window_percent")
                 .and_then(Value::as_i64),
             Some(95)
+        );
+    }
+
+    #[test]
+    fn pi_models_config_upserts_only_codex_helper_provider() {
+        let config = json!({
+            "providers": {
+                "other": {
+                    "baseUrl": "https://other.example/v1",
+                    "api": "openai-completions",
+                    "models": [{ "id": "other-model" }]
+                },
+                "codex-helper": {
+                    "baseUrl": "https://old.example/v1",
+                    "api": "openai-completions",
+                    "apiKey": "old-token",
+                    "models": [{ "id": "old-model" }]
+                }
+            },
+            "unrelated": true
+        });
+        let backup = capture_pi_backup(&config);
+        let router = RouterConfig {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 18080,
+            local_token: "local-token".to_string(),
+        };
+
+        let raw = render_pi_models_config(config, &router, &["gpt-5.5".to_string()]).unwrap();
+        let patched = serde_json::from_str::<Value>(&raw).unwrap();
+
+        assert_eq!(
+            patched
+                .pointer("/providers/other/models/0/id")
+                .and_then(Value::as_str),
+            Some("other-model")
+        );
+        assert_eq!(
+            patched
+                .pointer("/providers/codex-helper/baseUrl")
+                .and_then(Value::as_str),
+            Some("http://127.0.0.1:18080/v1")
+        );
+        assert_eq!(
+            patched
+                .pointer("/providers/codex-helper/api")
+                .and_then(Value::as_str),
+            Some("openai-responses")
+        );
+        assert_eq!(
+            patched
+                .pointer("/providers/codex-helper/apiKey")
+                .and_then(Value::as_str),
+            Some("local-token")
+        );
+        assert_eq!(
+            patched
+                .pointer("/providers/codex-helper/models/0/id")
+                .and_then(Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            patched
+                .pointer("/providers/codex-helper/models/0/contextWindow")
+                .and_then(Value::as_i64),
+            Some(256_000)
+        );
+        assert_eq!(
+            patched
+                .pointer("/providers/codex-helper/models/0/reasoning")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            patched.pointer("/providers/codex-helper/models/0/thinkingLevelMap"),
+            Some(&json!({
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh"
+            }))
+        );
+
+        let raw = restore_pi_models_config(patched, Some(&backup)).unwrap();
+        let restored = serde_json::from_str::<Value>(&raw).unwrap();
+        assert_eq!(
+            restored
+                .pointer("/providers/codex-helper/models/0/id")
+                .and_then(Value::as_str),
+            Some("old-model")
+        );
+    }
+
+    #[test]
+    fn pi_models_config_removes_codex_helper_without_backup() {
+        let config = json!({
+            "providers": {
+                "other": { "models": [{ "id": "other-model" }] },
+                "codex-helper": { "models": [{ "id": "generated-model" }] }
+            }
+        });
+
+        let raw = restore_pi_models_config(config, None).unwrap();
+        let restored = serde_json::from_str::<Value>(&raw).unwrap();
+
+        assert!(restored.pointer("/providers/codex-helper").is_none());
+        assert_eq!(
+            restored
+                .pointer("/providers/other/models/0/id")
+                .and_then(Value::as_str),
+            Some("other-model")
         );
     }
 }

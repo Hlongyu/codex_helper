@@ -8,6 +8,14 @@ Codex Helper manages local routing and provider configuration for Codex-compatib
 An upstream service configuration that can receive routed model requests. In this context, Provider includes both OpenAI-compatible providers and Claude-compatible providers.
 _Avoid_: Supplier, vendor
 
+**Agent Client**:
+A local coding-agent application that Codex Helper can configure to send model requests through routed Providers.
+_Avoid_: Provider, supplier, vendor
+
+**Pi Coding Agent**:
+An Agent Client whose Codex Helper support is limited to routing model requests through configured Providers.
+_Avoid_: Pi provider, Pi supplier
+
 **Provider Failure**:
 A routed request outcome that is attributable to provider availability or provider configuration and should count toward automatic disabling. Provider Failure includes network errors, timeouts, rate limits, upstream server errors, response read failures, stream interruptions, protocol conversion failures, and authentication or authorization failures.
 _Avoid_: Request failure, error
@@ -35,3 +43,7 @@ _Avoid_: Temporary disable, cooldown
 **Route Eligibility**:
 Whether a Provider may be selected as an upstream candidate for routed model requests. Route Eligibility is affected by Provider Status and model support, but not by maintenance actions such as connection tests, balance checks, or pricing sync.
 _Avoid_: Availability
+
+**Route Model**:
+A model name Codex Helper exposes to Agent Clients and can route to an eligible Provider. Route Models are distinct from Provider-specific upstream model names, which may be reached through model mappings.
+_Avoid_: Provider model, upstream model

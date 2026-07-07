@@ -207,8 +207,9 @@ button:disabled {
 
 .top-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 24px;
+  gap: 14px 20px;
 }
 
 .service-pill {
@@ -1511,7 +1512,7 @@ button.danger {
 
 .route-config-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   gap: 18px;
 }
 

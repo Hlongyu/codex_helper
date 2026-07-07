@@ -96,6 +96,7 @@ type RouterConfig = {
 type ClientConfigs = {
   codex: { enabled: boolean };
   claude: { enabled: boolean };
+  pi: { enabled: boolean };
 };
 
 type RouterStatus = {
@@ -293,6 +294,7 @@ type AppState = {
   app_version: string;
   codex_config_path: string;
   claude_settings_path: string;
+  pi_models_path: string;
   manager_dir: string;
   current_config_raw: string;
   current_config_exists: boolean;
@@ -312,6 +314,7 @@ type AppState = {
 
 type Screen = "dashboard" | "route" | "providers" | "usage" | "requests" | "settings";
 type EditorTab = "base" | "balance" | "route";
+type AgentClientKind = "codex" | "claude" | "pi";
 type ProviderKind = "codex" | "claude";
 type TimeRange = "today" | "week" | "month" | "all";
 type TrendMetric = "cost" | "tokens" | "requests";
@@ -1390,13 +1393,18 @@ function App() {
     });
   }
 
-  async function saveClientConfig(kind: ProviderKind, enabled: boolean) {
+  async function saveClientConfig(kind: AgentClientKind, enabled: boolean) {
     await run(async () => {
-      const clients = appState?.clients ?? { codex: { enabled: false }, claude: { enabled: false } };
+      const clients = appState?.clients ?? {
+        codex: { enabled: false },
+        claude: { enabled: false },
+        pi: { enabled: false },
+      };
       const state = await callCommand<AppState>("save_client_configs", {
         payload: {
           codex_enabled: kind === "codex" ? enabled : clients.codex.enabled,
           claude_enabled: kind === "claude" ? enabled : clients.claude.enabled,
+          pi_enabled: kind === "pi" ? enabled : clients.pi.enabled,
         },
       });
       setAppState(state);
@@ -1539,6 +1547,12 @@ function App() {
               checked={appState.clients.claude.enabled}
               disabled={busy}
               onChange={(checked) => void saveClientConfig("claude", checked)}
+            />
+            <span className="muted">Pi</span>
+            <Toggle
+              checked={appState.clients.pi.enabled}
+              disabled={busy}
+              onChange={(checked) => void saveClientConfig("pi", checked)}
             />
           </div>
         </header>
@@ -1765,7 +1779,7 @@ function RouteScreen({
 }: {
   appState: AppState;
   busy: boolean;
-  onSaveClientConfig: (kind: ProviderKind, enabled: boolean) => Promise<void>;
+  onSaveClientConfig: (kind: AgentClientKind, enabled: boolean) => Promise<void>;
   onSaveRouter: (nextRouter: RouterConfig, apply?: boolean) => Promise<void>;
   routerDraft: RouterConfig;
   routerOn: boolean;
@@ -1841,6 +1855,39 @@ function RouteScreen({
               checked={appState.clients.claude.enabled}
               disabled={busy}
               onChange={(checked) => void onSaveClientConfig("claude", checked)}
+            />
+          </div>
+        </article>
+
+        <article className="route-card">
+          <div className="route-card-head">
+            <h3>Pi 接管</h3>
+            <span className={`state-pill ${appState.clients.pi.enabled ? "ok" : "warn"}`}>
+              <span />
+              {appState.clients.pi.enabled ? "已接管" : "未接管"}
+            </span>
+          </div>
+          <label className="compact-field">
+            <span>模型配置</span>
+            <div className="copy-field">
+              <strong>{appState.pi_models_path}</strong>
+              <button className="ghost small">打开文件</button>
+            </div>
+          </label>
+          <label className="compact-field">
+            <span>Responses Base URL</span>
+            <div className="copy-field accent">
+              <strong>{routeBaseUrl(routerDraft)}</strong>
+              <button className="ghost small">复制</button>
+            </div>
+          </label>
+          <div className="route-diff-row">
+            <span>models.json → codex-helper provider</span>
+            <button className="ghost small">自动同步</button>
+            <Toggle
+              checked={appState.clients.pi.enabled}
+              disabled={busy}
+              onChange={(checked) => void onSaveClientConfig("pi", checked)}
             />
           </div>
         </article>
