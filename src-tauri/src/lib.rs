@@ -650,6 +650,11 @@ struct ReorderProvidersPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct DeleteProviderPayload {
+    provider_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SaveClientConfigsPayload {
     codex_enabled: bool,
     claude_enabled: bool,
@@ -1675,6 +1680,87 @@ fn active_provider(state: &ManagerState) -> Option<ProviderConfig> {
         .find(|provider| provider.id == state.active_provider_id)
         .cloned()
         .or_else(|| state.providers.first().cloned())
+}
+
+fn preferred_provider_id(providers: &[ProviderConfig]) -> String {
+    providers
+        .iter()
+        .find(|provider| provider.status == ProviderStatus::Enabled)
+        .or_else(|| providers.first())
+        .map(|provider| provider.id.clone())
+        .unwrap_or_default()
+}
+
+fn preferred_claude_provider_id(providers: &[ClaudeProviderConfig]) -> String {
+    providers
+        .iter()
+        .find(|provider| provider.status == ProviderStatus::Enabled)
+        .or_else(|| providers.first())
+        .map(|provider| provider.id.clone())
+        .unwrap_or_default()
+}
+
+fn delete_provider_from_state(state: &mut ManagerState, provider_id: &str) -> Result<(), String> {
+    let removed_index = state
+        .providers
+        .iter()
+        .position(|provider| provider.id == provider_id)
+        .ok_or_else(|| "供应商不存在".to_string())?;
+    let removed = state.providers.remove(removed_index);
+
+    let active_provider_missing = state.active_provider_id.trim().is_empty()
+        || !state
+            .providers
+            .iter()
+            .any(|provider| provider.id == state.active_provider_id);
+    if active_provider_missing {
+        state.active_provider_id = preferred_provider_id(&state.providers);
+    }
+
+    let applied_provider_missing = state
+        .applied_provider_id
+        .as_ref()
+        .is_some_and(|applied_id| {
+            !state
+                .providers
+                .iter()
+                .any(|provider| provider.id == applied_id.as_str())
+        });
+    if applied_provider_missing {
+        state.applied_provider_id = None;
+    }
+
+    if !state.router.enabled {
+        let removed_desired = desired_config(state, Some(&removed));
+        if state.last_applied.as_ref() == Some(&removed_desired) {
+            state.last_applied = None;
+        }
+    }
+
+    Ok(())
+}
+
+fn delete_claude_provider_from_state(
+    state: &mut ManagerState,
+    provider_id: &str,
+) -> Result<(), String> {
+    let removed_index = state
+        .claude_providers
+        .iter()
+        .position(|provider| provider.id == provider_id)
+        .ok_or_else(|| "Claude 供应商不存在".to_string())?;
+    state.claude_providers.remove(removed_index);
+
+    let active_provider_missing = state.active_claude_provider_id.trim().is_empty()
+        || !state
+            .claude_providers
+            .iter()
+            .any(|provider| provider.id == state.active_claude_provider_id);
+    if active_provider_missing {
+        state.active_claude_provider_id = preferred_claude_provider_id(&state.claude_providers);
+    }
+
+    Ok(())
 }
 
 fn merge_values(base: &mut Value, overlay: &Value) {
@@ -9286,6 +9372,29 @@ fn save_claude_provider(
 }
 
 #[tauri::command]
+fn delete_provider(
+    payload: DeleteProviderPayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
+    delete_provider_from_state(&mut state, &payload.provider_id)?;
+    ensure_client_configs_applied(&mut state)?;
+    save_state(&state)?;
+    build_app_state(state, &router_runtime)
+}
+
+#[tauri::command]
+fn delete_claude_provider(
+    payload: DeleteProviderPayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
+    delete_claude_provider_from_state(&mut state, &payload.provider_id)?;
+    save_state(&state)?;
+    build_app_state(state, &router_runtime)
+}
+
+#[tauri::command]
 fn reorder_providers(
     payload: ReorderProvidersPayload,
     router_runtime: tauri::State<RouterRuntime>,
@@ -10098,6 +10207,8 @@ pub fn run() {
             get_claude_provider,
             save_provider,
             save_claude_provider,
+            delete_provider,
+            delete_claude_provider,
             reorder_providers,
             reorder_claude_providers,
             preview_provider,
@@ -10145,6 +10256,30 @@ mod tests {
             pricing_sync_status: None,
             balance_query: BalanceQueryConfig::default(),
             balance_status: None,
+            connection_status: None,
+        }
+    }
+
+    fn test_claude_provider_config(
+        id: &str,
+        status: ProviderStatus,
+        enabled: bool,
+    ) -> ClaudeProviderConfig {
+        ClaudeProviderConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            status,
+            enabled,
+            consecutive_failure_count: 0,
+            auto_disabled_day: None,
+            last_failure_reason: None,
+            last_failure_at_ms: None,
+            base_url: String::new(),
+            api_key: String::new(),
+            connection_test_model: String::new(),
+            allowed_models: Vec::new(),
+            model_mappings: Vec::new(),
+            provider_pricing: Vec::new(),
             connection_status: None,
         }
     }
@@ -10332,6 +10467,40 @@ mod tests {
         assert_eq!(provider.consecutive_failure_count, 0);
         assert_eq!(provider.auto_disabled_day, None);
         assert_eq!(provider.last_failure_reason, None);
+    }
+
+    #[test]
+    fn deleting_provider_removes_it_and_reselects_active() {
+        let mut state = default_state();
+        state.providers = vec![
+            test_provider_config("provider-a", ProviderStatus::Enabled, true),
+            test_provider_config("provider-b", ProviderStatus::Enabled, true),
+        ];
+        state.active_provider_id = "provider-a".to_string();
+        state.applied_provider_id = Some("provider-a".to_string());
+
+        delete_provider_from_state(&mut state, "provider-a").unwrap();
+
+        assert_eq!(state.providers.len(), 1);
+        assert_eq!(state.providers[0].id, "provider-b");
+        assert_eq!(state.active_provider_id, "provider-b");
+        assert_eq!(state.applied_provider_id, None);
+    }
+
+    #[test]
+    fn deleting_claude_provider_removes_it_and_reselects_active() {
+        let mut state = default_state();
+        state.claude_providers = vec![
+            test_claude_provider_config("claude-a", ProviderStatus::Disabled, false),
+            test_claude_provider_config("claude-b", ProviderStatus::Enabled, true),
+        ];
+        state.active_claude_provider_id = "claude-a".to_string();
+
+        delete_claude_provider_from_state(&mut state, "claude-a").unwrap();
+
+        assert_eq!(state.claude_providers.len(), 1);
+        assert_eq!(state.claude_providers[0].id, "claude-b");
+        assert_eq!(state.active_claude_provider_id, "claude-b");
     }
 
     #[test]

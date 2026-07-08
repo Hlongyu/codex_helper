@@ -1490,9 +1490,14 @@ button:disabled {
 .provider-drawer > footer {
   display: grid;
   grid-template-columns: auto 1fr auto auto;
+  align-items: center;
   gap: 12px;
   border-top: 1px solid #202d3d;
   padding: 14px 30px 16px;
+}
+
+.provider-drawer > footer .danger-text {
+  font-size: 12px;
 }
 
 button.danger {

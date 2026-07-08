@@ -1188,6 +1188,30 @@ function App() {
     });
   }
 
+  async function deleteProvider() {
+    if (!editingId) return;
+    await run(async () => {
+      const state = await callCommand<AppState>("delete_provider", {
+        payload: { provider_id: editingId },
+      });
+      setAppState(state);
+      setEditorOpen(false);
+      setEditingId("");
+    });
+  }
+
+  async function deleteClaudeProvider() {
+    if (!editingId) return;
+    await run(async () => {
+      const state = await callCommand<AppState>("delete_claude_provider", {
+        payload: { provider_id: editingId },
+      });
+      setAppState(state);
+      setEditorOpen(false);
+      setEditingId("");
+    });
+  }
+
   async function testBalance() {
     if (!editingId) return;
     await run(async () => {
@@ -1678,6 +1702,7 @@ function App() {
           providerPricing={providerPricing}
           onBalanceTokenVisible={setBalanceTokenVisible}
           onClose={() => setEditorOpen(false)}
+          onDelete={deleteProvider}
           onLoadProviderModels={loadProviderModels}
           onSave={saveProvider}
           onSyncProviderPricing={syncProviderPricing}
@@ -1730,6 +1755,7 @@ function App() {
           busy={busy}
           modelMappings={modelMappings}
           onClose={() => setEditorOpen(false)}
+          onDelete={deleteClaudeProvider}
           onLoadProviderModels={loadClaudeProviderModels}
           onSave={saveClaudeProvider}
           providerApiKey={providerApiKey}
@@ -2849,6 +2875,7 @@ function ProviderEditor(props: {
   modelMappings: ModelMapping[];
   onBalanceTokenVisible: (visible: boolean) => void;
   onClose: () => void;
+  onDelete: () => void;
   onLoadProviderModels: () => void;
   onSave: () => void;
   onSyncProviderPricing: () => void;
@@ -2893,6 +2920,7 @@ function ProviderEditor(props: {
     modelMappings,
     onBalanceTokenVisible,
     onClose,
+    onDelete,
     onLoadProviderModels,
     onSave,
     onSyncProviderPricing,
@@ -2928,6 +2956,7 @@ function ProviderEditor(props: {
     tab,
   } = props;
   const [customAllowedModel, setCustomAllowedModel] = useState("");
+  const [deleteConfirming, setDeleteConfirming] = useState(false);
   const modelOptions = providerTestModel && !providerModels.includes(providerTestModel)
     ? [providerTestModel, ...providerModels]
     : providerModels;
@@ -3432,9 +3461,18 @@ function ProviderEditor(props: {
         </section>
 
         <footer>
-          <button className="danger">删除</button>
-          <div />
-          <button className="ghost" onClick={onClose}>取消</button>
+          <button
+            className="danger"
+            disabled={busy}
+            onClick={() => deleteConfirming ? onDelete() : setDeleteConfirming(true)}
+            type="button"
+          >
+            {deleteConfirming ? "确认删除" : "删除"}
+          </button>
+          {deleteConfirming ? <small className="danger-text">会保留历史请求日志；再次点击确认删除。</small> : <div />}
+          <button className="ghost" onClick={deleteConfirming ? () => setDeleteConfirming(false) : onClose}>
+            {deleteConfirming ? "取消删除" : "取消"}
+          </button>
           <button className="primary" disabled={busy} onClick={onSave}>保存修改</button>
         </footer>
       </aside>
@@ -3447,6 +3485,7 @@ function ClaudeProviderEditor(props: {
   busy: boolean;
   modelMappings: ModelMapping[];
   onClose: () => void;
+  onDelete: () => void;
   onLoadProviderModels: () => void;
   onSave: () => void;
   providerApiKey: string;
@@ -3473,6 +3512,7 @@ function ClaudeProviderEditor(props: {
     busy,
     modelMappings,
     onClose,
+    onDelete,
     onLoadProviderModels,
     onSave,
     providerApiKey,
@@ -3495,6 +3535,7 @@ function ClaudeProviderEditor(props: {
     setSecretVisible,
   } = props;
   const [customAllowedModel, setCustomAllowedModel] = useState("");
+  const [deleteConfirming, setDeleteConfirming] = useState(false);
   const updateAllowedModels = (models: string[]) => setAllowedModels(normalizeModelNames(models));
   const allowedModelOptions = normalizeModelNames([...providerModels, ...allowedModels]);
   const allModelsAllowed = allowedModels.length === 0;
@@ -3752,9 +3793,18 @@ function ClaudeProviderEditor(props: {
         </section>
 
         <footer>
-          <button className="danger" disabled>删除</button>
-          <div />
-          <button className="ghost" onClick={onClose}>取消</button>
+          <button
+            className="danger"
+            disabled={busy}
+            onClick={() => deleteConfirming ? onDelete() : setDeleteConfirming(true)}
+            type="button"
+          >
+            {deleteConfirming ? "确认删除" : "删除"}
+          </button>
+          {deleteConfirming ? <small className="danger-text">会保留历史请求日志；再次点击确认删除。</small> : <div />}
+          <button className="ghost" onClick={deleteConfirming ? () => setDeleteConfirming(false) : onClose}>
+            {deleteConfirming ? "取消删除" : "取消"}
+          </button>
           <button className="primary" disabled={busy} onClick={onSave}>保存修改</button>
         </footer>
       </aside>
