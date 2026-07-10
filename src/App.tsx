@@ -1024,6 +1024,7 @@ function App() {
   const [error, setError] = useState("");
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckInfo | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateConfirming, setUpdateConfirming] = useState(false);
   const [updateMessage, setUpdateMessage] = useState("");
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorKind, setEditorKind] = useState<ProviderKind>("codex");
@@ -1103,6 +1104,7 @@ function App() {
   async function checkForUpdate() {
     if (updateBusy) return;
     setUpdateBusy(true);
+    setUpdateConfirming(false);
     setUpdateMessage("");
     try {
       setUpdateCheck(await callCommand<UpdateCheckInfo>("check_for_update"));
@@ -1115,13 +1117,13 @@ function App() {
 
   async function installUpdate() {
     if (!updateCheck?.available || !updateCheck.installable || updateBusy) return;
-    const suffix = updateCheck.asset_name?.toLowerCase().endsWith(".dmg")
-      ? "下载完成后会打开 DMG，请按提示替换应用。"
-      : "下载完成后会启动安装程序，当前应用将自动退出。";
-    if (!window.confirm(`更新至 ${updateCheck.latest_version}？\n\n${suffix}`)) return;
-
     setUpdateBusy(true);
-    setUpdateMessage("");
+    setUpdateConfirming(false);
+    setUpdateMessage(
+      updateCheck.asset_name?.toLowerCase().endsWith(".dmg")
+        ? "正在下载并校验更新，完成后应用会自动替换并重启，请勿退出…"
+        : "正在下载更新，完成后会启动安装程序，请勿退出…",
+    );
     try {
       const result = await callCommand<UpdateInstallResult>("install_update");
       setUpdateMessage(result.message);
@@ -1965,9 +1967,35 @@ function App() {
                     </span>
                   </div>
                   {updateCheck.available && updateCheck.installable && (
-                    <button className="primary" disabled={updateBusy} onClick={() => void installUpdate()} type="button">
-                      {updateBusy ? "正在下载…" : "一键更新"}
-                    </button>
+                    <div className="update-actions">
+                      {updateConfirming && !updateBusy && (
+                        <span className="update-confirm-text">
+                          {updateCheck.asset_name?.toLowerCase().endsWith(".dmg")
+                            ? "确认后将自动替换当前应用并重启；没有写入权限时 macOS 会请求管理员授权。"
+                            : "确认后将下载安装包并退出当前应用。"}
+                        </span>
+                      )}
+                      {updateConfirming && !updateBusy && (
+                        <button className="ghost" onClick={() => setUpdateConfirming(false)} type="button">
+                          取消
+                        </button>
+                      )}
+                      <button
+                        className="primary"
+                        disabled={updateBusy}
+                        onClick={() => {
+                          if (updateConfirming) {
+                            void installUpdate();
+                          } else {
+                            setUpdateConfirming(true);
+                            setUpdateMessage("");
+                          }
+                        }}
+                        type="button"
+                      >
+                        {updateBusy ? "正在更新…" : updateConfirming ? "确认更新" : "一键更新"}
+                      </button>
+                    </div>
                   )}
                 </div>
               )}

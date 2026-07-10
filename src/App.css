@@ -1999,6 +1999,19 @@ button.danger {
   color: #f7f9fd;
 }
 
+.update-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.update-confirm-text {
+  max-width: 360px;
+  line-height: 1.45;
+  text-align: right;
+}
+
 .update-message {
   border: 1px solid #24364a;
   border-radius: 10px;
@@ -2018,6 +2031,17 @@ button.danger {
 
   .trend-card {
     grid-column: auto;
+  }
+
+  .update-result,
+  .update-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .update-confirm-text {
+    max-width: none;
+    text-align: left;
   }
 
   .provider-table > header,

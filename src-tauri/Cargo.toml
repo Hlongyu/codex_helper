@@ -29,4 +29,5 @@ tokio = { version = "1", features = ["net", "sync"] }
 futures-util = "0.3"
 getrandom = "0.3"
 semver = "1"
+sha2 = "0.10"
 zstd = "0.13"

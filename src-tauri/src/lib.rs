@@ -15,6 +15,7 @@ use reqwest::header::{
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
@@ -53,6 +54,8 @@ const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/Hlongyu/codex_helper/releases/latest";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Hlongyu/codex_helper/releases/download/";
+#[cfg(target_os = "macos")]
+const MACOS_BUNDLE_IDENTIFIER: &str = "com.local.codex-config-manager";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderConfig {
@@ -798,6 +801,7 @@ struct GithubRelease {
 struct GithubReleaseAsset {
     name: String,
     browser_download_url: String,
+    digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3617,6 +3621,8 @@ fn update_asset_for_platform<'a>(
 fn github_release_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(format!("Codex Helper/{}", env!("CODEX_HELPER_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
         .build()
         .map_err(|err| format!("无法创建更新检查客户端: {err}"))
 }
@@ -3665,6 +3671,18 @@ fn update_download_path(asset_name: &str) -> Result<PathBuf, String> {
     Ok(directory.join(format!("{timestamp}-{file_name}")))
 }
 
+fn verify_update_asset_digest(bytes: &[u8], digest: Option<&str>) -> Result<(), String> {
+    let Some(expected) = digest.and_then(|digest| digest.strip_prefix("sha256:")) else {
+        return Ok(());
+    };
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err("更新包 SHA-256 校验失败，请重试".to_string())
+    }
+}
+
 async fn download_update_asset(asset: &GithubReleaseAsset) -> Result<PathBuf, String> {
     if !asset
         .browser_download_url
@@ -3686,9 +3704,307 @@ async fn download_update_asset(asset: &GithubReleaseAsset) -> Result<PathBuf, St
     if bytes.is_empty() {
         return Err("下载的更新包为空".to_string());
     }
+    verify_update_asset_digest(&bytes, asset.digest.as_deref())?;
     let path = update_download_path(&asset.name)?;
     fs::write(&path, &bytes).map_err(|err| format!("无法保存更新包: {err}"))?;
     Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_bundle_from_path(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| {
+            ancestor
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+        })
+        .map(Path::to_path_buf)
+}
+
+#[cfg(target_os = "macos")]
+fn find_macos_app_bundle(root: &Path, depth: usize) -> Result<Option<PathBuf>, String> {
+    if depth == 0 {
+        return Ok(None);
+    }
+    let entries = fs::read_dir(root)
+        .map_err(|err| format!("无法读取更新镜像内容 {}: {err}", root.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("无法读取更新镜像条目: {err}"))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("无法读取更新镜像条目类型: {err}"))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+        {
+            return Ok(Some(path));
+        }
+        if let Some(app) = find_macos_app_bundle(&path, depth - 1)? {
+            return Ok(Some(app));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_command(command: &mut Command, action: &str) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|err| format!("{action}失败: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if detail.is_empty() {
+        format!("{action}失败，退出码 {}", output.status)
+    } else {
+        format!("{action}失败: {detail}")
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_plist_value(app_bundle: &Path, key: &str) -> Result<String, String> {
+    let plist = app_bundle.join("Contents/Info.plist");
+    let output = Command::new("/usr/libexec/PlistBuddy")
+        .arg("-c")
+        .arg(format!("Print :{key}"))
+        .arg(&plist)
+        .output()
+        .map_err(|err| format!("无法读取更新应用信息: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "更新应用缺少 {key}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_codesign_team_id(app_bundle: &Path) -> Option<String> {
+    let output = Command::new("/usr/bin/codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(app_bundle)
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find_map(|line| line.strip_prefix("TeamIdentifier="))
+        .map(str::trim)
+        .filter(|team| !team.is_empty() && *team != "not set")
+        .map(str::to_string)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_update_app(
+    current_app: Option<&Path>,
+    update_app: &Path,
+    latest_version: &str,
+) -> Result<(), String> {
+    let bundle_id = macos_plist_value(update_app, "CFBundleIdentifier")?;
+    if bundle_id != MACOS_BUNDLE_IDENTIFIER {
+        return Err(format!("更新应用标识不匹配: {bundle_id}"));
+    }
+    let expected_version = latest_version.trim().trim_start_matches('v');
+    let actual_version = macos_plist_value(update_app, "CFBundleShortVersionString")?;
+    if actual_version != expected_version {
+        return Err(format!(
+            "更新应用版本不匹配，期望 {expected_version}，实际 {actual_version}"
+        ));
+    }
+    run_macos_command(
+        Command::new("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict"])
+            .arg(update_app),
+        "校验更新应用签名",
+    )?;
+    if let Some(current_app) = current_app {
+        let current_team = macos_codesign_team_id(current_app);
+        let update_team = macos_codesign_team_id(update_app);
+        if current_team.is_some() && current_team != update_team {
+            return Err("更新应用的开发者签名与当前应用不一致".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_path_is_writable(path: &Path) -> bool {
+    Command::new("/usr/bin/test")
+        .arg("-w")
+        .arg(path)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(value: &Path) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_app_directly(source: &Path, target: &Path, backup: &Path) -> Result<(), String> {
+    if backup.exists() {
+        fs::remove_dir_all(backup).map_err(|err| format!("无法清理旧更新备份: {err}"))?;
+    }
+    if target.exists() {
+        fs::rename(target, backup).map_err(|err| format!("无法备份当前应用: {err}"))?;
+    }
+    let install_result = run_macos_command(
+        Command::new("/usr/bin/ditto").arg(source).arg(target),
+        "复制更新应用",
+    );
+    if let Err(err) = install_result {
+        let _ = fs::remove_dir_all(target);
+        if backup.exists() {
+            let _ = fs::rename(backup, target);
+        }
+        return Err(err);
+    }
+    if backup.exists() {
+        fs::remove_dir_all(backup).map_err(|err| format!("无法清理更新备份: {err}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_app_with_authorization(
+    source: &Path,
+    target: &Path,
+    backup: &Path,
+) -> Result<(), String> {
+    let source = shell_quote(source);
+    let target = shell_quote(target);
+    let backup = shell_quote(backup);
+    let shell_command = format!(
+        "set -e; /bin/rm -rf {backup}; \
+         if [ -e {target} ]; then /bin/mv {target} {backup}; fi; \
+         if /usr/bin/ditto {source} {target}; then /bin/rm -rf {backup}; \
+         else /bin/rm -rf {target}; if [ -e {backup} ]; then /bin/mv {backup} {target}; fi; exit 1; fi"
+    );
+    let apple_script = format!(
+        "do shell script \"{}\" with administrator privileges",
+        applescript_string(&shell_command)
+    );
+    run_macos_command(
+        Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(apple_script),
+        "安装更新应用",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_update_from_dmg(
+    app: &tauri::AppHandle,
+    dmg_path: &Path,
+    latest_version: &str,
+) -> Result<UpdateInstallResult, String> {
+    let current_executable =
+        std::env::current_exe().map_err(|err| format!("无法定位当前应用: {err}"))?;
+    let current_app = macos_app_bundle_from_path(&current_executable);
+    if current_app.is_none() {
+        Command::new("/usr/bin/open")
+            .arg(dmg_path)
+            .spawn()
+            .map_err(|err| format!("无法打开更新 DMG: {err}"))?;
+        return Ok(UpdateInstallResult {
+            message: "当前运行位置不是应用包，已打开更新 DMG，请手动拖入 Applications。"
+                .to_string(),
+            manual_install: true,
+        });
+    }
+
+    let work_dir = std::env::temp_dir()
+        .join("codex-helper-updates")
+        .join(format!("macos-{}", current_epoch_ms().unwrap_or_default()));
+    let mount_dir = work_dir.join("mount");
+    let staged_app = work_dir.join("Codex Helper.app");
+    fs::create_dir_all(&mount_dir).map_err(|err| format!("无法创建 DMG 挂载目录: {err}"))?;
+
+    run_macos_command(
+        Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
+            .arg(&mount_dir)
+            .arg(dmg_path),
+        "挂载更新 DMG",
+    )?;
+
+    let prepare_result = (|| {
+        let source_app = find_macos_app_bundle(&mount_dir, 4)?
+            .ok_or_else(|| "更新 DMG 中未找到应用包".to_string())?;
+        verify_macos_update_app(current_app.as_deref(), &source_app, latest_version)?;
+        run_macos_command(
+            Command::new("/usr/bin/ditto")
+                .arg(&source_app)
+                .arg(&staged_app),
+            "暂存更新应用",
+        )?;
+        verify_macos_update_app(current_app.as_deref(), &staged_app, latest_version)
+    })();
+
+    let detach_result = run_macos_command(
+        Command::new("/usr/bin/hdiutil")
+            .arg("detach")
+            .arg(&mount_dir),
+        "卸载更新 DMG",
+    );
+    prepare_result?;
+    detach_result?;
+
+    let current_app = current_app.expect("checked above");
+    let target_app = if current_app.starts_with("/Volumes") {
+        PathBuf::from("/Applications/Codex Helper.app")
+    } else {
+        current_app
+    };
+    let target_parent = target_app
+        .parent()
+        .ok_or_else(|| "无法确定应用安装目录".to_string())?;
+    let backup_app = target_parent.join(format!(
+        ".Codex Helper.app.codex-helper-backup-{}",
+        current_epoch_ms().unwrap_or_default()
+    ));
+
+    if macos_path_is_writable(target_parent) {
+        install_macos_app_directly(&staged_app, &target_app, &backup_app)?;
+    } else {
+        install_macos_app_with_authorization(&staged_app, &target_app, &backup_app)?;
+    }
+    verify_macos_update_app(None, &target_app, latest_version)?;
+
+    let _ = fs::remove_file(dmg_path);
+    let _ = fs::remove_dir_all(&work_dir);
+    Command::new("/bin/sh")
+        .args([
+            "-c",
+            "sleep 1; exec /usr/bin/open \"$1\"",
+            "codex-helper-relaunch",
+        ])
+        .arg(&target_app)
+        .spawn()
+        .map_err(|err| format!("更新已安装，但无法安排自动重启: {err}"))?;
+
+    let app_for_exit = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        app_for_exit.exit(0);
+    });
+    Ok(UpdateInstallResult {
+        message: "更新已安装，Codex Helper 即将重启。".to_string(),
+        manual_install: false,
+    })
 }
 
 fn normalize_balance_config(
@@ -10735,15 +11051,7 @@ async fn install_update(app: tauri::AppHandle) -> Result<UpdateInstallResult, St
 
     #[cfg(target_os = "macos")]
     {
-        let _ = app;
-        Command::new("open")
-            .arg(&path)
-            .spawn()
-            .map_err(|err| format!("无法打开更新 DMG: {err}"))?;
-        return Ok(UpdateInstallResult {
-            message: "更新 DMG 已打开，请将 Codex Helper 拖入 Applications 完成替换。".to_string(),
-            manual_install: true,
-        });
+        return install_macos_update_from_dmg(&app, &path, &info.latest_version);
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -11973,10 +12281,12 @@ mod tests {
             GithubReleaseAsset {
                 name: "Codex.Helper_1.1.8_universal.dmg".to_string(),
                 browser_download_url: format!("{GITHUB_RELEASE_DOWNLOAD_PREFIX}v1.1.8/mac.dmg"),
+                digest: None,
             },
             GithubReleaseAsset {
                 name: "Codex.Helper_1.1.8_x64-setup.exe".to_string(),
                 browser_download_url: format!("{GITHUB_RELEASE_DOWNLOAD_PREFIX}v1.1.8/windows.exe"),
+                digest: None,
             },
         ];
 
@@ -11991,6 +12301,42 @@ mod tests {
             Some("Codex.Helper_1.1.8_universal.dmg")
         );
         assert!(update_asset_for_platform(&assets, UpdatePlatform::Unsupported).is_none());
+    }
+
+    #[test]
+    fn verifies_github_release_asset_sha256_digest() {
+        assert!(verify_update_asset_digest(
+            b"codex-helper",
+            Some("sha256:129713b6f0f6e251c45e57f52f26f0e753b666b9f984a042127488ac6567fdbd")
+        )
+        .is_ok());
+        assert!(verify_update_asset_digest(b"tampered", Some("sha256:deadbeef")).is_err());
+        assert!(verify_update_asset_digest(b"legacy", None).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn locates_macos_app_bundle_from_executable_path() {
+        let executable =
+            Path::new("/Applications/Codex Helper.app/Contents/MacOS/codex-config-manager");
+        assert_eq!(
+            macos_app_bundle_from_path(executable).as_deref(),
+            Some(Path::new("/Applications/Codex Helper.app"))
+        );
+        assert!(macos_app_bundle_from_path(Path::new("/tmp/codex-config-manager")).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quotes_macos_update_paths_for_shell_commands() {
+        assert_eq!(
+            shell_quote(Path::new("/Applications/Codex Helper.app")),
+            "'/Applications/Codex Helper.app'"
+        );
+        assert_eq!(
+            shell_quote(Path::new("/tmp/owner's app.app")),
+            "'/tmp/owner'\\''s app.app'"
+        );
     }
 
     struct ChatStreamTestState {
