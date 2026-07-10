@@ -1,5 +1,7 @@
 stages:
   - verify
+  - package
+  - release
 
 default:
   interruptible: true
@@ -48,3 +50,101 @@ backend:test:
       pkg-config
   script:
     - cargo test --manifest-path src-tauri/Cargo.toml
+
+release:validate-tag:
+  stage: verify
+  image: node:22-bookworm
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+  script:
+    - |
+      version="${CI_COMMIT_TAG#v}"
+      if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+        echo "Release tag '$CI_COMMIT_TAG' must look like v1.2.3 or v1.2.3-beta.1." >&2
+        exit 1
+      fi
+      printf 'RELEASE_VERSION=%s\n' "$version" > release.env
+  artifacts:
+    reports:
+      dotenv: release.env
+
+# These jobs require GitLab shell runners with the matching tags:
+# - windows: Node.js, Corepack, Rust, and NSIS.
+# - macos: Node.js, Corepack, Rust, Xcode command-line tools.
+release:windows:
+  stage: package
+  tags:
+    - windows
+  interruptible: false
+  needs:
+    - job: release:validate-tag
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+  before_script:
+    - corepack enable
+    - pnpm install --frozen-lockfile
+  script:
+    - node scripts/apply-release-version.mjs "$env:RELEASE_VERSION"
+    - $env:CODEX_HELPER_VERSION = $env:CI_COMMIT_TAG
+    - pnpm tauri build --bundles nsis
+  artifacts:
+    name: "codex-helper-$CI_COMMIT_TAG-windows"
+    expire_in: 1 week
+    paths:
+      - src-tauri/target/release/bundle/nsis/*.exe
+      - src-tauri/target/release/bundle/msi/*.msi
+
+release:macos-universal:
+  stage: package
+  tags:
+    - macos
+  interruptible: false
+  needs:
+    - job: release:validate-tag
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+  before_script:
+    - corepack enable
+    - pnpm install --frozen-lockfile
+    - rustup target add x86_64-apple-darwin aarch64-apple-darwin
+  script:
+    - node scripts/apply-release-version.mjs "$RELEASE_VERSION"
+    - export CODEX_HELPER_VERSION="$CI_COMMIT_TAG"
+    - pnpm tauri build --target universal-apple-darwin --bundles dmg
+  artifacts:
+    name: "codex-helper-$CI_COMMIT_TAG-macos-universal"
+    expire_in: 1 week
+    paths:
+      - src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+      - src-tauri/target/universal-apple-darwin/release/bundle/macos/*.tar.gz
+
+release:publish:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  interruptible: false
+  needs:
+    - job: release:windows
+      artifacts: true
+    - job: release:macos-universal
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+  script:
+    - |
+      set -eu
+      : > release-assets
+      if [ -d src-tauri/target/release/bundle ]; then
+        find src-tauri/target/release/bundle -type f \
+          \( -path '*/nsis/*' -o -path '*/msi/*' \) -print0 >> release-assets
+      fi
+      if [ -d src-tauri/target/universal-apple-darwin/release/bundle ]; then
+        find src-tauri/target/universal-apple-darwin/release/bundle -type f \
+          \( -name '*.dmg' -o -name '*.tar.gz' \) -print0 >> release-assets
+      fi
+      test -s release-assets
+      xargs -0 glab release create "$CI_COMMIT_TAG" \
+        --name "Codex Helper $CI_COMMIT_TAG" \
+        --notes "Automated release for $CI_COMMIT_TAG." \
+        --use-package-registry < release-assets
