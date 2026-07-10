@@ -9,14 +9,14 @@ use axum::{
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use futures_util::{stream::BoxStream, StreamExt};
 use reqwest::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE,
+    AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -242,6 +242,8 @@ struct ConnectionStatus {
 struct RouterConfig {
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    remote_compaction_enabled: bool,
     #[serde(default = "default_router_host")]
     host: String,
     #[serde(default = "default_router_port")]
@@ -411,6 +413,7 @@ impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            remote_compaction_enabled: false,
             host: default_router_host(),
             port: default_router_port(),
             local_token: default_router_token(),
@@ -460,6 +463,10 @@ struct ManagerState {
 struct RouterApplyBackup {
     #[serde(default)]
     model_provider: RouterFieldBackup,
+    #[serde(default)]
+    custom_name: RouterFieldBackup,
+    #[serde(default)]
+    remote_compaction_v2: RouterFieldBackup,
     #[serde(default)]
     custom_base_url: RouterFieldBackup,
     #[serde(default)]
@@ -844,6 +851,8 @@ struct SaveBasePayload {
 #[derive(Debug, Deserialize)]
 struct SaveRouterPayload {
     enabled: bool,
+    #[serde(default)]
+    remote_compaction_enabled: bool,
     host: String,
     port: u16,
     local_token: String,
@@ -1149,6 +1158,8 @@ struct RouteRequestLog {
     path: String,
     model: String,
     #[serde(default)]
+    remote_compaction_v2: RemoteCompactionV2Audit,
+    #[serde(default)]
     upstream_model: Option<String>,
     provider_id: String,
     provider_name: String,
@@ -1182,6 +1193,20 @@ struct RouteRequestLog {
     provider_pricing_source: String,
     first_byte_ms: Option<u64>,
     total_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RemoteCompactionV2Audit {
+    #[serde(default)]
+    trigger_received: bool,
+    #[serde(default)]
+    trigger_forwarded: bool,
+    #[serde(default)]
+    compaction_response_received: bool,
+    #[serde(default)]
+    compaction_response_forwarded: bool,
+    #[serde(default)]
+    compaction_item_reused: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1326,6 +1351,7 @@ struct PendingRouteLog {
     method: String,
     path: String,
     model: String,
+    remote_compaction_v2: RemoteCompactionV2Audit,
     upstream_model: Option<String>,
     provider_id: String,
     provider_name: String,
@@ -2823,18 +2849,7 @@ fn set_json_path(value: &mut Value, path: &[&str], next: Value) -> Result<(), St
 fn desired_config(state: &ManagerState, provider: Option<&ProviderConfig>) -> Value {
     let mut desired = state.base.clone();
     if state.router.enabled {
-        merge_values(
-            &mut desired,
-            &json!({
-                "model_provider": "custom",
-                "model_providers": {
-                    "custom": {
-                        "base_url": router_base_url(&state.router),
-                        "experimental_bearer_token": state.router.local_token,
-                    }
-                }
-            }),
-        );
+        merge_values(&mut desired, &router_patch_desired(&state.router));
     } else if let Some(provider) = provider {
         merge_values(&mut desired, &provider.config);
     }
@@ -4127,8 +4142,10 @@ fn source_for_path(state: &ManagerState, provider: Option<&ProviderConfig>, path
         && matches!(
             path,
             "model_provider"
+                | "model_providers.custom.name"
                 | "model_providers.custom.base_url"
                 | "model_providers.custom.experimental_bearer_token"
+                | "features.remote_compaction_v2"
         )
     {
         return "本地路由".to_string();
@@ -4330,6 +4347,8 @@ fn capture_toml_field(doc: &DocumentMut, path: &str) -> RouterFieldBackup {
 fn capture_router_backup(doc: &DocumentMut) -> RouterApplyBackup {
     RouterApplyBackup {
         model_provider: capture_toml_field(doc, "model_provider"),
+        custom_name: capture_toml_field(doc, "model_providers.custom.name"),
+        remote_compaction_v2: capture_toml_field(doc, "features.remote_compaction_v2"),
         custom_base_url: capture_toml_field(doc, "model_providers.custom.base_url"),
         custom_token: capture_toml_field(doc, "model_providers.custom.experimental_bearer_token"),
     }
@@ -4359,6 +4378,12 @@ fn restore_router_backup(
 ) -> Result<String, String> {
     if let Some(backup) = backup {
         restore_toml_field(&mut doc, "model_provider", &backup.model_provider)?;
+        restore_toml_field(&mut doc, "model_providers.custom.name", &backup.custom_name)?;
+        restore_toml_field(
+            &mut doc,
+            "features.remote_compaction_v2",
+            &backup.remote_compaction_v2,
+        )?;
         restore_toml_field(
             &mut doc,
             "model_providers.custom.base_url",
@@ -4376,8 +4401,10 @@ fn restore_router_backup(
         let current_flat = flatten(&current);
         for path in [
             "model_provider",
+            "model_providers.custom.name",
             "model_providers.custom.base_url",
             "model_providers.custom.experimental_bearer_token",
+            "features.remote_compaction_v2",
         ] {
             if desired_flat.get(path) == current_flat.get(path) {
                 remove_toml_path(&mut doc, path);
@@ -4407,6 +4434,21 @@ fn render_router_patch_toml(
         "model_providers.custom.experimental_bearer_token",
         &Value::String(router.local_token.clone()),
     )?;
+    let custom_name = if router.remote_compaction_enabled {
+        "OpenAI"
+    } else {
+        "custom"
+    };
+    set_toml_path(
+        &mut doc,
+        "model_providers.custom.name",
+        &Value::String(custom_name.to_string()),
+    )?;
+    set_toml_path(
+        &mut doc,
+        "features.remote_compaction_v2",
+        &Value::Bool(router.remote_compaction_enabled),
+    )?;
 
     let mut raw = doc.to_string();
     if !marker_present && !raw.contains(MARKER) {
@@ -4417,14 +4459,34 @@ fn render_router_patch_toml(
 }
 
 fn router_patch_desired(router: &RouterConfig) -> Value {
+    let mut custom = Map::new();
+    custom.insert(
+        "base_url".to_string(),
+        Value::String(router_base_url(router)),
+    );
+    custom.insert(
+        "experimental_bearer_token".to_string(),
+        Value::String(router.local_token.clone()),
+    );
+    custom.insert(
+        "name".to_string(),
+        Value::String(
+            if router.remote_compaction_enabled {
+                "OpenAI"
+            } else {
+                "custom"
+            }
+            .to_string(),
+        ),
+    );
     json!({
         "model_provider": "custom",
         "model_providers": {
-            "custom": {
-                "base_url": router_base_url(router),
-                "experimental_bearer_token": router.local_token,
-            }
-        }
+            "custom": custom,
+        },
+        "features": {
+            "remote_compaction_v2": router.remote_compaction_enabled,
+        },
     })
 }
 
@@ -4767,12 +4829,14 @@ fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String
     }
 
     let (doc, marker_present, _, _) = read_current_toml()?;
+    let desired = router_patch_desired(&state.router);
     let current_json = toml_doc_to_json(&doc);
-    if router_patch_matches_current(&current_json, &state.router) {
+    if router_patch_matches_current(&current_json, &state.router)
+        && state.last_applied.as_ref() == Some(&desired)
+    {
         return Ok(false);
     }
 
-    let desired = router_patch_desired(&state.router);
     let was_managed = marker_present
         || state.router_backup.is_some()
         || state.last_applied.as_ref() == Some(&desired);
@@ -5260,6 +5324,101 @@ fn model_from_request_body(body: &[u8]) -> String {
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "未知模型".to_string())
+}
+
+fn request_has_compaction_trigger(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("compaction_trigger").cloned())
+        .is_some_and(|value| !value.is_null())
+}
+
+fn value_contains_compaction_item(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(value_contains_compaction_item),
+        Value::Object(object) => {
+            object.get("type").and_then(Value::as_str) == Some("compaction")
+                || object.values().any(value_contains_compaction_item)
+        }
+        _ => false,
+    }
+}
+
+fn remote_compaction_v2_audit_from_request_body(body: &[u8]) -> RemoteCompactionV2Audit {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return RemoteCompactionV2Audit::default();
+    };
+    RemoteCompactionV2Audit {
+        trigger_received: value
+            .get("compaction_trigger")
+            .is_some_and(|value| !value.is_null()),
+        compaction_item_reused: value
+            .get("input")
+            .is_some_and(value_contains_compaction_item),
+        ..RemoteCompactionV2Audit::default()
+    }
+}
+
+fn response_contains_compaction_item(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .is_some_and(|value| value_contains_compaction_item(&value))
+}
+
+fn sse_event_contains_compaction_item(event: &str) -> bool {
+    event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|data| !data.is_empty() && *data != "[DONE]")
+        .any(|data| response_contains_compaction_item(data.as_bytes()))
+}
+
+fn decoded_proxy_request_body(headers: &HeaderMap, body: &[u8]) -> Result<Bytes, String> {
+    let encodings = headers
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let is_zstd_frame = body.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
+    if (encodings.is_empty() || encodings.iter().all(|encoding| encoding == "identity"))
+        && !is_zstd_frame
+    {
+        return Ok(Bytes::copy_from_slice(body));
+    }
+    if !encodings.is_empty()
+        && encodings
+            .iter()
+            .any(|encoding| encoding != "identity" && encoding != "zstd")
+    {
+        return Err(format!(
+            "不支持的请求 Content-Encoding: {}",
+            encodings.join(", ")
+        ));
+    }
+
+    let decoder = zstd::stream::read::Decoder::new(Cursor::new(body))
+        .map_err(|err| format!("无法解压 zstd 请求体: {err}"))?;
+    let mut limited = decoder.take((MAX_PROXY_BODY_BYTES + 1) as u64);
+    let mut decoded = Vec::new();
+    limited
+        .read_to_end(&mut decoded)
+        .map_err(|err| format!("无法读取 zstd 请求体: {err}"))?;
+    if decoded.len() > MAX_PROXY_BODY_BYTES {
+        return Err(format!(
+            "解压后的请求体超过 {} MiB 限制",
+            MAX_PROXY_BODY_BYTES / 1024 / 1024
+        ));
+    }
+
+    Ok(Bytes::from(decoded))
 }
 
 fn body_with_provider_overrides(
@@ -6808,11 +6967,13 @@ fn next_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
     None
 }
 
-fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) {
+fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) -> bool {
     buffer.push_str(&String::from_utf8_lossy(bytes));
+    let mut compaction_response_received = false;
     while let Some((index, delimiter_len)) = next_sse_event_boundary(buffer) {
         let event = buffer[..index].to_string();
         buffer.drain(..index + delimiter_len);
+        compaction_response_received |= sse_event_contains_compaction_item(&event);
         let next = usage_from_sse_event(&event);
         if !usage_is_zero(&next) {
             *usage = next;
@@ -6824,6 +6985,7 @@ fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) {
         let tail = buffer[keep_from..].to_string();
         *buffer = tail;
     }
+    compaction_response_received
 }
 
 fn finish_sse_usage(buffer: &mut String, usage: &mut TokenUsage) {
@@ -6839,17 +7001,38 @@ fn finish_sse_usage(buffer: &mut String, usage: &mut TokenUsage) {
 fn route_stream_ingest(state: &mut RouteStreamState, bytes: &[u8]) {
     let mut buffer = std::mem::take(&mut state.sse_buffer);
     let mut usage = std::mem::take(&mut state.usage);
-    ingest_sse_chunk(&mut buffer, &mut usage, bytes);
+    let compaction_response_received = ingest_sse_chunk(&mut buffer, &mut usage, bytes);
     state.sse_buffer = buffer;
     state.usage = usage;
+    if compaction_response_received {
+        state
+            .pending
+            .remote_compaction_v2
+            .compaction_response_received = true;
+        state
+            .pending
+            .remote_compaction_v2
+            .compaction_response_forwarded = true;
+    }
 }
 
 fn route_stream_finish_usage(state: &mut RouteStreamState) {
     let mut buffer = std::mem::take(&mut state.sse_buffer);
     let mut usage = std::mem::take(&mut state.usage);
+    let compaction_response_received = sse_event_contains_compaction_item(&buffer);
     finish_sse_usage(&mut buffer, &mut usage);
     state.sse_buffer = buffer;
     state.usage = usage;
+    if compaction_response_received {
+        state
+            .pending
+            .remote_compaction_v2
+            .compaction_response_received = true;
+        state
+            .pending
+            .remote_compaction_v2
+            .compaction_response_forwarded = true;
+    }
 }
 
 fn usage_from_response_text(text: &str) -> TokenUsage {
@@ -6919,6 +7102,7 @@ fn finish_route_log(
         method: pending.method,
         path: pending.path,
         model: pending.model,
+        remote_compaction_v2: pending.remote_compaction_v2,
         upstream_model: pending.upstream_model,
         provider_id: pending.provider_id,
         provider_name: pending.provider_name,
@@ -6967,6 +7151,7 @@ fn build_pending_route_log(
     method: &Method,
     path: &str,
     model: &str,
+    remote_compaction_v2: RemoteCompactionV2Audit,
     upstream_model: Option<&str>,
     upstream_chain: &[String],
     status_code: Option<u16>,
@@ -6979,6 +7164,7 @@ fn build_pending_route_log(
         method: method.as_str().to_string(),
         path: format!("/v1/{path}"),
         model: model.to_string(),
+        remote_compaction_v2,
         upstream_model: upstream_model.map(str::to_string),
         provider_id: candidate.provider.id.clone(),
         provider_name: candidate.provider.name.clone(),
@@ -7375,6 +7561,10 @@ async fn proxy_claude_request(
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
     };
+    let body_bytes = match decoded_proxy_request_body(&headers, &body_bytes) {
+        Ok(bytes) => bytes,
+        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
+    };
     let model = model_from_request_body(&body_bytes);
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(method) => method,
@@ -7415,6 +7605,7 @@ async fn proxy_claude_request(
         for (name, value) in headers.iter() {
             if name == AUTHORIZATION
                 || name == HOST
+                || name == CONTENT_ENCODING
                 || name == CONTENT_LENGTH
                 || name.as_str().eq_ignore_ascii_case("x-api-key")
                 || is_hop_by_hop_header(name)
@@ -7596,7 +7787,12 @@ async fn proxy_request(
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
     };
+    let body_bytes = match decoded_proxy_request_body(&headers, &body_bytes) {
+        Ok(bytes) => bytes,
+        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
+    };
     let model = model_from_request_body(&body_bytes);
+    let remote_compaction_v2_audit = remote_compaction_v2_audit_from_request_body(&body_bytes);
 
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(method) => method,
@@ -7635,6 +7831,11 @@ async fn proxy_request(
                     return proxy_error(StatusCode::BAD_REQUEST, err);
                 }
             };
+        let mut candidate_compaction_audit = remote_compaction_v2_audit.clone();
+        if candidate_compaction_audit.trigger_received {
+            candidate_compaction_audit.trigger_forwarded =
+                request_has_compaction_trigger(&prepared.body);
+        }
         let upstream_url = join_url(&candidate.base_url, &prepared.path) + &prepared.query;
         let mut request = proxy_state
             .client
@@ -7644,6 +7845,7 @@ async fn proxy_request(
         for (name, value) in headers.iter() {
             if name == AUTHORIZATION
                 || name == HOST
+                || name == CONTENT_ENCODING
                 || name == CONTENT_LENGTH
                 || is_hop_by_hop_header(name)
             {
@@ -7680,6 +7882,7 @@ async fn proxy_request(
                     &method,
                     &path,
                     &model,
+                    candidate_compaction_audit,
                     prepared.upstream_model.as_deref(),
                     &upstream_chain,
                     None,
@@ -7716,7 +7919,7 @@ async fn proxy_request(
             continue;
         }
 
-        let pending = build_pending_route_log(
+        let mut pending = build_pending_route_log(
             route_request_id.clone(),
             request_started_at_ms,
             request_started,
@@ -7724,6 +7927,7 @@ async fn proxy_request(
             &method,
             &path,
             &model,
+            candidate_compaction_audit,
             prepared.upstream_model.as_deref(),
             &upstream_chain,
             Some(status.as_u16()),
@@ -7829,6 +8033,7 @@ async fn proxy_request(
                 return proxy_error(StatusCode::BAD_GATEWAY, format!("读取上游响应失败: {err}"));
             }
         };
+        let response_is_passthrough = matches!(&prepared.adapter, ResponseAdapter::Passthrough);
         let response_bytes = match prepared.adapter {
             ResponseAdapter::Passthrough => bytes,
             ResponseAdapter::ChatCompletionsToResponses => {
@@ -7855,6 +8060,10 @@ async fn proxy_request(
                 }
             }
         };
+        if response_contains_compaction_item(&response_bytes) {
+            pending.remote_compaction_v2.compaction_response_received = true;
+            pending.remote_compaction_v2.compaction_response_forwarded = response_is_passthrough;
+        }
         let usage = usage_from_response_text(&String::from_utf8_lossy(&response_bytes));
         finish_route_log(pending, status_success, usage, first_byte_ms);
         if status_success {
@@ -10685,6 +10894,7 @@ fn save_router_config(
     }
     state.router = RouterConfig {
         enabled: payload.enabled,
+        remote_compaction_enabled: payload.remote_compaction_enabled,
         host: if host.is_empty() {
             default_router_host()
         } else {
@@ -11642,6 +11852,7 @@ mod tests {
         let backup = capture_claude_backup(&settings);
         let router = RouterConfig {
             enabled: true,
+            remote_compaction_enabled: false,
             host: "127.0.0.1".to_string(),
             port: 18080,
             local_token: "local-token".to_string(),
@@ -11697,6 +11908,129 @@ mod tests {
             json_env_value(&restored, "OTHER_ENV"),
             Some(Value::String("kept".to_string()))
         );
+    }
+
+    #[test]
+    fn remote_compaction_switches_custom_provider_name() {
+        let doc = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Example Provider"
+base_url = "https://example.com/v1"
+experimental_bearer_token = "example-token"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let enabled_router = RouterConfig {
+            enabled: true,
+            remote_compaction_enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 18080,
+            local_token: "local-token".to_string(),
+        };
+
+        let patched = render_router_patch_toml(doc, false, &enabled_router)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            toml_path_value(&patched, "model_providers.custom.name"),
+            Some(Value::String("OpenAI".to_string()))
+        );
+        assert_eq!(
+            router_patch_desired(&enabled_router)
+                .pointer("/model_providers/custom/name")
+                .and_then(Value::as_str),
+            Some("OpenAI")
+        );
+        assert_eq!(
+            toml_path_value(&patched, "features.remote_compaction_v2"),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            router_patch_desired(&enabled_router).pointer("/features/remote_compaction_v2"),
+            Some(&Value::Bool(true))
+        );
+
+        let disabled_router = RouterConfig {
+            remote_compaction_enabled: false,
+            ..enabled_router
+        };
+        let restored = render_router_patch_toml(patched, true, &disabled_router)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            toml_path_value(&restored, "model_providers.custom.name"),
+            Some(Value::String("custom".to_string()))
+        );
+        assert_eq!(
+            router_patch_desired(&disabled_router)
+                .pointer("/model_providers/custom/name")
+                .and_then(Value::as_str),
+            Some("custom")
+        );
+        assert_eq!(
+            toml_path_value(&restored, "features.remote_compaction_v2"),
+            Some(Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn forwards_remote_compaction_with_the_original_model_name() {
+        let provider = test_provider_config("provider-a", ProviderStatus::Enabled, true);
+        let body = br#"{"model":"gpt-5.6-sol","input":[],"parallel_tool_calls":false}"#;
+
+        let prepared =
+            prepare_upstream_request(&provider, "responses/compact", "", body, "gpt-5.6-sol")
+                .unwrap();
+        let forwarded: Value = serde_json::from_slice(&prepared.body).unwrap();
+
+        assert_eq!(prepared.path, "responses/compact");
+        assert_eq!(
+            forwarded.get("model").and_then(Value::as_str),
+            Some("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn decodes_zstd_request_before_model_routing() {
+        let raw = br#"{"model":"gpt-5.6-sol","input":[],"parallel_tool_calls":false}"#;
+        let compressed = zstd::stream::encode_all(Cursor::new(raw), 0).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+
+        let decoded = decoded_proxy_request_body(&headers, &compressed).unwrap();
+
+        assert_eq!(decoded.as_ref(), raw);
+        assert_eq!(model_from_request_body(&decoded), "gpt-5.6-sol");
+
+        let decoded_without_header =
+            decoded_proxy_request_body(&HeaderMap::new(), &compressed).unwrap();
+        assert_eq!(decoded_without_header.as_ref(), raw);
+    }
+
+    #[test]
+    fn audits_remote_compaction_v2_without_storing_request_content() {
+        let request = br#"{
+            "model":"gpt-5.6-sol",
+            "compaction_trigger":{"reason":"context_limit"},
+            "input":[{"type":"compaction","id":"cmp_test"}]
+        }"#;
+        let audit = remote_compaction_v2_audit_from_request_body(request);
+        let forwarded = body_with_provider_overrides(request, Some("upstream-model"), None);
+        let response = br#"{
+            "output":[{"type":"compaction","id":"cmp_result"}]
+        }"#;
+        let sse = "event: response.output_item.done\n\
+data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"id\":\"cmp_result\"}}\n\n";
+
+        assert!(audit.trigger_received);
+        assert!(audit.compaction_item_reused);
+        assert!(request_has_compaction_trigger(&forwarded));
+        assert!(response_contains_compaction_item(response));
+        assert!(sse_event_contains_compaction_item(sse));
     }
 
     #[test]
@@ -11813,6 +12147,7 @@ mod tests {
             method: "POST".to_string(),
             path: path.to_string(),
             model: "test-model".to_string(),
+            remote_compaction_v2: RemoteCompactionV2Audit::default(),
             upstream_model: None,
             provider_id: provider_id.to_string(),
             provider_name: provider_id.to_string(),
@@ -13267,6 +13602,7 @@ mod tests {
         let backup = capture_pi_backup(&config);
         let router = RouterConfig {
             enabled: true,
+            remote_compaction_enabled: false,
             host: "127.0.0.1".to_string(),
             port: 18080,
             local_token: "local-token".to_string(),

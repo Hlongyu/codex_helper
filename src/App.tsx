@@ -88,6 +88,7 @@ type PricingSyncStatus = {
 
 type RouterConfig = {
   enabled: boolean;
+  remote_compaction_enabled: boolean;
   host: string;
   port: number;
   local_token: string;
@@ -267,6 +268,13 @@ type RouteRequestLog = {
   method: string;
   path: string;
   model: string;
+  remote_compaction_v2?: {
+    trigger_received: boolean;
+    trigger_forwarded: boolean;
+    compaction_response_received: boolean;
+    compaction_response_forwarded: boolean;
+    compaction_item_reused: boolean;
+  } | null;
   upstream_model?: string | null;
   provider_id: string;
   provider_name: string;
@@ -413,6 +421,7 @@ function defaultBalanceQuery(endpoint = ""): BalanceQueryConfig {
 function defaultRouterConfig(): RouterConfig {
   return {
     enabled: false,
+    remote_compaction_enabled: false,
     host: "127.0.0.1",
     port: 18080,
     local_token: "",
@@ -667,6 +676,20 @@ function formatTokenTriplet(log: RouteRequestLog) {
   return `${formatTokenCount(log.uncached_input_tokens)} / ${formatTokenCount(log.cached_input_tokens)} / ${formatTokenCount(log.output_tokens)}`;
 }
 
+function remoteCompactionV2AuditLabel(log: RouteRequestLog) {
+  const audit = log.remote_compaction_v2;
+  if (!audit) return "";
+  const steps: string[] = [];
+  if (audit.trigger_received) {
+    steps.push(audit.trigger_forwarded ? "V2 触发已转发" : "V2 触发未转发");
+  }
+  if (audit.compaction_response_received) {
+    steps.push(audit.compaction_response_forwarded ? "已返回 compaction" : "compaction 未透传");
+  }
+  if (audit.compaction_item_reused) steps.push("已复用 compaction");
+  return steps.join(" · ");
+}
+
 function formatMs(value?: number | null) {
   if (value == null) return "-";
   if (value >= 1000) return `${(value / 1000).toFixed(value >= 10_000 ? 1 : 1)} s`;
@@ -712,6 +735,7 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
     "状态",
     "模型",
     "供应商",
+    "V2 压缩审计",
     "Token",
     "首字延迟",
     "总耗时",
@@ -724,6 +748,7 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
     statusMeta(log.status).label,
     log.model,
     log.provider_name,
+    remoteCompactionV2AuditLabel(log),
     log.total_tokens,
     log.first_byte_ms ?? "",
     log.total_ms,
@@ -2039,6 +2064,19 @@ function RouteScreen({
               onChange={(checked) => void onSaveClientConfig("codex", checked)}
             />
           </div>
+          <div className="route-toggle-line">
+            <div>
+              <strong>启用远程压缩</strong>
+              <p>开启时将 model_providers.custom.name 设为 OpenAI；关闭时设为 custom。</p>
+            </div>
+            <Toggle
+              checked={routerDraft.remote_compaction_enabled}
+              disabled={busy}
+              onChange={(remote_compaction_enabled) =>
+                setRouterDraft({ ...routerDraft, remote_compaction_enabled })
+              }
+            />
+          </div>
         </article>
 
         <article className="route-card">
@@ -2713,6 +2751,7 @@ function RequestLogsScreen({
           </header>
           {rows.map((log) => {
             const status = statusMeta(log.status);
+            const compactionAudit = remoteCompactionV2AuditLabel(log);
             return (
               <div className={log.route_attempts > 1 ? "selected" : ""} key={log.id}>
                 <div className="status-cell">
@@ -2727,6 +2766,7 @@ function RequestLogsScreen({
                 <div>
                   <strong>{log.provider_name}</strong>
                   <small>{log.error ?? log.upstream_chain.join(" → ")}</small>
+                  {compactionAudit && <small>{compactionAudit}</small>}
                 </div>
                 <span>{formatTokenTriplet(log)}</span>
                 <b>{formatMs(log.first_byte_ms)}</b>
