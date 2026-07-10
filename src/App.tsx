@@ -93,10 +93,86 @@ type RouterConfig = {
   local_token: string;
 };
 
+type SkillLocationConfig = {
+  path: string;
+  writable: boolean;
+};
+
+type ClientTargetConfig = {
+  enabled: boolean;
+  skill_locations: SkillLocationConfig[];
+  managed_skill_location: string;
+};
+
 type ClientConfigs = {
-  codex: { enabled: boolean };
-  claude: { enabled: boolean };
-  pi: { enabled: boolean };
+  codex: ClientTargetConfig;
+  claude: ClientTargetConfig;
+  pi: ClientTargetConfig;
+};
+
+type SkillLocationView = SkillLocationConfig & {
+  managed: boolean;
+  exists: boolean;
+};
+
+type SkillClientView = {
+  client: AgentClientKind;
+  label: string;
+  managed_skill_location: string;
+  skill_locations: SkillLocationView[];
+};
+
+type ClientSkillView = {
+  client: AgentClientKind;
+  client_label: string;
+  skill_location: string;
+  path: string;
+  dir_name: string;
+  identity: string;
+  description: string;
+  managed: boolean;
+  shared: boolean;
+};
+
+type SkillOrigin = {
+  client: AgentClientKind;
+  skill_location: string;
+  original_path: string;
+  original_dir_name: string;
+};
+
+type SkillExposureView = {
+  client: AgentClientKind;
+  client_label: string;
+  path: string;
+  health: string;
+  message: string;
+};
+
+type SharedSkillView = {
+  identity: string;
+  description: string;
+  library_dir_name: string;
+  path: string;
+  sharing_scope: AgentClientKind[];
+  origin?: SkillOrigin | null;
+  exposures: SkillExposureView[];
+};
+
+type SkillConflictView = {
+  kind: string;
+  identity: string;
+  client?: AgentClientKind | null;
+  path: string;
+  message: string;
+};
+
+type SkillManagementView = {
+  library_root: string;
+  clients: SkillClientView[];
+  shared_skills: SharedSkillView[];
+  client_skills: ClientSkillView[];
+  conflicts: SkillConflictView[];
 };
 
 type RouterStatus = {
@@ -312,7 +388,7 @@ type AppState = {
   router_status: RouterStatus;
 };
 
-type Screen = "dashboard" | "route" | "providers" | "usage" | "requests" | "settings";
+type Screen = "dashboard" | "route" | "providers" | "skills" | "usage" | "requests" | "settings";
 type EditorTab = "base" | "balance" | "route";
 type AgentClientKind = "codex" | "claude" | "pi";
 type ProviderKind = "codex" | "claude";
@@ -341,6 +417,20 @@ function defaultRouterConfig(): RouterConfig {
     port: 18080,
     local_token: "",
   };
+}
+
+function defaultClientConfigs(): ClientConfigs {
+  return {
+    codex: { enabled: false, skill_locations: [], managed_skill_location: "" },
+    claude: { enabled: false, skill_locations: [], managed_skill_location: "" },
+    pi: { enabled: false, skill_locations: [], managed_skill_location: "" },
+  };
+}
+
+function agentClientLabel(client: AgentClientKind) {
+  if (client === "codex") return "Codex";
+  if (client === "claude") return "Claude";
+  return "Pi";
 }
 
 function jsonPath(value: JsonValue | undefined | null, path: string[]) {
@@ -757,6 +847,17 @@ function NavIcon({ type }: { type: Screen }) {
           <path d="M9 17h3" />
         </>
       )}
+      {type === "skills" && (
+        <>
+          <path d="M5 5h6v6H5z" />
+          <path d="M13 5h6v6h-6z" />
+          <path d="M5 13h6v6H5z" />
+          <path d="M14 14h4" />
+          <path d="M16 12v4" />
+          <path d="M11 8h2" />
+          <path d="M8 11v2" />
+        </>
+      )}
       {type === "usage" && (
         <>
           <path d="M4 19V5" />
@@ -866,6 +967,7 @@ function ToolIcon({ type }: { type: "settings" | "latency" | "balance" }) {
 
 function App() {
   const [appState, setAppState] = useState<AppState | null>(null);
+  const [skillManagement, setSkillManagement] = useState<SkillManagementView | null>(null);
   const [routeUsageStats, setRouteUsageStats] = useState<RouteUsageStats | null>(null);
   const [routeLogs, setRouteLogs] = useState<RouteLogsResponse | null>(null);
   const [usageRange, setUsageRange] = useState<TimeRange>("today");
@@ -941,6 +1043,11 @@ function App() {
     setRouterDraft(state.router ?? defaultRouterConfig());
   }
 
+  async function refreshSkillManagement() {
+    const view = await callCommand<SkillManagementView>("load_skill_management");
+    setSkillManagement(view);
+  }
+
   async function refresh() {
     await refreshAppState();
     try {
@@ -970,6 +1077,8 @@ function App() {
           await refreshRouteLogs(requestFilter);
         } else if (screen === "route" || screen === "providers") {
           await refreshAppState();
+        } else if (screen === "skills") {
+          await refreshSkillManagement();
         }
       } catch (err) {
         if (!cancelled) setError(String(err));
@@ -1419,11 +1528,7 @@ function App() {
 
   async function saveClientConfig(kind: AgentClientKind, enabled: boolean) {
     await run(async () => {
-      const clients = appState?.clients ?? {
-        codex: { enabled: false },
-        claude: { enabled: false },
-        pi: { enabled: false },
-      };
+      const clients = appState?.clients ?? defaultClientConfigs();
       const state = await callCommand<AppState>("save_client_configs", {
         payload: {
           codex_enabled: kind === "codex" ? enabled : clients.codex.enabled,
@@ -1433,6 +1538,72 @@ function App() {
       });
       setAppState(state);
       setRouterDraft(state.router);
+    });
+  }
+
+  async function saveSkillClientConfig(
+    client: AgentClientKind,
+    skillLocations: SkillLocationConfig[],
+    managedSkillLocation: string,
+  ) {
+    await run(async () => {
+      const view = await callCommand<SkillManagementView>("save_skill_client_config", {
+        payload: {
+          client,
+          skill_locations: skillLocations,
+          managed_skill_location: managedSkillLocation,
+        },
+      });
+      setSkillManagement(view);
+    });
+  }
+
+  async function promoteClientSkill(skill: ClientSkillView) {
+    await run(async () => {
+      const view = await callCommand<SkillManagementView>("promote_client_skill", {
+        payload: {
+          client: skill.client,
+          skill_path: skill.path,
+          sharing_scope: [skill.client],
+        },
+      });
+      setSkillManagement(view);
+    });
+  }
+
+  async function useExistingSharedSkill(skill: ClientSkillView) {
+    await run(async () => {
+      const view = await callCommand<SkillManagementView>("replace_client_skill_with_shared", {
+        payload: {
+          client: skill.client,
+          skill_path: skill.path,
+        },
+      });
+      setSkillManagement(view);
+    });
+  }
+
+  async function setSkillSharingScope(skill: SharedSkillView, scope: AgentClientKind[]) {
+    await run(async () => {
+      const view = await callCommand<SkillManagementView>("set_skill_sharing_scope", {
+        payload: {
+          skill_identity: skill.identity,
+          sharing_scope: scope,
+        },
+      });
+      setSkillManagement(view);
+    });
+  }
+
+  async function deleteSharedSkill(skill: SharedSkillView) {
+    if (!window.confirm(`删除 Shared Skill「${skill.identity}」并移除所有 exposure？`)) return;
+    await run(async () => {
+      const view = await callCommand<SkillManagementView>("delete_shared_skill", {
+        payload: {
+          skill_identity: skill.identity,
+        },
+      });
+      setSkillManagement(view);
     });
   }
 
@@ -1511,6 +1682,7 @@ function App() {
             ["dashboard", "总览"],
             ["route", "路由"],
             ["providers", "供应商"],
+            ["skills", "Skills"],
             ["usage", "使用统计"],
             ["requests", "请求记录"],
             ["settings", "设置"],
@@ -1538,6 +1710,8 @@ function App() {
                   ? "路由"
                 : screen === "providers"
                   ? "供应商"
+                  : screen === "skills"
+                    ? "Skill 管理"
                   : screen === "usage"
                     ? "使用统计"
                     : screen === "requests"
@@ -1551,6 +1725,8 @@ function App() {
                   ? "管理 Codex、Claude 接管与本地代理"
                 : screen === "providers"
                   ? "管理上游连接、余额监控与路由顺序"
+                  : screen === "skills"
+                    ? "管理 Codex、Claude 与 Pi 之间的本机 Shared Skills"
                 : screen === "usage"
                     ? "分析本地路由后的 Token、费用与供应商使用情况"
                     : screen === "requests"
@@ -1633,6 +1809,19 @@ function App() {
             onToggle={providerKind === "claude" ? toggleClaudeProvider : toggleProvider}
             providerKind={providerKind}
             providers={providerKind === "claude" ? appState.claude_providers : appState.providers}
+          />
+        )}
+
+        {screen === "skills" && (
+          <SkillManagementScreen
+            busy={busy}
+            onDeleteSharedSkill={deleteSharedSkill}
+            onPromote={promoteClientSkill}
+            onRefresh={refreshSkillManagement}
+            onSaveClientConfig={saveSkillClientConfig}
+            onSetSharingScope={setSkillSharingScope}
+            onUseExistingSharedSkill={useExistingSharedSkill}
+            view={skillManagement}
           />
         )}
 
@@ -2014,6 +2203,263 @@ function RouteScreen({
           保存修改
         </button>
       </div>
+    </section>
+  );
+}
+
+
+function SkillClientConfigCard({
+  busy,
+  client,
+  onSave,
+}: {
+  busy: boolean;
+  client: SkillClientView;
+  onSave: (
+    client: AgentClientKind,
+    skillLocations: SkillLocationConfig[],
+    managedSkillLocation: string,
+  ) => Promise<void>;
+}) {
+  const [locationsText, setLocationsText] = useState(() =>
+    client.skill_locations.map((location) => location.path).join("\n"),
+  );
+  const [managedLocation, setManagedLocation] = useState(client.managed_skill_location);
+
+  useEffect(() => {
+    setLocationsText(client.skill_locations.map((location) => location.path).join("\n"));
+    setManagedLocation(client.managed_skill_location);
+  }, [client.client, client.managed_skill_location, client.skill_locations]);
+
+  const parsedLocations = locationsText
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((path) => ({ path, writable: true }));
+
+  return (
+    <article className="skill-card">
+      <div className="card-head">
+        <div>
+          <h3>{client.label}</h3>
+          <p>扫描 Skill Location 的直接子目录；新 exposure 只写入 Managed Skill Location。</p>
+        </div>
+        <button
+          className="ghost"
+          disabled={busy}
+          onClick={() => void onSave(client.client, parsedLocations, managedLocation)}
+          type="button"
+        >
+          保存路径
+        </button>
+      </div>
+      <label className="field skill-field">
+        <span>Skill Locations（一行一个）</span>
+        <textarea
+          onChange={(event) => setLocationsText(event.currentTarget.value)}
+          rows={4}
+          value={locationsText}
+        />
+      </label>
+      <label className="field skill-field">
+        <span>Managed Skill Location</span>
+        <input
+          onChange={(event) => setManagedLocation(event.currentTarget.value)}
+          value={managedLocation}
+        />
+      </label>
+      <div className="skill-location-list">
+        {client.skill_locations.map((location) => (
+          <span className={location.exists ? "skill-pill ok" : "skill-pill warn"} key={location.path}>
+            {location.managed ? "Managed · " : "Scan · "}
+            {location.exists ? "存在" : "缺失"}
+          </span>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function SkillManagementScreen({
+  busy,
+  onDeleteSharedSkill,
+  onPromote,
+  onRefresh,
+  onSaveClientConfig,
+  onSetSharingScope,
+  onUseExistingSharedSkill,
+  view,
+}: {
+  busy: boolean;
+  onDeleteSharedSkill: (skill: SharedSkillView) => Promise<void>;
+  onPromote: (skill: ClientSkillView) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onSaveClientConfig: (
+    client: AgentClientKind,
+    skillLocations: SkillLocationConfig[],
+    managedSkillLocation: string,
+  ) => Promise<void>;
+  onSetSharingScope: (skill: SharedSkillView, scope: AgentClientKind[]) => Promise<void>;
+  onUseExistingSharedSkill: (skill: ClientSkillView) => Promise<void>;
+  view: SkillManagementView | null;
+}) {
+  const clients: AgentClientKind[] = ["codex", "claude", "pi"];
+
+  function nextScope(skill: SharedSkillView, client: AgentClientKind, checked: boolean) {
+    const current = new Set(skill.sharing_scope);
+    if (checked) current.add(client);
+    else current.delete(client);
+    return clients.filter((item) => current.has(item));
+  }
+
+  if (!view) {
+    return (
+      <section className="skills-page">
+        <article className="page-panel empty-state">
+          <h2>Skill 管理</h2>
+          <p>扫描本机已知 Agent Client 的 Skill Locations，发现可共享的 Skill。</p>
+          <button className="primary" disabled={busy} onClick={() => void onRefresh()} type="button">
+            扫描 Skills
+          </button>
+        </article>
+      </section>
+    );
+  }
+
+  return (
+    <section className="skills-page">
+      <div className="section-title">
+        <div>
+          <h2>Skill Management</h2>
+          <p className="muted">Skill Library Root: {view.library_root}</p>
+        </div>
+        <button className="primary" disabled={busy} onClick={() => void onRefresh()} type="button">
+          重新扫描
+        </button>
+      </div>
+
+      <div className="skill-client-grid">
+        {view.clients.map((client) => (
+          <SkillClientConfigCard
+            busy={busy}
+            client={client}
+            key={client.client}
+            onSave={onSaveClientConfig}
+          />
+        ))}
+      </div>
+
+      {view.conflicts.length > 0 && (
+        <article className="page-panel skill-section">
+          <div className="panel-head">
+            <div>
+              <h2>冲突</h2>
+              <p>同名冲突不会自动覆盖、合并或重命名。</p>
+            </div>
+          </div>
+          <div className="skill-list">
+            {view.conflicts.map((conflict) => (
+              <div className="skill-row conflict" key={`${conflict.kind}-${conflict.path}`}>
+                <div>
+                  <strong>{conflict.identity}</strong>
+                  <small>{conflict.client ? agentClientLabel(conflict.client) : "Library"} · {conflict.path}</small>
+                </div>
+                <span className="skill-pill warn">{conflict.kind}</span>
+                <p>{conflict.message}</p>
+              </div>
+            ))}
+          </div>
+        </article>
+      )}
+
+      <article className="page-panel skill-section">
+        <div className="panel-head">
+          <div>
+            <h2>Shared Skills</h2>
+            <p>每个 Shared Skill 的 Sharing Scope 保存后立即应用为 symlink exposure。</p>
+          </div>
+        </div>
+        <div className="skill-list">
+          {view.shared_skills.length === 0 && <p className="muted">暂无 Shared Skill。</p>}
+          {view.shared_skills.map((skill) => (
+            <div className="shared-skill" key={skill.identity}>
+              <div className="shared-skill-main">
+                <div>
+                  <strong>{skill.identity}</strong>
+                  <small>{skill.description || skill.path}</small>
+                  {skill.origin && (
+                    <small>Origin: {agentClientLabel(skill.origin.client)} · {skill.origin.original_path}</small>
+                  )}
+                </div>
+                <button className="ghost danger" disabled={busy} onClick={() => void onDeleteSharedSkill(skill)} type="button">
+                  删除
+                </button>
+              </div>
+              <div className="scope-row">
+                {clients.map((client) => (
+                  <label key={client}>
+                    <input
+                      checked={skill.sharing_scope.includes(client)}
+                      disabled={busy}
+                      onChange={(event) =>
+                        void onSetSharingScope(skill, nextScope(skill, client, event.currentTarget.checked))
+                      }
+                      type="checkbox"
+                    />
+                    {agentClientLabel(client)}
+                  </label>
+                ))}
+              </div>
+              <div className="exposure-list">
+                {skill.exposures.map((exposure) => (
+                  <div className="exposure-row" key={`${skill.identity}-${exposure.client}-${exposure.path}`}>
+                    <span className={`skill-pill ${exposure.health === "healthy" ? "ok" : "warn"}`}>
+                      {exposure.client_label} · {exposure.health}
+                    </span>
+                    <code>{exposure.path || "未创建"}</code>
+                    <small>{exposure.message}</small>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </article>
+
+      <article className="page-panel skill-section">
+        <div className="panel-head">
+          <div>
+            <h2>Client Skills</h2>
+            <p>从已知 Agent Client 的 Skill Locations 发现；公用后会进入 Skill Library。</p>
+          </div>
+        </div>
+        <div className="skill-list">
+          {view.client_skills.length === 0 && <p className="muted">暂无未共享 Client Skill。</p>}
+          {view.client_skills.map((skill) => (
+            <div className="skill-row" key={`${skill.client}-${skill.path}`}>
+              <div>
+                <strong>{skill.identity}</strong>
+                <small>{skill.client_label} · {skill.path}</small>
+                {skill.description && <small>{skill.description}</small>}
+              </div>
+              {skill.shared ? (
+                <button
+                  className="ghost"
+                  disabled={busy}
+                  onClick={() => void onUseExistingSharedSkill(skill)}
+                  type="button"
+                >
+                  使用已有 Shared Skill
+                </button>
+              ) : (
+                <button className="primary" disabled={busy} onClick={() => void onPromote(skill)} type="button">
+                  公用
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      </article>
     </section>
   );
 }

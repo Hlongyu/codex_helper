@@ -1990,3 +1990,160 @@ button.danger {
     grid-template-columns: 1fr 1fr;
   }
 }
+
+.skills-page {
+  padding: 30px 28px 32px;
+}
+
+.skill-client-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.skill-card,
+.shared-skill,
+.skill-row {
+  border: 1px solid #1d2a3b;
+  border-radius: 14px;
+  background: #111925;
+  padding: 16px;
+}
+
+.skill-section {
+  margin-top: 16px;
+  padding: 20px;
+}
+
+.skill-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.skill-row,
+.shared-skill-main,
+.exposure-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.skill-row.conflict {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.skill-row.conflict p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #ffc35c;
+}
+
+.skill-row strong,
+.shared-skill strong,
+.skill-card h3 {
+  display: block;
+  color: #f7f9fd;
+}
+
+.skill-row small,
+.shared-skill small,
+.exposure-row small,
+.skill-card p {
+  display: block;
+  margin-top: 4px;
+  color: #8693a5;
+  overflow-wrap: anywhere;
+}
+
+.skill-field {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.field textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid #24364a;
+  border-radius: 12px;
+  background: #0e151f;
+  color: #f7f9fd;
+  outline: none;
+  padding: 10px 12px;
+}
+
+.skill-location-list,
+.scope-row,
+.exposure-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.scope-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #24364a;
+  border-radius: 999px;
+  background: #0d1520;
+  color: #dbe4f4;
+  padding: 7px 12px;
+}
+
+.skill-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  background: #162234;
+  color: #9fb0c8;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.skill-pill.ok {
+  background: #123626;
+  color: #63f0ac;
+}
+
+.skill-pill.warn {
+  background: #2e2418;
+  color: #ffc35c;
+}
+
+.exposure-row {
+  width: 100%;
+  grid-template-columns: auto minmax(0, 1fr);
+  border-top: 1px solid #202d3d;
+  padding-top: 10px;
+}
+
+.exposure-row code {
+  overflow: hidden;
+  color: #d8e2f2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.exposure-row small {
+  grid-column: 1 / -1;
+}
+
+.ghost.danger {
+  border-color: #6b2c3c;
+  color: #ff859c;
+}
+
+.empty-state {
+  display: grid;
+  min-height: 260px;
+  place-items: center;
+  text-align: center;
+  padding: 30px;
+}

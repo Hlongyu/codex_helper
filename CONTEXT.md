@@ -9,11 +9,11 @@ An upstream service configuration that can receive routed model requests. In thi
 _Avoid_: Supplier, vendor
 
 **Agent Client**:
-A local coding-agent application that Codex Helper can configure to send model requests through routed Providers.
+A known local coding-agent application that Codex Helper supports, such as by configuring model routing or coordinating shared Skills.
 _Avoid_: Provider, supplier, vendor
 
 **Pi Coding Agent**:
-An Agent Client whose Codex Helper support is limited to routing model requests through configured Providers.
+An Agent Client that Codex Helper can configure for model routing and Skill Exposure by placing shared Skills in Pi's Skill Location.
 _Avoid_: Pi provider, Pi supplier
 
 **Provider Failure**:
@@ -47,3 +47,83 @@ _Avoid_: Availability
 **Route Model**:
 A model name Codex Helper exposes to Agent Clients and can route to an eligible Provider. Route Models are distinct from Provider-specific upstream model names, which may be reached through model mappings.
 _Avoid_: Provider model, upstream model
+
+**Skill**:
+A reusable capability directory containing `SKILL.md` that an Agent Client can discover and apply while working. A Skill is treated as user-authored working knowledge rather than as a model-routing Provider or runtime plugin, and Codex Helper manages the whole Skill directory rather than only its `SKILL.md`.
+_Avoid_: Plugin, provider, prompt
+
+**Skill Identity**:
+The stable name that identifies a Skill across Agent Clients. Codex Helper reads it from the Skill's metadata name when present, and falls back to the Skill's directory name only when metadata is missing; Codex Helper does not rename Skill Identities.
+_Avoid_: Path, folder name, display name
+
+**Client Skill**:
+A Skill that currently lives in an Agent Client's native skill location and is discoverable by that Agent Client.
+_Avoid_: Local skill, private skill
+
+**Skill Location**:
+A filesystem location where an Agent Client discovers Skills. An Agent Client may have multiple Skill Locations; Codex Helper may suggest defaults for known Agent Clients, but the user can configure them.
+_Avoid_: Shared folder, library
+
+**Writable Skill Location**:
+A Skill Location that Codex Helper may manage when promoting or exposing Skills. Read-only, built-in, or otherwise unmanaged Skill Locations can be scanned for discovery but are not modified.
+_Avoid_: Skill Location
+
+**Managed Skill Location**:
+The single Writable Skill Location for a known Agent Client where Codex Helper creates new Skill Exposures. Other Skill Locations for the same Agent Client may still be scanned for discovery, but Codex Helper does not distribute new Shared Skills into them.
+_Avoid_: Skill Location, all writable locations
+
+**Shared Skill**:
+A canonical Skill managed by Codex Helper and made discoverable to selected Agent Clients without creating independent content copies.
+_Avoid_: Copied skill, duplicated skill, public skill
+
+**Skill Sharing Scope**:
+The set of Agent Clients that a Shared Skill is intended to be exposed to. Each Shared Skill has its own Skill Sharing Scope chosen by the user; Codex Helper does not inspect Skill content to decide whether an Agent Client is compatible.
+_Avoid_: Global sharing, automatic sharing
+
+**Skill Unsharing**:
+The removal of a Shared Skill from one Agent Client's Skill Sharing Scope. Skill Unsharing removes that Agent Client's Skill Exposure but does not delete the Shared Skill from the Skill Library.
+_Avoid_: Delete, uninstall
+
+**Shared Skill Deletion**:
+The removal of a Shared Skill's canonical content from the Skill Library. Shared Skill Deletion includes reviewing the affected Skill Exposures, removing those exposures, and then deleting the canonical Shared Skill.
+_Avoid_: Unshare, disable
+
+**Skill Library**:
+The Codex Helper-owned collection of Shared Skills. Agent Client skill locations expose Skills from the Skill Library, but do not own the canonical Shared Skill content. Each Skill Identity is unique within the Skill Library.
+_Avoid_: Codex skills directory, client skill folder
+
+**Skill Library Root**:
+The Codex Helper-managed filesystem location where the Skill Library stores canonical Shared Skill content. The Skill Library Root is not user-configurable.
+_Avoid_: Agent Client skill folder, exposure path
+
+**Skill Promotion**:
+The act of turning a Client Skill into a Shared Skill by establishing its canonical content in the Skill Library and replacing the original Agent Client location with an exposure of that Shared Skill. Skill Promotion may originate from any Writable Skill Location and must preserve a recoverable path if Codex Helper cannot complete the exposure.
+_Avoid_: Copy, import
+
+**Skill Origin**:
+The Agent Client, Skill Location, and original path from which a Shared Skill was promoted. Skill Origin is audit history and does not make the originating Agent Client the owner of the Shared Skill.
+_Avoid_: Owner, source of truth
+
+**Skill Exposure**:
+The relationship that makes a Shared Skill discoverable to an Agent Client through that Agent Client's native discovery mechanism. The exposure may be implemented by links, generated entries, or client-specific adapters, but the exposed Shared Skill remains canonical in the Skill Library.
+_Avoid_: Symlink, copy
+
+**Managed Skill Exposure**:
+A Skill Exposure created and tracked by Codex Helper. Managed Skill Exposures are shown as exposures of Shared Skills rather than as independent Client Skills during discovery.
+_Avoid_: Client Skill, duplicate skill
+
+**Exposure Registry**:
+Codex Helper's record of Managed Skill Exposures. The Exposure Registry is the authoritative source for which Agent Client locations are managed exposures, rather than inferring management solely from filesystem paths.
+_Avoid_: Path inference, scan result
+
+**Exposure Health**:
+The consistency state between the Exposure Registry and the Agent Client-visible filesystem entry for a Managed Skill Exposure. Missing, orphaned, and broken exposures require explicit user repair rather than silent automatic repair.
+_Avoid_: Sync status, availability
+
+**Skill Name Conflict**:
+A situation where an Agent Client already has a Client Skill with the same identity as a Shared Skill that Codex Helper could expose to it, or where a Client Skill selected for sharing has the same Skill Identity as an existing Shared Skill. Codex Helper does not merge, rename, or overwrite Skills automatically; the user must choose whether to use the existing Shared Skill or keep the Client Skill unshared.
+_Avoid_: Merge, overwrite
+
+**Skill Location Conflict**:
+A situation where the same Agent Client discovers multiple Client Skills with the same Skill Identity from different Skill Locations. Codex Helper does not merge or choose between them automatically.
+_Avoid_: Duplicate skill, priority

@@ -1,6 +1,6 @@
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, State as AxumState},
+    extract::{Path as AxumPath, State as AxumState},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     response::Response,
     routing::any,
@@ -18,7 +18,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -250,10 +250,151 @@ struct RouterConfig {
     local_token: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentClientKind {
+    Codex,
+    Claude,
+    Pi,
+}
+
+impl AgentClientKind {
+    fn all() -> [Self; 3] {
+        [Self::Codex, Self::Claude, Self::Pi]
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+            Self::Pi => "Pi",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SkillLocationConfig {
+    path: String,
+    #[serde(default = "default_true")]
+    writable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SkillOrigin {
+    client: AgentClientKind,
+    skill_location: String,
+    original_path: String,
+    original_dir_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SharedSkillConfig {
+    identity: String,
+    library_dir_name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    sharing_scope: Vec<AgentClientKind>,
+    #[serde(default)]
+    origin: Option<SkillOrigin>,
+    #[serde(default)]
+    created_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedSkillExposureConfig {
+    skill_identity: String,
+    client: AgentClientKind,
+    path: String,
+    #[serde(default)]
+    skill_location: String,
+    #[serde(default)]
+    created_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SkillManagementConfig {
+    #[serde(default)]
+    shared_skills: Vec<SharedSkillConfig>,
+    #[serde(default)]
+    exposures: Vec<ManagedSkillExposureConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SkillLocationView {
+    path: String,
+    writable: bool,
+    managed: bool,
+    exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SkillClientView {
+    client: AgentClientKind,
+    label: String,
+    managed_skill_location: String,
+    skill_locations: Vec<SkillLocationView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClientSkillView {
+    client: AgentClientKind,
+    client_label: String,
+    skill_location: String,
+    path: String,
+    dir_name: String,
+    identity: String,
+    description: String,
+    managed: bool,
+    shared: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SkillExposureView {
+    client: AgentClientKind,
+    client_label: String,
+    path: String,
+    health: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SharedSkillView {
+    identity: String,
+    description: String,
+    library_dir_name: String,
+    path: String,
+    sharing_scope: Vec<AgentClientKind>,
+    origin: Option<SkillOrigin>,
+    exposures: Vec<SkillExposureView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SkillConflictView {
+    kind: String,
+    identity: String,
+    client: Option<AgentClientKind>,
+    path: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SkillManagementView {
+    library_root: String,
+    clients: Vec<SkillClientView>,
+    shared_skills: Vec<SharedSkillView>,
+    client_skills: Vec<ClientSkillView>,
+    conflicts: Vec<SkillConflictView>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ClientTargetConfig {
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    skill_locations: Vec<SkillLocationConfig>,
+    #[serde(default)]
+    managed_skill_location: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -311,6 +452,8 @@ struct ManagerState {
     claude_backup: Option<ClaudeApplyBackup>,
     #[serde(default)]
     pi_backup: Option<PiApplyBackup>,
+    #[serde(default)]
+    skills: SkillManagementConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -659,6 +802,37 @@ struct SaveClientConfigsPayload {
     codex_enabled: bool,
     claude_enabled: bool,
     pi_enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveSkillClientConfigPayload {
+    client: AgentClientKind,
+    skill_locations: Vec<SkillLocationConfig>,
+    managed_skill_location: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromoteClientSkillPayload {
+    client: AgentClientKind,
+    skill_path: String,
+    sharing_scope: Vec<AgentClientKind>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplaceClientSkillWithSharedPayload {
+    client: AgentClientKind,
+    skill_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetSkillSharingScopePayload {
+    skill_identity: String,
+    sharing_scope: Vec<AgentClientKind>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillIdentityPayload {
+    skill_identity: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1217,6 +1391,10 @@ fn default_balance_path() -> String {
     "/api/usage/token/".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_router_host() -> String {
     DEFAULT_ROUTER_HOST.to_string()
 }
@@ -1342,6 +1520,836 @@ fn pi_models_path() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".pi").join("agent").join("models.json"))
 }
 
+fn skill_library_root() -> Result<PathBuf, String> {
+    Ok(manager_dir()?.join("skills"))
+}
+
+fn skill_backup_root() -> Result<PathBuf, String> {
+    Ok(manager_dir()?.join("skill-backups"))
+}
+
+fn default_skill_location_for(client: AgentClientKind) -> Result<PathBuf, String> {
+    match client {
+        AgentClientKind::Codex => Ok(codex_home()?.join("skills")),
+        AgentClientKind::Claude => Ok(claude_home()?.join("skills")),
+        AgentClientKind::Pi => Ok(home_dir()?.join(".pi").join("agent").join("skills")),
+    }
+}
+
+fn expand_user_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    if trimmed == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return Ok(home_dir()?.join(rest));
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn client_config(clients: &ClientConfigs, client: AgentClientKind) -> &ClientTargetConfig {
+    match client {
+        AgentClientKind::Codex => &clients.codex,
+        AgentClientKind::Claude => &clients.claude,
+        AgentClientKind::Pi => &clients.pi,
+    }
+}
+
+fn client_config_mut(
+    clients: &mut ClientConfigs,
+    client: AgentClientKind,
+) -> &mut ClientTargetConfig {
+    match client {
+        AgentClientKind::Codex => &mut clients.codex,
+        AgentClientKind::Claude => &mut clients.claude,
+        AgentClientKind::Pi => &mut clients.pi,
+    }
+}
+
+fn normalize_skill_locations_for_client(config: &mut ClientTargetConfig, default_path: PathBuf) {
+    let default_path = display_path(&default_path);
+    let mut seen = BTreeSet::new();
+    let mut locations = Vec::new();
+    for location in std::mem::take(&mut config.skill_locations) {
+        let path = location.path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let normalized = expand_user_path(path)
+            .map(|path| display_path(&path))
+            .unwrap_or_else(|_| path.to_string());
+        if seen.insert(normalized.clone()) {
+            locations.push(SkillLocationConfig {
+                path: normalized,
+                writable: location.writable,
+            });
+        }
+    }
+    if locations.is_empty() {
+        locations.push(SkillLocationConfig {
+            path: default_path.clone(),
+            writable: true,
+        });
+    }
+
+    let mut managed = config.managed_skill_location.trim().to_string();
+    if managed.is_empty() {
+        managed = locations
+            .iter()
+            .find(|location| location.writable)
+            .map(|location| location.path.clone())
+            .unwrap_or_else(|| default_path.clone());
+    } else if let Ok(expanded) = expand_user_path(&managed) {
+        managed = display_path(&expanded);
+    }
+    if !locations.iter().any(|location| location.path == managed) {
+        locations.push(SkillLocationConfig {
+            path: managed.clone(),
+            writable: true,
+        });
+    }
+    if !locations
+        .iter()
+        .any(|location| location.path == managed && location.writable)
+    {
+        if let Some(first_writable) = locations.iter().find(|location| location.writable) {
+            managed = first_writable.path.clone();
+        } else {
+            managed = default_path.clone();
+            locations.push(SkillLocationConfig {
+                path: managed.clone(),
+                writable: true,
+            });
+        }
+    }
+
+    config.skill_locations = locations;
+    config.managed_skill_location = managed;
+}
+
+fn normalize_skill_management_state(state: &mut ManagerState) {
+    for client in AgentClientKind::all() {
+        if let Ok(default_path) = default_skill_location_for(client) {
+            normalize_skill_locations_for_client(
+                client_config_mut(&mut state.clients, client),
+                default_path,
+            );
+        }
+    }
+
+    let mut seen_skills = BTreeSet::new();
+    state.skills.shared_skills.retain_mut(|skill| {
+        skill.identity = skill.identity.trim().to_string();
+        skill.library_dir_name = skill.library_dir_name.trim().to_string();
+        if skill.identity.is_empty() || skill.library_dir_name.is_empty() {
+            return false;
+        }
+        if !seen_skills.insert(skill.identity.clone()) {
+            return false;
+        }
+        let mut seen_scope = BTreeSet::new();
+        skill
+            .sharing_scope
+            .retain(|client| seen_scope.insert(*client));
+        true
+    });
+    let known_skills = state
+        .skills
+        .shared_skills
+        .iter()
+        .map(|skill| skill.identity.clone())
+        .collect::<BTreeSet<_>>();
+    state.skills.exposures.retain_mut(|exposure| {
+        exposure.path = exposure.path.trim().to_string();
+        exposure.skill_location = exposure.skill_location.trim().to_string();
+        known_skills.contains(&exposure.skill_identity) && !exposure.path.is_empty()
+    });
+    let mut seen_exposures = BTreeSet::new();
+    state.skills.exposures.retain(|exposure| {
+        seen_exposures.insert((
+            exposure.skill_identity.clone(),
+            exposure.client,
+            exposure.path.clone(),
+        ))
+    });
+}
+
+fn parse_skill_frontmatter_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string()
+}
+
+fn parse_skill_metadata_text(text: &str) -> (Option<String>, Option<String>) {
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return (None, None);
+    }
+    let mut name = None;
+    let mut description = None;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        if let Some((key, value)) = trimmed.split_once(':') {
+            match key.trim() {
+                "name" => name = Some(parse_skill_frontmatter_value(value)),
+                "description" => description = Some(parse_skill_frontmatter_value(value)),
+                _ => {}
+            }
+        }
+    }
+    (
+        name.filter(|value| !value.is_empty()),
+        description.unwrap_or_default().into(),
+    )
+}
+
+fn read_skill_metadata(skill_dir: &Path) -> Result<(String, String), String> {
+    let skill_md = skill_dir.join("SKILL.md");
+    if !skill_md.is_file() {
+        return Err("Skill 目录缺少 SKILL.md".to_string());
+    }
+    let raw = fs::read_to_string(&skill_md)
+        .map_err(|err| format!("无法读取 {}: {err}", skill_md.display()))?;
+    let (name, description) = parse_skill_metadata_text(&raw);
+    let fallback = skill_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("skill")
+        .to_string();
+    Ok((name.unwrap_or(fallback), description.unwrap_or_default()))
+}
+
+fn safe_skill_slug(identity: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in identity.trim().chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if ch == '-' || ch == '_' {
+            Some(ch)
+        } else if ch.is_whitespace() || matches!(ch, '/' | '\\' | ':' | '.' | '#') {
+            Some('-')
+        } else {
+            Some('-')
+        };
+        if let Some(ch) = next {
+            if ch == '-' {
+                if !last_dash && !slug.is_empty() {
+                    slug.push(ch);
+                    last_dash = true;
+                }
+            } else {
+                slug.push(ch);
+                last_dash = false;
+            }
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "skill".to_string()
+    } else {
+        slug
+    }
+}
+
+fn unique_skill_library_dir_name(state: &ManagerState, identity: &str) -> Result<String, String> {
+    let root = skill_library_root()?;
+    let base = safe_skill_slug(identity);
+    let used = state
+        .skills
+        .shared_skills
+        .iter()
+        .map(|skill| skill.library_dir_name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut candidate = base.clone();
+    let mut index = 2;
+    while used.contains(&candidate) || root.join(&candidate).exists() {
+        candidate = format!("{base}-{index}");
+        index += 1;
+    }
+    Ok(candidate)
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|err| format!("无法创建目录 {}: {err}", dst.display()))?;
+    for entry in
+        fs::read_dir(src).map_err(|err| format!("无法读取目录 {}: {err}", src.display()))?
+    {
+        let entry = entry.map_err(|err| format!("无法读取目录项: {err}"))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("无法读取文件类型 {}: {err}", src_path.display()))?;
+        if file_type.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            fs::copy(&src_path, &dst_path).map_err(|err| {
+                format!(
+                    "无法复制 {} 到 {}: {err}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_file_or_dir(path: &Path) -> Result<(), String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|err| format!("无法读取 {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path).map_err(|err| format!("无法删除 {}: {err}", path.display()))
+    } else {
+        fs::remove_dir_all(path).map_err(|err| format!("无法删除 {}: {err}", path.display()))
+    }
+}
+
+fn create_dir_symlink(src: &Path, dst: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(src, dst).map_err(|err| {
+            format!(
+                "无法创建 symlink {} -> {}: {err}",
+                dst.display(),
+                src.display()
+            )
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(src, dst).map_err(|err| {
+            format!(
+                "无法创建 symlink {} -> {}: {err}",
+                dst.display(),
+                src.display()
+            )
+        })
+    }
+}
+
+fn symlink_points_to(path: &Path, target: &Path) -> bool {
+    let Ok(link) = fs::read_link(path) else {
+        return false;
+    };
+    if link == target {
+        return true;
+    }
+    let resolved = if link.is_absolute() {
+        link
+    } else {
+        path.parent().unwrap_or_else(|| Path::new(".")).join(link)
+    };
+    match (fs::canonicalize(resolved), fs::canonicalize(target)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveredSkill {
+    client: AgentClientKind,
+    skill_location: String,
+    path: PathBuf,
+    dir_name: String,
+    identity: String,
+    description: String,
+    managed: bool,
+}
+
+fn exposure_path_matches(exposure: &ManagedSkillExposureConfig, path: &Path) -> bool {
+    exposure.path == display_path(path)
+}
+
+fn scan_client_skills(state: &ManagerState) -> Vec<DiscoveredSkill> {
+    let mut skills = Vec::new();
+    for client in AgentClientKind::all() {
+        let config = client_config(&state.clients, client);
+        for location in &config.skill_locations {
+            let Ok(location_path) = expand_user_path(&location.path) else {
+                continue;
+            };
+            let Ok(entries) = fs::read_dir(&location_path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let skill_path = entry.path();
+                if !skill_path.join("SKILL.md").is_file() {
+                    continue;
+                }
+                let Ok((identity, description)) = read_skill_metadata(&skill_path) else {
+                    continue;
+                };
+                let dir_name = skill_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let managed = state
+                    .skills
+                    .exposures
+                    .iter()
+                    .any(|exposure| exposure_path_matches(exposure, &skill_path));
+                skills.push(DiscoveredSkill {
+                    client,
+                    skill_location: display_path(&location_path),
+                    path: skill_path,
+                    dir_name,
+                    identity,
+                    description,
+                    managed,
+                });
+            }
+        }
+    }
+    skills
+}
+
+fn managed_skill_path_for(
+    state: &ManagerState,
+    client: AgentClientKind,
+    skill: &SharedSkillConfig,
+) -> Result<PathBuf, String> {
+    let managed_location = &client_config(&state.clients, client).managed_skill_location;
+    Ok(expand_user_path(managed_location)?.join(&skill.library_dir_name))
+}
+
+fn exposure_health(path: &Path, library_path: &Path) -> (String, String) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                if symlink_points_to(path, library_path) {
+                    ("healthy".to_string(), "已链接到 Skill Library".to_string())
+                } else {
+                    (
+                        "broken".to_string(),
+                        "symlink 指向的目标不是该 Shared Skill".to_string(),
+                    )
+                }
+            } else {
+                (
+                    "broken".to_string(),
+                    "路径存在但不是 Codex Helper 管理的 symlink".to_string(),
+                )
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (
+            "missing".to_string(),
+            "Exposure Registry 中有记录，但文件系统入口缺失".to_string(),
+        ),
+        Err(err) => ("broken".to_string(), format!("无法检查 exposure: {err}")),
+    }
+}
+
+fn build_skill_management_view(state: &ManagerState) -> Result<SkillManagementView, String> {
+    let library_root = skill_library_root()?;
+    let discovered = scan_client_skills(state);
+    let shared_identities = state
+        .skills
+        .shared_skills
+        .iter()
+        .map(|skill| skill.identity.clone())
+        .collect::<BTreeSet<_>>();
+
+    let clients = AgentClientKind::all()
+        .iter()
+        .map(|client| {
+            let config = client_config(&state.clients, *client);
+            SkillClientView {
+                client: *client,
+                label: client.label().to_string(),
+                managed_skill_location: config.managed_skill_location.clone(),
+                skill_locations: config
+                    .skill_locations
+                    .iter()
+                    .map(|location| {
+                        let path = expand_user_path(&location.path)
+                            .map(|path| display_path(&path))
+                            .unwrap_or_else(|_| location.path.clone());
+                        SkillLocationView {
+                            managed: path == config.managed_skill_location,
+                            exists: PathBuf::from(&path).is_dir(),
+                            path,
+                            writable: location.writable,
+                        }
+                    })
+                    .collect(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let client_skills = discovered
+        .iter()
+        .filter(|skill| !skill.managed)
+        .map(|skill| ClientSkillView {
+            client: skill.client,
+            client_label: skill.client.label().to_string(),
+            skill_location: skill.skill_location.clone(),
+            path: display_path(&skill.path),
+            dir_name: skill.dir_name.clone(),
+            identity: skill.identity.clone(),
+            description: skill.description.clone(),
+            managed: skill.managed,
+            shared: shared_identities.contains(&skill.identity),
+        })
+        .collect::<Vec<_>>();
+
+    let mut conflicts = Vec::new();
+    let mut location_counts: BTreeMap<(AgentClientKind, String), Vec<&DiscoveredSkill>> =
+        BTreeMap::new();
+    for skill in discovered.iter().filter(|skill| !skill.managed) {
+        location_counts
+            .entry((skill.client, skill.identity.clone()))
+            .or_default()
+            .push(skill);
+        if shared_identities.contains(&skill.identity) {
+            conflicts.push(SkillConflictView {
+                kind: "name".to_string(),
+                identity: skill.identity.clone(),
+                client: Some(skill.client),
+                path: display_path(&skill.path),
+                message: format!(
+                    "{} 已有同名 Client Skill；不会自动覆盖或合并 Shared Skill",
+                    skill.client.label()
+                ),
+            });
+        }
+    }
+    for ((client, identity), skills) in location_counts {
+        if skills.len() > 1 {
+            for skill in skills {
+                conflicts.push(SkillConflictView {
+                    kind: "location".to_string(),
+                    identity: identity.clone(),
+                    client: Some(client),
+                    path: display_path(&skill.path),
+                    message: format!("{} 的多个 Skill Location 中发现同名 Skill", client.label()),
+                });
+            }
+        }
+    }
+
+    let shared_skills = state
+        .skills
+        .shared_skills
+        .iter()
+        .map(|skill| {
+            let library_path = library_root.join(&skill.library_dir_name);
+            let mut exposures = state
+                .skills
+                .exposures
+                .iter()
+                .filter(|exposure| exposure.skill_identity == skill.identity)
+                .map(|exposure| {
+                    let path = PathBuf::from(&exposure.path);
+                    let (health, message) = exposure_health(&path, &library_path);
+                    SkillExposureView {
+                        client: exposure.client,
+                        client_label: exposure.client.label().to_string(),
+                        path: exposure.path.clone(),
+                        health,
+                        message,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let registered_clients = exposures
+                .iter()
+                .map(|exposure| exposure.client)
+                .collect::<BTreeSet<_>>();
+            for client in &skill.sharing_scope {
+                if registered_clients.contains(client) {
+                    continue;
+                }
+                let target_path = managed_skill_path_for(state, *client, skill)
+                    .map(|path| display_path(&path))
+                    .unwrap_or_default();
+                let message = if !target_path.is_empty() && PathBuf::from(&target_path).exists() {
+                    format!(
+                        "{} 的目标路径已有非 Codex Helper 管理的同名入口",
+                        client.label()
+                    )
+                } else {
+                    "Sharing Scope 包含该客户端，但尚未创建 exposure".to_string()
+                };
+                exposures.push(SkillExposureView {
+                    client: *client,
+                    client_label: client.label().to_string(),
+                    path: target_path,
+                    health: "missing".to_string(),
+                    message,
+                });
+            }
+            SharedSkillView {
+                identity: skill.identity.clone(),
+                description: skill.description.clone(),
+                library_dir_name: skill.library_dir_name.clone(),
+                path: display_path(&library_path),
+                sharing_scope: skill.sharing_scope.clone(),
+                origin: skill.origin.clone(),
+                exposures,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(SkillManagementView {
+        library_root: display_path(&library_root),
+        clients,
+        shared_skills,
+        client_skills,
+        conflicts,
+    })
+}
+
+fn ensure_scope_contains(scope: &mut Vec<AgentClientKind>, client: AgentClientKind) {
+    if !scope.contains(&client) {
+        scope.push(client);
+    }
+    let mut seen = BTreeSet::new();
+    scope.retain(|client| seen.insert(*client));
+}
+
+fn create_or_register_exposure(
+    state: &mut ManagerState,
+    skill_identity: &str,
+    client: AgentClientKind,
+    path: PathBuf,
+    skill_location: String,
+) -> Result<(), String> {
+    if state.skills.exposures.iter().any(|exposure| {
+        exposure.skill_identity == skill_identity
+            && exposure.client == client
+            && exposure.path == display_path(&path)
+    }) {
+        return Ok(());
+    }
+    let skill = state
+        .skills
+        .shared_skills
+        .iter()
+        .find(|skill| skill.identity == skill_identity)
+        .ok_or_else(|| "Shared Skill 不存在".to_string())?;
+    let library_path = skill_library_root()?.join(&skill.library_dir_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() && symlink_points_to(&path, &library_path) {
+                state.skills.exposures.push(ManagedSkillExposureConfig {
+                    skill_identity: skill_identity.to_string(),
+                    client,
+                    path: display_path(&path),
+                    skill_location,
+                    created_at_ms: current_epoch_ms().ok(),
+                });
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    format!("无法创建 Skill Location {}: {err}", parent.display())
+                })?;
+            }
+            create_dir_symlink(&library_path, &path)?;
+            state.skills.exposures.push(ManagedSkillExposureConfig {
+                skill_identity: skill_identity.to_string(),
+                client,
+                path: display_path(&path),
+                skill_location,
+                created_at_ms: current_epoch_ms().ok(),
+            });
+            Ok(())
+        }
+        Err(err) => Err(format!("无法检查 {}: {err}", path.display())),
+    }
+}
+
+fn remove_registered_exposure(exposure: &ManagedSkillExposureConfig) -> Result<(), String> {
+    let path = PathBuf::from(&exposure.path);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(&path)
+            .map_err(|err| format!("无法删除 exposure {}: {err}", path.display())),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("无法检查 exposure {}: {err}", path.display())),
+    }
+}
+
+fn apply_skill_sharing_scope(state: &mut ManagerState, skill_identity: &str) -> Result<(), String> {
+    let skill = state
+        .skills
+        .shared_skills
+        .iter()
+        .find(|skill| skill.identity == skill_identity)
+        .cloned()
+        .ok_or_else(|| "Shared Skill 不存在".to_string())?;
+    let desired_clients = skill.sharing_scope.iter().copied().collect::<BTreeSet<_>>();
+
+    let mut retained = Vec::new();
+    for exposure in std::mem::take(&mut state.skills.exposures) {
+        if exposure.skill_identity == skill_identity && !desired_clients.contains(&exposure.client)
+        {
+            remove_registered_exposure(&exposure)?;
+        } else {
+            retained.push(exposure);
+        }
+    }
+    state.skills.exposures = retained;
+
+    for client in desired_clients {
+        if state
+            .skills
+            .exposures
+            .iter()
+            .any(|exposure| exposure.skill_identity == skill_identity && exposure.client == client)
+        {
+            continue;
+        }
+        let target_path = managed_skill_path_for(state, client, &skill)?;
+        let skill_location = target_path.parent().map(display_path).unwrap_or_default();
+        let _ =
+            create_or_register_exposure(state, skill_identity, client, target_path, skill_location);
+    }
+    Ok(())
+}
+
+fn backup_skill_directory(source_path: &Path, identity: &str) -> Result<PathBuf, String> {
+    let timestamp = current_epoch_ms().unwrap_or_default();
+    let backup_root = skill_backup_root()?;
+    fs::create_dir_all(&backup_root)
+        .map_err(|err| format!("无法创建 Skill 备份目录 {}: {err}", backup_root.display()))?;
+    let backup_path = backup_root.join(format!("{}-{timestamp}", safe_skill_slug(identity)));
+    copy_dir_all(source_path, &backup_path)?;
+    Ok(backup_path)
+}
+
+fn promote_discovered_skill(
+    state: &mut ManagerState,
+    discovered: &DiscoveredSkill,
+    mut sharing_scope: Vec<AgentClientKind>,
+) -> Result<(), String> {
+    if state
+        .skills
+        .shared_skills
+        .iter()
+        .any(|skill| skill.identity == discovered.identity)
+    {
+        return Err("Skill Library 中已存在同名 Shared Skill".to_string());
+    }
+    ensure_scope_contains(&mut sharing_scope, discovered.client);
+
+    let library_root = skill_library_root()?;
+    fs::create_dir_all(&library_root)
+        .map_err(|err| format!("无法创建 Skill Library {}: {err}", library_root.display()))?;
+    let dir_name = unique_skill_library_dir_name(state, &discovered.identity)?;
+    let library_path = library_root.join(&dir_name);
+    let temp_path = library_root.join(format!(
+        ".tmp-{dir_name}-{}",
+        current_epoch_ms().unwrap_or_default()
+    ));
+    copy_dir_all(&discovered.path, &temp_path)?;
+    let backup_path = backup_skill_directory(&discovered.path, &discovered.identity)?;
+    fs::rename(&temp_path, &library_path).map_err(|err| {
+        let _ = fs::remove_dir_all(&temp_path);
+        format!("无法写入 Skill Library {}: {err}", library_path.display())
+    })?;
+
+    if let Err(err) = remove_file_or_dir(&discovered.path) {
+        let _ = fs::remove_dir_all(&library_path);
+        return Err(err);
+    }
+    if let Err(err) = create_dir_symlink(&library_path, &discovered.path) {
+        let _ = fs::remove_dir_all(&library_path);
+        let _ = copy_dir_all(&backup_path, &discovered.path);
+        return Err(err);
+    }
+
+    state.skills.shared_skills.push(SharedSkillConfig {
+        identity: discovered.identity.clone(),
+        library_dir_name: dir_name,
+        description: discovered.description.clone(),
+        sharing_scope,
+        origin: Some(SkillOrigin {
+            client: discovered.client,
+            skill_location: discovered.skill_location.clone(),
+            original_path: display_path(&discovered.path),
+            original_dir_name: discovered.dir_name.clone(),
+        }),
+        created_at_ms: current_epoch_ms().ok(),
+    });
+    state.skills.exposures.push(ManagedSkillExposureConfig {
+        skill_identity: discovered.identity.clone(),
+        client: discovered.client,
+        path: display_path(&discovered.path),
+        skill_location: discovered.skill_location.clone(),
+        created_at_ms: current_epoch_ms().ok(),
+    });
+    apply_skill_sharing_scope(state, &discovered.identity)
+}
+
+fn replace_client_skill_with_shared_skill(
+    state: &mut ManagerState,
+    discovered: &DiscoveredSkill,
+) -> Result<(), String> {
+    let shared = state
+        .skills
+        .shared_skills
+        .iter()
+        .find(|skill| skill.identity == discovered.identity)
+        .cloned()
+        .ok_or_else(|| "Shared Skill 不存在".to_string())?;
+    let library_path = skill_library_root()?.join(&shared.library_dir_name);
+    let backup_path = backup_skill_directory(&discovered.path, &discovered.identity)?;
+    if let Err(err) = remove_file_or_dir(&discovered.path) {
+        return Err(err);
+    }
+    if let Err(err) = create_dir_symlink(&library_path, &discovered.path) {
+        let _ = copy_dir_all(&backup_path, &discovered.path);
+        return Err(err);
+    }
+    if let Some(skill) = state
+        .skills
+        .shared_skills
+        .iter_mut()
+        .find(|skill| skill.identity == discovered.identity)
+    {
+        ensure_scope_contains(&mut skill.sharing_scope, discovered.client);
+    }
+    state.skills.exposures.push(ManagedSkillExposureConfig {
+        skill_identity: discovered.identity.clone(),
+        client: discovered.client,
+        path: display_path(&discovered.path),
+        skill_location: discovered.skill_location.clone(),
+        created_at_ms: current_epoch_ms().ok(),
+    });
+    apply_skill_sharing_scope(state, &discovered.identity)
+}
+
+fn find_discovered_skill(
+    state: &ManagerState,
+    client: AgentClientKind,
+    skill_path: &str,
+) -> Result<DiscoveredSkill, String> {
+    let requested = expand_user_path(skill_path)?;
+    scan_client_skills(state)
+        .into_iter()
+        .find(|skill| skill.client == client && skill.path == requested)
+        .ok_or_else(|| "未在该 Agent Client 的 Skill Locations 中发现指定 Skill".to_string())
+}
+
 fn sessions_dir() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("sessions"))
 }
@@ -1363,6 +2371,7 @@ fn default_state() -> ManagerState {
         router_backup: None,
         claude_backup: None,
         pi_backup: None,
+        skills: SkillManagementConfig::default(),
     }
 }
 
@@ -1643,6 +2652,7 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
             .map(|provider| provider.id.clone())
             .unwrap_or_default();
     }
+    normalize_skill_management_state(&mut state);
     state
 }
 
@@ -6544,7 +7554,7 @@ async fn proxy_request(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    Path(path): Path<String>,
+    AxumPath(path): AxumPath<String>,
     body: Body,
 ) -> Response {
     if method == Method::GET
@@ -9713,6 +10723,113 @@ fn save_client_configs(
 }
 
 #[tauri::command]
+fn load_skill_management() -> Result<SkillManagementView, String> {
+    let state = load_state_file()?;
+    build_skill_management_view(&state)
+}
+
+#[tauri::command]
+fn save_skill_client_config(
+    payload: SaveSkillClientConfigPayload,
+) -> Result<SkillManagementView, String> {
+    let mut state = load_state_file()?;
+    let config = client_config_mut(&mut state.clients, payload.client);
+    config.skill_locations = payload.skill_locations;
+    config.managed_skill_location = payload.managed_skill_location;
+    normalize_skill_management_state(&mut state);
+    save_state(&state)?;
+    build_skill_management_view(&state)
+}
+
+#[tauri::command]
+fn promote_client_skill(payload: PromoteClientSkillPayload) -> Result<SkillManagementView, String> {
+    let mut state = load_state_file()?;
+    let discovered = find_discovered_skill(&state, payload.client, &payload.skill_path)?;
+    if discovered.managed {
+        return Err("该 Skill 已是 Managed Skill Exposure".to_string());
+    }
+    promote_discovered_skill(&mut state, &discovered, payload.sharing_scope)?;
+    normalize_skill_management_state(&mut state);
+    save_state(&state)?;
+    build_skill_management_view(&state)
+}
+
+#[tauri::command]
+fn replace_client_skill_with_shared(
+    payload: ReplaceClientSkillWithSharedPayload,
+) -> Result<SkillManagementView, String> {
+    let mut state = load_state_file()?;
+    let discovered = find_discovered_skill(&state, payload.client, &payload.skill_path)?;
+    if discovered.managed {
+        return Ok(build_skill_management_view(&state)?);
+    }
+    replace_client_skill_with_shared_skill(&mut state, &discovered)?;
+    normalize_skill_management_state(&mut state);
+    save_state(&state)?;
+    build_skill_management_view(&state)
+}
+
+#[tauri::command]
+fn set_skill_sharing_scope(
+    payload: SetSkillSharingScopePayload,
+) -> Result<SkillManagementView, String> {
+    let mut state = load_state_file()?;
+    let skill = state
+        .skills
+        .shared_skills
+        .iter_mut()
+        .find(|skill| skill.identity == payload.skill_identity)
+        .ok_or_else(|| "Shared Skill 不存在".to_string())?;
+    let mut seen = BTreeSet::new();
+    skill.sharing_scope = payload
+        .sharing_scope
+        .into_iter()
+        .filter(|client| seen.insert(*client))
+        .collect();
+    apply_skill_sharing_scope(&mut state, &payload.skill_identity)?;
+    normalize_skill_management_state(&mut state);
+    save_state(&state)?;
+    build_skill_management_view(&state)
+}
+
+#[tauri::command]
+fn delete_shared_skill(payload: SkillIdentityPayload) -> Result<SkillManagementView, String> {
+    let mut state = load_state_file()?;
+    let skill = state
+        .skills
+        .shared_skills
+        .iter()
+        .find(|skill| skill.identity == payload.skill_identity)
+        .cloned()
+        .ok_or_else(|| "Shared Skill 不存在".to_string())?;
+    let exposures = state
+        .skills
+        .exposures
+        .iter()
+        .filter(|exposure| exposure.skill_identity == skill.identity)
+        .cloned()
+        .collect::<Vec<_>>();
+    for exposure in &exposures {
+        remove_registered_exposure(exposure)?;
+    }
+    state
+        .skills
+        .exposures
+        .retain(|exposure| exposure.skill_identity != skill.identity);
+    let library_path = skill_library_root()?.join(&skill.library_dir_name);
+    if library_path.exists() {
+        remove_file_or_dir(&library_path)?;
+    }
+    state
+        .skills
+        .shared_skills
+        .retain(|shared| shared.identity != skill.identity);
+    normalize_skill_management_state(&mut state);
+    save_state(&state)?;
+    build_skill_management_view(&state)
+}
+
+#[tauri::command]
 fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState, String> {
     let mut state = load_state_file()?;
     let config_path = codex_config_path()?;
@@ -10217,6 +11334,12 @@ pub fn run() {
             save_base_template,
             save_router_config,
             save_client_configs,
+            load_skill_management,
+            save_skill_client_config,
+            promote_client_skill,
+            replace_client_skill_with_shared,
+            set_skill_sharing_scope,
+            delete_shared_skill,
             apply_config,
             load_usage_stats,
             load_route_logs,
