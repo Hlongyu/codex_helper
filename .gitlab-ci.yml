@@ -1,0 +1,50 @@
+stages:
+  - verify
+
+default:
+  interruptible: true
+
+frontend:build:
+  stage: verify
+  image: node:22-bookworm
+  cache:
+    key:
+      files:
+        - pnpm-lock.yaml
+    paths:
+      - .pnpm-store/
+  before_script:
+    - corepack enable
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --frozen-lockfile
+  script:
+    - pnpm build
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - dist/
+
+backend:test:
+  stage: verify
+  image: rust:1.96-bookworm
+  cache:
+    key:
+      files:
+        - src-tauri/Cargo.lock
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+      - src-tauri/target/
+  before_script:
+    - apt-get update
+    - >-
+      DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends
+      build-essential
+      libayatana-appindicator3-dev
+      librsvg2-dev
+      libssl-dev
+      libwebkit2gtk-4.1-dev
+      libxdo-dev
+      pkg-config
+  script:
+    - cargo test --manifest-path src-tauri/Cargo.toml
