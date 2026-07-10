@@ -1,11 +1,13 @@
 fn main() {
-    let app_version = std::env::var("CODEX_HELPER_VERSION")
+    let app_version = std::env::var("XXSWITCH_VERSION")
+        .or_else(|_| std::env::var("CODEX_HELPER_VERSION"))
         .or_else(|_| std::env::var("GITHUB_REF_NAME"))
         .ok()
         .filter(|value| value.starts_with('v'))
         .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
 
-    println!("cargo:rustc-env=CODEX_HELPER_VERSION={app_version}");
+    println!("cargo:rustc-env=XXSWITCH_VERSION={app_version}");
+    println!("cargo:rerun-if-env-changed=XXSWITCH_VERSION");
     println!("cargo:rerun-if-env-changed=CODEX_HELPER_VERSION");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
 

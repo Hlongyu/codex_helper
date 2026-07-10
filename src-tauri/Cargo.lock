@@ -376,26 +376,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-config-manager"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "futures-util",
- "getrandom 0.3.4",
- "reqwest 0.12.28",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tokio",
- "toml_edit 0.23.10+spec-1.0.0",
- "zstd",
-]
-
-[[package]]
 name = "combine"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4711,6 +4691,26 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "xxswitch"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "futures-util",
+ "getrandom 0.3.4",
+ "reqwest 0.12.28",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tokio",
+ "toml_edit 0.23.10+spec-1.0.0",
+ "zstd",
 ]
 
 [[package]]

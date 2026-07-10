@@ -111,7 +111,7 @@ jobs:
         include:
           - label: Windows
             os: windows-latest
-            artifact_name: codex-config-manager-windows
+            artifact_name: xxswitch-windows
             rust_targets: ""
             build_args: --bundles nsis
             bundle_paths: |
@@ -119,7 +119,7 @@ jobs:
               src-tauri/target/release/bundle/msi/*
           - label: macOS universal
             os: macos-latest
-            artifact_name: codex-config-manager-macos-universal
+            artifact_name: xxswitch-macos-universal
             rust_targets: x86_64-apple-darwin aarch64-apple-darwin
             build_args: --target universal-apple-darwin --bundles dmg
             bundle_paths: |
@@ -176,7 +176,7 @@ jobs:
             if [ -z "$value" ]; then
               return
             fi
-            local delimiter="CODEX_HELPER_$(uuidgen)"
+            local delimiter="XXSWITCH_$(uuidgen)"
             {
               echo "${name}<<${delimiter}"
               echo "$value"
@@ -219,7 +219,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CODEX_HELPER_VERSION: ${{ needs.prepare-release.outputs.tag }}
+          XXSWITCH_VERSION: ${{ needs.prepare-release.outputs.tag }}
         with:
           releaseId: ${{ needs.prepare-release.outputs.release_id }}
           args: ${{ matrix.build_args }}

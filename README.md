@@ -1,4 +1,4 @@
-# Codex Helper
+# XXSwitch
 
 本地 Codex 网关管理器，使用 Rust + Tauri + React 实现。
 
@@ -7,7 +7,7 @@
 ```toml
 [model_providers.custom]
 base_url = "http://127.0.0.1:18080/v1"
-experimental_bearer_token = "codex-helper-local-token"
+experimental_bearer_token = "xxswitch-local-token"
 ```
 
 除此之外，`config.toml` 里的其他内容都保持原样，不再做基础模板、全量 merge、供应商配置覆盖等逻辑。
@@ -16,12 +16,12 @@ experimental_bearer_token = "codex-helper-local-token"
 
 使用前请先通过 Codex 官方方式完成登录，并确保本机已有可用的官方登录态。
 
-然后在 Codex Helper 中：
+然后在 XXSwitch 中：
 
 1. 添加上游供应商，填写 Base URL 与 API Key。
 2. 启用需要参与路由的供应商。
 3. 打开右上角“接管 Codex”开关。
-4. Codex 会连接本机 `/v1`，真实请求由 Codex Helper 转发到上游供应商。
+4. Codex 会连接本机 `/v1`，真实请求由 XXSwitch 转发到上游供应商。
 
 ## 功能
 
@@ -62,7 +62,7 @@ Codex 配置：
 ~/.codex/config.toml
 ```
 
-Codex Helper 状态：
+XXSwitch 状态：
 
 ```text
 ~/.codex/config-manager/state.json

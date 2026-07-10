@@ -1,5 +1,6 @@
 import { type PointerEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import brandMark from "../output/icons/codex-helper-mark-transparent.png";
 import "./App.css";
 
 type JsonValue =
@@ -34,56 +35,13 @@ type BalanceStatus = {
   error?: string | null;
 };
 
-type ProviderConnectionTestStep = {
-  key: string;
-  label: string;
-  status: "ok" | "warn" | "failed" | string;
-  latency_ms?: number | null;
-  message: string;
-};
-
-type ProviderConnectionTestResult = {
-  ok: boolean;
-  steps: ProviderConnectionTestStep[];
-};
-
 type ProviderModelsResponse = {
   models: string[];
-};
-
-type ProviderPricingSyncResponse = {
-  state: AppState;
-  pricing: PricingRule[];
-  ok: boolean;
-  message: string;
 };
 
 type ModelMapping = {
   source: string;
   target: string;
-};
-
-type PricingRule = {
-  id: string;
-  provider_match: string;
-  model_match: string;
-  input_per_million: number;
-  cached_input_per_million: number;
-  output_per_million: number;
-  reasoning_output_per_million: number;
-  request_price: number;
-  currency: string;
-  source: string;
-};
-
-type PricingSyncStatus = {
-  ok: boolean;
-  label: string;
-  checked_at?: number | null;
-  error?: string | null;
-  group: string;
-  group_ratio: number;
-  pricing_count: number;
 };
 
 type RouterConfig = {
@@ -197,8 +155,6 @@ type ProviderConfig = {
   connection_test_model: string;
   allowed_models: string[];
   model_mappings: ModelMapping[];
-  provider_pricing: PricingRule[];
-  pricing_sync_status?: PricingSyncStatus | null;
   balance_query: BalanceQueryConfig;
   balance_status?: BalanceStatus | null;
   connection_status?: unknown;
@@ -218,7 +174,6 @@ type ClaudeProviderConfig = {
   connection_test_model: string;
   allowed_models: string[];
   model_mappings: ModelMapping[];
-  provider_pricing: PricingRule[];
   connection_status?: unknown;
 };
 
@@ -239,13 +194,26 @@ type ProviderSummary = {
   latency_ms?: number | null;
   latency_label: string;
   latency_error?: string | null;
-  provider_today_cost: number;
-  provider_month_cost: number;
-  provider_currency: string;
-  provider_pricing_count: number;
-  pricing_sync_ok: boolean;
-  pricing_sync_label: string;
-  pricing_sync_error?: string | null;
+};
+
+type ProviderLatencyDialogState = {
+  provider: ProviderSummary;
+  providerKind: ProviderKind;
+  models: string[];
+  selectedModel: string;
+  prompt: string;
+  streaming: boolean;
+  preparing: boolean;
+  testing: boolean;
+  result: { ok: boolean; latencyMs?: number | null; message: string; reply?: string } | null;
+};
+
+type ProviderLatencyTestResponse = {
+  app_state: AppState;
+  ok: boolean;
+  latency_ms?: number | null;
+  error?: string | null;
+  reply: string;
 };
 
 type UsageSummary = {
@@ -256,8 +224,6 @@ type UsageSummary = {
   output_tokens: number;
   reasoning_output_tokens: number;
   total_tokens: number;
-  estimated_cost: number;
-  currency: string;
 };
 
 type RouteRequestLog = {
@@ -291,16 +257,6 @@ type RouteRequestLog = {
   output_tokens: number;
   reasoning_output_tokens: number;
   total_tokens: number;
-  estimated_cost: number;
-  currency: string;
-  cost_breakdown: string;
-  pricing_model_match: string;
-  pricing_source: string;
-  provider_estimated_cost: number;
-  provider_currency: string;
-  provider_cost_breakdown: string;
-  provider_pricing_model_match: string;
-  provider_pricing_source: string;
   first_byte_ms?: number | null;
   total_ms: number;
 };
@@ -342,7 +298,6 @@ type RouteUsageBucket = {
   cached_input_tokens: number;
   output_tokens: number;
   total_tokens: number;
-  estimated_cost: number;
 };
 
 type RouteUsageBreakdown = RouteUsageBucket & {
@@ -411,11 +366,11 @@ type AppState = {
 };
 
 type Screen = "dashboard" | "route" | "providers" | "skills" | "usage" | "requests" | "settings";
-type EditorTab = "base" | "balance" | "route";
+type EditorTab = "base" | "models" | "balance";
 type AgentClientKind = "codex" | "claude" | "pi";
 type ProviderKind = "codex" | "claude";
 type TimeRange = "today" | "week" | "month" | "all";
-type TrendMetric = "cost" | "tokens" | "requests";
+type TrendMetric = "tokens" | "requests";
 
 const isTauriRuntime = "__TAURI_INTERNALS__" in window;
 
@@ -504,50 +459,6 @@ function normalizeModelNames(models: string[]) {
   return normalized;
 }
 
-function defaultPricingRule(model = ""): PricingRule {
-  return {
-    id: `provider-price-${Date.now()}`,
-    provider_match: "*",
-    model_match: model,
-    input_per_million: 0,
-    cached_input_per_million: 0,
-    output_per_million: 0,
-    reasoning_output_per_million: 0,
-    request_price: 0,
-    currency: "USD",
-    source: "供应商手动价格",
-  };
-}
-
-function normalizeProviderPricing(pricing: PricingRule[]) {
-  const seen = new Set<string>();
-  return pricing.flatMap((rule, index) => {
-    const model = rule.model_match.trim();
-    if (!model) return [];
-    const key = model.toLowerCase();
-    if (seen.has(key)) return [];
-    seen.add(key);
-    return [{
-      ...rule,
-      id: rule.id.trim() || `provider-price-${index}`,
-      provider_match: "*",
-      model_match: model,
-      input_per_million: Math.max(0, Number(rule.input_per_million) || 0),
-      cached_input_per_million: Math.max(0, Number(rule.cached_input_per_million) || 0),
-      output_per_million: Math.max(0, Number(rule.output_per_million) || 0),
-      reasoning_output_per_million: Math.max(0, Number(rule.reasoning_output_per_million) || 0),
-      request_price: Math.max(0, Number(rule.request_price) || 0),
-      currency: (rule.currency || "USD").trim().toUpperCase(),
-      source: rule.source.trim() || "供应商手动价格",
-    }];
-  });
-}
-
-function formatMoney(value: number, currency = "USD") {
-  const prefix = currency.toUpperCase() === "USD" ? "$" : `${currency} `;
-  return `${prefix}${(value || 0).toFixed(6)}`;
-}
-
 function formatCompact(value: number) {
   const abs = Math.abs(value || 0);
   if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(abs >= 10_000_000 ? 1 : 2)}M`;
@@ -583,7 +494,6 @@ function rangeLabel(range: TimeRange) {
 }
 
 function trendMetricLabel(metric: TrendMetric) {
-  if (metric === "cost") return "消费";
   if (metric === "tokens") return "总 Token";
   return "成功请求";
 }
@@ -594,8 +504,7 @@ function bucketGranularityLabel(value?: string) {
   return "按小时聚合";
 }
 
-function trendBucketValue(bucket: Pick<RouteUsageBucket, "estimated_cost" | "total_tokens" | "request_count">, metric: TrendMetric) {
-  if (metric === "cost") return bucket.estimated_cost;
+function trendBucketValue(bucket: Pick<RouteUsageBucket, "total_tokens" | "request_count">, metric: TrendMetric) {
   if (metric === "tokens") return bucket.total_tokens;
   return bucket.request_count;
 }
@@ -609,7 +518,6 @@ function emptyTrendBucket(label: string): RouteUsageBucket {
     cached_input_tokens: 0,
     output_tokens: 0,
     total_tokens: 0,
-    estimated_cost: 0,
   };
 }
 
@@ -652,8 +560,8 @@ function completeTrendBuckets(
   return sorted.length ? sorted : [emptyTrendBucket("暂无")];
 }
 
-function niceTrendMax(value: number, metric: TrendMetric) {
-  if (value <= 0) return metric === "cost" ? 0.000001 : 1;
+function niceTrendMax(value: number) {
+  if (value <= 0) return 1;
   const exponent = Math.floor(Math.log10(value));
   const base = Math.pow(10, exponent);
   const fraction = value / base;
@@ -671,7 +579,6 @@ function trendTickIndexes(count: number, maxTicks = 6) {
 }
 
 function formatTrendAxisValue(value: number, metric: TrendMetric) {
-  if (metric === "cost") return formatMoney(value);
   if (metric === "tokens") return formatTokenCount(value);
   return String(Math.round(value));
 }
@@ -753,7 +660,6 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
     "Token",
     "首字延迟",
     "总耗时",
-    "消费",
     "路由结果",
     "错误",
   ];
@@ -766,7 +672,6 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
     log.total_tokens,
     log.first_byte_ms ?? "",
     log.total_ms,
-    log.estimated_cost.toFixed(6),
     log.route_result,
     log.error ?? "",
   ]);
@@ -774,31 +679,55 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
   const url = URL.createObjectURL(new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }));
   const link = document.createElement("a");
   link.href = url;
-  link.download = `codex-helper-route-logs-${Date.now()}.csv`;
+  link.download = `xxswitch-route-logs-${Date.now()}.csv`;
   link.click();
   URL.revokeObjectURL(url);
 }
 
 function formatBalanceForCard(label: string) {
-  if (!label || label === "未配置") return "未配置";
+  if (!label || label === "未配置") return "";
   return label.replace(/^账户余额\s*/, "").replace(/^Key额度\s*/, "").replace(/^余额\s*/, "");
+}
+
+function providerBalanceMeta(provider: ProviderSummary) {
+  const label = formatBalanceForCard(provider.balance_label);
+  const error = provider.balance_error?.trim() ?? "";
+  if (provider.balance_label === "不适用" || provider.provider_type === "Claude") {
+    return { value: "不适用", detail: "无需余额查询", tone: "muted" };
+  }
+  if (!label || error === "未启用余额查询") {
+    return { value: "未启用", detail: "余额查询", tone: "muted" };
+  }
+  if (error) {
+    return { value: label || "查询异常", detail: "检查余额配置", tone: "danger" };
+  }
+  return { value: label, detail: "账户余额", tone: "ok" };
+}
+
+function providerLatencyMeta(provider: ProviderSummary) {
+  if (provider.latency_error) {
+    return { value: "测试失败", detail: "连接异常", tone: "danger" };
+  }
+  if (provider.latency_ms == null) {
+    return { value: "未测试", detail: "点击测速", tone: "muted" };
+  }
+  return {
+    value: provider.latency_label && provider.latency_label !== "-"
+      ? provider.latency_label
+      : `${provider.latency_ms} ms`,
+    detail: provider.latency_ms > 500 ? "响应较慢" : "连接正常",
+    tone: provider.latency_ms > 500 ? "warn" : "ok",
+  };
 }
 
 function providerStatus(provider: ProviderSummary) {
   if (provider.status === "auto_disabled") return { label: "自动禁用", tone: "danger" };
-  if (provider.status === "disabled" || !provider.enabled) return { label: "禁用", tone: "danger" };
+  if (provider.status === "disabled" || !provider.enabled) return { label: "已停用", tone: "muted" };
   if (provider.latency_error) return { label: "异常", tone: "warn" };
-  if (provider.latency_ms == null) return { label: "未测试", tone: "warn" };
   if (provider.latency_ms != null && provider.latency_ms > 500) {
     return { label: "高延迟", tone: "warn" };
   }
-  return { label: "正常", tone: "ok" };
-}
-
-function providerLatencyTone(provider: ProviderSummary) {
-  if (provider.latency_error) return "danger-text";
-  if (provider.latency_ms == null) return "muted-text";
-  return provider.latency_ms > 500 ? "warn-text" : "ok-text";
+  return { label: "可用", tone: "ok" };
 }
 
 function routeBaseUrl(router: RouterConfig | RouterStatus) {
@@ -933,13 +862,16 @@ function Toggle({
   checked,
   onChange,
   disabled,
+  label,
 }: {
   checked: boolean;
   onChange: (checked: boolean) => void;
   disabled?: boolean;
+  label?: string;
 }) {
   return (
     <button
+      aria-label={label}
       aria-pressed={checked}
       className={`switch ${checked ? "on" : ""}`}
       disabled={disabled}
@@ -960,7 +892,7 @@ function StatusPill({ ok }: { ok: boolean }) {
   );
 }
 
-function ToolIcon({ type }: { type: "settings" | "latency" | "balance" }) {
+function ToolIcon({ type }: { type: "settings" | "models" | "latency" | "balance" }) {
   return (
     <svg
       aria-hidden="true"
@@ -982,6 +914,13 @@ function ToolIcon({ type }: { type: "settings" | "latency" | "balance" }) {
           <path d="M18 12h3" />
           <path d="m5.6 18.4 2.1-2.1" />
           <path d="m16.3 7.7 2.1-2.1" />
+        </>
+      )}
+      {type === "models" && (
+        <>
+          <path d="M5 6.5 12 3l7 3.5-7 3.5-7-3.5Z" />
+          <path d="m5 11 7 3.5 7-3.5" />
+          <path d="m5 15.5 7 3.5 7-3.5" />
         </>
       )}
       {type === "latency" && (
@@ -1015,7 +954,7 @@ function App() {
     page_size: 20,
     ...filterForRange("today"),
   }));
-  const [trendMetric, setTrendMetric] = useState<TrendMetric>("cost");
+  const [trendMetric, setTrendMetric] = useState<TrendMetric>("tokens");
   const [requestFilter, setRequestFilter] = useState<RouteLogFilter>({ model: "", page_size: 20 });
   const [requestAutoRefresh, setRequestAutoRefresh] = useState(true);
   const [screen, setScreen] = useState<Screen>("dashboard");
@@ -1037,13 +976,11 @@ function App() {
   const [providerEnabled, setProviderEnabled] = useState(true);
   const [providerEnabledDirty, setProviderEnabledDirty] = useState(false);
   const [providerWireApi, setProviderWireApi] = useState<ProviderWireApi>("responses");
-  const [providerServiceTier, setProviderServiceTier] = useState("");
-  const [connectionTestResult, setConnectionTestResult] = useState<ProviderConnectionTestResult | null>(null);
+  const [providerFastMode, setProviderFastMode] = useState(false);
   const [providerTestModel, setProviderTestModel] = useState("");
   const [providerModels, setProviderModels] = useState<string[]>([]);
   const [allowedModels, setAllowedModels] = useState<string[]>([]);
   const [modelMappings, setModelMappings] = useState<ModelMapping[]>([]);
-  const [providerPricing, setProviderPricing] = useState<PricingRule[]>([]);
   const [balanceQuery, setBalanceQuery] = useState<BalanceQueryConfig>(() =>
     defaultBalanceQuery(),
   );
@@ -1051,8 +988,10 @@ function App() {
   const [routerDraft, setRouterDraft] = useState<RouterConfig>(() => defaultRouterConfig());
   const [secretVisible, setSecretVisible] = useState(false);
   const [balanceTokenVisible, setBalanceTokenVisible] = useState(false);
+  const [latencyDialog, setLatencyDialog] = useState<ProviderLatencyDialogState | null>(null);
   const [newProviderCount, setNewProviderCount] = useState(1);
   const didInitialRefresh = useRef(false);
+  const shellRef = useRef<HTMLElement>(null);
 
   async function run(action: () => Promise<void>) {
     setBusy(true);
@@ -1175,6 +1114,10 @@ function App() {
     return () => window.clearInterval(timer);
   }, [requestAutoRefresh, requestFilter, screen]);
 
+  useEffect(() => {
+    if (shellRef.current) shellRef.current.scrollTop = 0;
+  }, [screen]);
+
   const activeProvider = useMemo(() => {
     if (!appState) return null;
     return (
@@ -1183,14 +1126,7 @@ function App() {
       null
     );
   }, [appState]);
-  const editingProviderSummary = useMemo(() => {
-    if (!appState || !editingId) return null;
-    const providers = editorKind === "claude" ? appState.claude_providers : appState.providers;
-    return providers.find((provider) => provider.id === editingId) ?? null;
-  }, [appState, editingId, editorKind]);
-
   const requestCount = routeUsageStats?.success_count ?? routeUsageStats?.summary.request_count ?? 0;
-  const officialCost = routeUsageStats?.summary.estimated_cost ?? 0;
   const uncachedInput = routeUsageStats?.summary.uncached_input_tokens ?? 0;
   const cachedInput = routeUsageStats?.summary.cached_input_tokens ?? 0;
   const outputTokens = routeUsageStats?.summary.output_tokens ?? 0;
@@ -1200,7 +1136,6 @@ function App() {
       model: row.label,
       requests: row.request_count,
       tokens: row.total_tokens,
-      cost: row.estimated_cost,
     }))
     .slice(0, 3);
   const failedCount = routeUsageStats?.failed_count ?? 0;
@@ -1218,12 +1153,11 @@ function App() {
     setProviderEnabled((summary?.status ?? targetFull.status) === "enabled");
     setProviderEnabledDirty(false);
     setProviderWireApi(targetFull.wire_api ?? "responses");
-    setProviderServiceTier(targetFull.service_tier ?? "");
+    setProviderFastMode(targetFull.service_tier?.trim().toLowerCase() === "priority");
     setProviderTestModel(targetFull.connection_test_model ?? "");
     setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
     setAllowedModels(targetFull.allowed_models ?? []);
     setModelMappings(targetFull.model_mappings ?? []);
-    setProviderPricing(targetFull.provider_pricing ?? []);
     setBalanceQuery(
       normalizeBalanceQuery(
         targetFull.balance_query,
@@ -1233,7 +1167,6 @@ function App() {
     setEditorTab(tab);
     setSecretVisible(false);
     setBalanceTokenVisible(false);
-    setConnectionTestResult(null);
     setBalanceTestStatus(targetFull.balance_status ?? null);
     setEditorOpen(true);
   }
@@ -1251,10 +1184,8 @@ function App() {
     setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
     setAllowedModels(targetFull.allowed_models ?? []);
     setModelMappings(targetFull.model_mappings ?? []);
-    setProviderPricing(targetFull.provider_pricing ?? []);
     setEditorTab("base");
     setSecretVisible(false);
-    setConnectionTestResult(null);
     setEditorOpen(true);
   }
 
@@ -1325,13 +1256,12 @@ function App() {
         config_toml: "",
         base_url: providerBaseUrl,
         wire_api: providerWireApi,
-        service_tier: providerServiceTier,
+        service_tier: providerFastMode ? "priority" : "",
         balance_query: nextBalance,
         balance_status: balanceTestStatus,
         connection_test_model: providerTestModel,
         allowed_models: allowedModels,
         model_mappings: modelMappings,
-        provider_pricing: normalizeProviderPricing(providerPricing),
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
@@ -1357,7 +1287,6 @@ function App() {
         connection_test_model: providerTestModel,
         allowed_models: allowedModels,
         model_mappings: modelMappings,
-        provider_pricing: normalizeProviderPricing(providerPricing),
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
@@ -1432,25 +1361,6 @@ function App() {
     });
   }
 
-  async function testConnection() {
-    if (!editingId) return;
-    await run(async () => {
-      const payload: Record<string, unknown> = {
-        provider_id: editingId,
-        base_url: providerBaseUrl,
-        api_key: null,
-        test_model: providerTestModel,
-      };
-      if (providerApiKeyDirty) {
-        payload.api_key = providerApiKey;
-      }
-      const result = await callCommand<ProviderConnectionTestResult>("test_provider_connection", {
-        payload,
-      });
-      setConnectionTestResult(result);
-    });
-  }
-
   async function loadProviderModels() {
     if (!editingId) return;
     await run(async () => {
@@ -1470,6 +1380,9 @@ function App() {
         payload,
       });
       setProviderModels(result.models);
+      if (allowedModels.length === 0 && result.models.length > 0) {
+        setAllowedModels(result.models);
+      }
       if (!providerTestModel && result.models[0]) {
         setProviderTestModel(result.models[0]);
       }
@@ -1491,33 +1404,12 @@ function App() {
         payload,
       });
       setProviderModels(result.models);
+      if (allowedModels.length === 0 && result.models.length > 0) {
+        setAllowedModels(result.models);
+      }
       if (!providerTestModel && result.models[0]) {
         setProviderTestModel(result.models[0]);
       }
-    });
-  }
-
-  async function syncProviderPricing() {
-    if (!editingId) return;
-    await run(async () => {
-      const nextBalance = {
-        ...balanceQuery,
-        endpoint: balanceQuery.endpoint || endpointFromBaseUrl(providerBaseUrl),
-      };
-      const payload: Record<string, unknown> = {
-        provider_id: editingId,
-        base_url: providerBaseUrl,
-        api_key: null,
-        balance_query: nextBalance,
-      };
-      if (providerApiKeyDirty) {
-        payload.api_key = providerApiKey;
-      }
-      const result = await callCommand<ProviderPricingSyncResponse>("sync_provider_pricing", {
-        payload,
-      });
-      setAppState(result.state);
-      setProviderPricing(result.pricing);
     });
   }
 
@@ -1568,13 +1460,93 @@ function App() {
     });
   }
 
-  async function testProviderLatency(provider: ProviderSummary) {
-    await run(async () => {
-      const state = await callCommand<AppState>("test_provider_connection_state", {
-        payload: { provider_id: provider.id },
-      });
-      setAppState(state);
+  async function openProviderLatencyDialog(provider: ProviderSummary, kind: ProviderKind) {
+    setLatencyDialog({
+      provider,
+      providerKind: kind,
+      models: [],
+      selectedModel: "",
+      prompt: "hi",
+      streaming: false,
+      preparing: true,
+      testing: false,
+      result: null,
     });
+
+    try {
+      const config = kind === "claude"
+        ? await callCommand<ClaudeProviderConfig>("get_claude_provider", { providerId: provider.id })
+        : await callCommand<ProviderConfig>("get_provider", { providerId: provider.id });
+      let models = normalizeModelNames([
+        ...config.allowed_models,
+        ...config.model_mappings.map((mapping) => mapping.target),
+        config.connection_test_model,
+      ]);
+      try {
+        const response = await callCommand<ProviderModelsResponse>(
+          kind === "claude" ? "load_claude_provider_models" : "load_provider_models",
+          { payload: { provider_id: provider.id } },
+        );
+        if (response.models.length > 0) models = response.models;
+      } catch (err) {
+        if (models.length === 0) throw err;
+      }
+      const preferredModel = config.connection_test_model.trim();
+      const selectedModel = models.find((model) => model.toLowerCase() === preferredModel.toLowerCase())
+        ?? models[0]
+        ?? "";
+      setLatencyDialog((current) => current?.provider.id === provider.id
+        ? { ...current, models, selectedModel, preparing: false }
+        : current);
+    } catch (err) {
+      setLatencyDialog((current) => current?.provider.id === provider.id
+        ? {
+            ...current,
+            preparing: false,
+            result: { ok: false, message: String(err) },
+          }
+        : current);
+    }
+  }
+
+  async function testProviderLatency() {
+    if (!latencyDialog || !latencyDialog.selectedModel || !latencyDialog.prompt.trim()) return;
+    const target = latencyDialog;
+    setLatencyDialog({ ...target, testing: true, result: null });
+    try {
+      const response = await callCommand<ProviderLatencyTestResponse>("test_provider_latency_state", {
+        payload: {
+          provider_id: target.provider.id,
+          provider_kind: target.providerKind,
+          model: target.selectedModel,
+          prompt: target.prompt.trim(),
+          stream: target.streaming,
+        },
+      });
+      setAppState(response.app_state);
+      setLatencyDialog((current) => current?.provider.id === target.provider.id
+        ? {
+            ...current,
+            testing: false,
+            result: {
+              ok: response.ok,
+              latencyMs: response.latency_ms,
+              message: response.ok
+                ? `${target.selectedModel} ${target.streaming ? "流式响应完成" : "同步响应正常"}`
+                : response.error || "测速失败",
+              reply: response.reply,
+            },
+          }
+        : current);
+    } catch (err) {
+      setLatencyDialog((current) => current?.provider.id === target.provider.id
+        ? {
+            ...current,
+            testing: false,
+            result: { ok: false, message: String(err) },
+          }
+        : current);
+    }
   }
 
   async function refreshProviderBalance(provider: ProviderSummary) {
@@ -1729,9 +1701,9 @@ function App() {
     return (
       <main className="loading-screen">
         <div className="brand-logo">
-          <span />
+          <img src={brandMark} alt="" />
         </div>
-        <strong>Codex Helper</strong>
+        <strong>XXSwitch</strong>
         <p>{error || "正在加载本地网关状态"}</p>
         {error && <button onClick={() => refresh()}>重试</button>}
       </main>
@@ -1739,44 +1711,68 @@ function App() {
   }
 
   const routerOn = serviceOk(appState);
+  const navGroups = [
+    {
+      label: "工作区",
+      items: [
+        ["dashboard", "总览"],
+        ["route", "路由"],
+        ["providers", "供应商"],
+        ["usage", "使用统计"],
+        ["requests", "请求记录"],
+      ],
+    },
+    {
+      label: "管理",
+      items: [
+        ["skills", "Skills"],
+        ["settings", "设置"],
+      ],
+    },
+  ] as const;
 
   return (
     <main className="app">
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-logo">
-            <span />
+            <img src={brandMark} alt="" />
           </div>
           <div>
-            <strong>Codex Helper</strong>
-            <small>LOCAL GATEWAY</small>
+            <strong>XXSwitch</strong>
+            <small>LOCAL AI GATEWAY</small>
           </div>
         </div>
 
         <nav className="nav">
-          {[
-            ["dashboard", "总览"],
-            ["route", "路由"],
-            ["providers", "供应商"],
-            ["skills", "Skills"],
-            ["usage", "使用统计"],
-            ["requests", "请求记录"],
-            ["settings", "设置"],
-          ].map(([key, label]) => (
-            <button
-              className={screen === key ? "active" : ""}
-              key={key}
-              onClick={() => setScreen(key as Screen)}
-              type="button"
-            >
-              <NavIcon type={key as Screen} />
-              {label}
-            </button>
+          {navGroups.map((group) => (
+            <div className="nav-section" key={group.label}>
+              <span className="nav-section-label">{group.label}</span>
+              {group.items.map(([key, label]) => (
+                <button
+                  className={screen === key ? "active" : ""}
+                  key={key}
+                  onClick={() => setScreen(key as Screen)}
+                  type="button"
+                >
+                  <NavIcon type={key as Screen} />
+                  <span>{label}</span>
+                </button>
+              ))}
+            </div>
           ))}
         </nav>
+
+        <div className="sidebar-meta">
+          <span className={routerOn ? "online" : "offline"}>
+            <i />
+            {routerOn ? "网关运行中" : "网关未运行"}
+          </span>
+          <small>v{appState.app_version}</small>
+        </div>
       </aside>
 
-      <section className="shell">
+      <section className="shell" ref={shellRef}>
         <header className="topbar">
           <div>
             <h1>
@@ -1804,32 +1800,38 @@ function App() {
                   : screen === "skills"
                     ? "管理 Codex、Claude 与 Pi 之间的本机 Shared Skills"
                 : screen === "usage"
-                    ? "分析本地路由后的 Token、费用与供应商使用情况"
+                    ? "分析经过路由的调用、Token 与供应商使用情况"
                     : screen === "requests"
-                      ? "经 Codex Helper 转发的请求"
+                      ? "经 XXSwitch 转发的请求"
                       : "本地网关运行参数"}
             </p>
           </div>
           <div className="top-actions">
             <StatusPill ok={routerOn} />
-            <span className="muted">Codex</span>
-            <Toggle
-              checked={appState.clients.codex.enabled}
-              disabled={busy}
-              onChange={(checked) => void saveClientConfig("codex", checked)}
-            />
-            <span className="muted">Claude</span>
-            <Toggle
-              checked={appState.clients.claude.enabled}
-              disabled={busy}
-              onChange={(checked) => void saveClientConfig("claude", checked)}
-            />
-            <span className="muted">Pi</span>
-            <Toggle
-              checked={appState.clients.pi.enabled}
-              disabled={busy}
-              onChange={(checked) => void saveClientConfig("pi", checked)}
-            />
+            <div className="client-switch">
+              <span>Codex</span>
+              <Toggle
+                checked={appState.clients.codex.enabled}
+                disabled={busy}
+                onChange={(checked) => void saveClientConfig("codex", checked)}
+              />
+            </div>
+            <div className="client-switch">
+              <span>Claude</span>
+              <Toggle
+                checked={appState.clients.claude.enabled}
+                disabled={busy}
+                onChange={(checked) => void saveClientConfig("claude", checked)}
+              />
+            </div>
+            <div className="client-switch">
+              <span>Pi</span>
+              <Toggle
+                checked={appState.clients.pi.enabled}
+                disabled={busy}
+                onChange={(checked) => void saveClientConfig("pi", checked)}
+              />
+            </div>
           </div>
         </header>
 
@@ -1842,7 +1844,6 @@ function App() {
             modelRows={modelRows}
             onRangeChange={applyUsageRange}
             onTrendMetricChange={setTrendMetric}
-            officialCost={officialCost}
             outputTokens={outputTokens}
             providers={appState.providers}
             requestCount={requestCount}
@@ -1881,7 +1882,7 @@ function App() {
             onKindChange={setProviderKind}
             onRefreshBalance={providerKind === "claude" ? async (_provider) => undefined : refreshProviderBalance}
             onReorder={providerKind === "claude" ? reorderClaudeProviders : reorderProviders}
-            onTestLatency={providerKind === "claude" ? async (_provider) => undefined : testProviderLatency}
+            onTestLatency={(provider) => openProviderLatencyDialog(provider, providerKind)}
             onToggle={providerKind === "claude" ? toggleClaudeProvider : toggleProvider}
             providerKind={providerKind}
             providers={providerKind === "claude" ? appState.claude_providers : appState.providers}
@@ -2005,42 +2006,43 @@ function App() {
         )}
       </section>
 
+      {latencyDialog && (
+        <ProviderLatencyDialog
+          state={latencyDialog}
+          onClose={() => setLatencyDialog(null)}
+          onPromptChange={(prompt) => setLatencyDialog((current) => current ? { ...current, prompt, result: null } : current)}
+          onModelChange={(selectedModel) => setLatencyDialog((current) => current ? { ...current, selectedModel, result: null } : current)}
+          onStreamingChange={(streaming) => setLatencyDialog((current) => current ? { ...current, streaming, result: null } : current)}
+          onTest={() => void testProviderLatency()}
+        />
+      )}
+
       {editorOpen && editorKind === "codex" && (
         <ProviderEditor
           balanceQuery={balanceQuery}
           balanceTestStatus={balanceTestStatus}
           balanceTokenVisible={balanceTokenVisible}
           busy={busy}
-          connectionTestResult={connectionTestResult}
           allowedModels={allowedModels}
           modelMappings={modelMappings}
-          pricingSyncError={editingProviderSummary?.pricing_sync_error ?? null}
-          pricingSyncLabel={editingProviderSummary?.pricing_sync_label ?? "未同步"}
-          pricingSyncOk={editingProviderSummary?.pricing_sync_ok ?? false}
-          providerPricing={providerPricing}
           onBalanceTokenVisible={setBalanceTokenVisible}
           onClose={() => setEditorOpen(false)}
           onDelete={deleteProvider}
           onLoadProviderModels={loadProviderModels}
           onSave={saveProvider}
-          onSyncProviderPricing={syncProviderPricing}
           onTab={setEditorTab}
           onTestBalance={testBalance}
-          onTestConnection={testConnection}
           onUpdateBalance={updateBalanceQuery}
           providerApiKey={providerApiKey}
           providerBaseUrl={providerBaseUrl}
-          providerEnabled={providerEnabled}
           providerModels={providerModels}
           providerName={providerName}
-          providerServiceTier={providerServiceTier}
-          providerTestModel={providerTestModel}
+          providerFastMode={providerFastMode}
           providerWireApi={providerWireApi}
           secretVisible={secretVisible}
           setProviderApiKey={(value) => {
             setProviderApiKey(value);
             setBalanceTestStatus(null);
-            setConnectionTestResult(null);
             setProviderModels([]);
             setProviderTestModel("");
           }}
@@ -2048,20 +2050,13 @@ function App() {
           setProviderBaseUrl={(value) => {
             setProviderBaseUrl(value);
             setBalanceTestStatus(null);
-            setConnectionTestResult(null);
             setProviderModels([]);
             setProviderTestModel("");
           }}
-          setProviderEnabled={(value) => {
-            setProviderEnabled(value);
-            setProviderEnabledDirty(true);
-          }}
           setAllowedModels={setAllowedModels}
           setModelMappings={setModelMappings}
-          setProviderPricing={setProviderPricing}
           setProviderName={setProviderName}
-          setProviderServiceTier={setProviderServiceTier}
-          setProviderTestModel={setProviderTestModel}
+          setProviderFastMode={setProviderFastMode}
           setProviderWireApi={setProviderWireApi}
           setSecretVisible={setSecretVisible}
           tab={editorTab}
@@ -2078,11 +2073,8 @@ function App() {
           onSave={saveClaudeProvider}
           providerApiKey={providerApiKey}
           providerBaseUrl={providerBaseUrl}
-          providerEnabled={providerEnabled}
           providerModels={providerModels}
           providerName={providerName}
-          providerPricing={providerPricing}
-          providerTestModel={providerTestModel}
           secretVisible={secretVisible}
           setAllowedModels={setAllowedModels}
           setModelMappings={setModelMappings}
@@ -2098,13 +2090,7 @@ function App() {
             setProviderModels([]);
             setProviderTestModel("");
           }}
-          setProviderEnabled={(value) => {
-            setProviderEnabled(value);
-            setProviderEnabledDirty(true);
-          }}
           setProviderName={setProviderName}
-          setProviderPricing={setProviderPricing}
-          setProviderTestModel={setProviderTestModel}
           setSecretVisible={setSecretVisible}
         />
       )}
@@ -2239,7 +2225,7 @@ function RouteScreen({
             </div>
           </label>
           <div className="route-diff-row">
-            <span>models.json → codex-helper provider</span>
+            <span>models.json → xxswitch provider</span>
             <button className="ghost small">自动同步</button>
             <Toggle
               checked={appState.clients.pi.enabled}
@@ -2633,13 +2619,11 @@ function UsageScreen({
     output_tokens: 0,
     reasoning_output_tokens: 0,
     total_tokens: 0,
-    estimated_cost: 0,
-    currency: "USD",
   };
   const trendBuckets = stats?.buckets.length
     ? stats.buckets
     : [emptyTrendBucket("00:00")];
-  const totalCost = summary.estimated_cost || 1;
+  const totalCalls = (stats?.models ?? []).reduce((total, row) => total + row.request_count, 0) || 1;
 
   return (
     <section className="usage-page">
@@ -2680,11 +2664,10 @@ function UsageScreen({
       </div>
 
       <div className="metric-grid">
-        <Metric title="消费" value={formatMoney(summary.estimated_cost, summary.currency)} tone="purple" />
+        <Metric title="调用次数" value={String(stats?.success_count ?? summary.request_count)} tone="green" />
+        <Metric title="总 Token" value={formatCompact(summary.total_tokens)} tone="purple" sub={rangeLabel(timeRange)} />
         <Metric title="非缓存输入" value={formatCompact(summary.uncached_input_tokens)} tone="cyan" sub={`${formatCompact(summary.input_tokens)} 输入`} />
-        <Metric title="缓存输入" value={formatCompact(summary.cached_input_tokens)} tone="blue" sub="路由后统计" />
-        <Metric title="输出 Token" value={formatCompact(summary.output_tokens)} tone="amber" sub={rangeLabel(timeRange)} />
-        <Metric title="请求数" value={String(stats?.success_count ?? summary.request_count)} tone="green" />
+        <Metric title="输出 Token" value={formatCompact(summary.output_tokens)} tone="amber" sub="路由响应" />
       </div>
 
       <div className="usage-main-grid">
@@ -2695,7 +2678,7 @@ function UsageScreen({
               <p>{rangeLabel(timeRange)} {bucketGranularityLabel(stats?.bucket_granularity)}的{trendMetricLabel(trendMetric)}</p>
             </div>
             <div className="mini-tabs">
-              {(["cost", "tokens", "requests"] as TrendMetric[]).map((metric) => (
+              {(["tokens", "requests"] as TrendMetric[]).map((metric) => (
                 <button
                   className={trendMetric === metric ? "active" : ""}
                   key={metric}
@@ -2715,11 +2698,11 @@ function UsageScreen({
           />
         </article>
 
-        <article className="card cost-distribution">
+        <article className="card call-distribution">
           <div className="card-head">
             <div>
-              <h3>费用分布</h3>
-              <p>按模型与供应商</p>
+              <h3>调用分布</h3>
+              <p>按模型统计成功调用</p>
             </div>
             <div className="mini-tabs">
               <button className="active">按模型</button>
@@ -2730,10 +2713,10 @@ function UsageScreen({
             <div className="distribution-row" key={row.key}>
               <div>
                 <strong>{row.label}</strong>
-                <b>{formatMoney(row.estimated_cost)}</b>
+                <b>{row.request_count} 次</b>
               </div>
-              <span><i style={{ width: `${Math.max(3, (row.estimated_cost / totalCost) * 100)}%` }} /></span>
-              <small>{Math.round((row.estimated_cost / totalCost) * 100)}%</small>
+              <span><i style={{ width: `${Math.max(3, (row.request_count / totalCalls) * 100)}%` }} /></span>
+              <small>{Math.round((row.request_count / totalCalls) * 100)}%</small>
             </div>
           ))}
         </article>
@@ -2743,7 +2726,7 @@ function UsageScreen({
         <div className="panel-head">
           <div>
             <h2>用量明细</h2>
-            <p>展示经过 Codex Helper 转发并成功记录用量的请求。</p>
+            <p>展示经过 XXSwitch 转发并成功记录 Token 的调用。</p>
           </div>
         </div>
         <div className="usage-detail-table">
@@ -2755,7 +2738,7 @@ function UsageScreen({
             <span>缓存输入</span>
             <span>输出</span>
             <span>请求</span>
-            <span>消费</span>
+            <span>总 Token</span>
           </header>
           {(stats?.details ?? []).slice(0, 8).map((log) => (
             <div key={log.id}>
@@ -2766,7 +2749,7 @@ function UsageScreen({
               <span>{formatTokenCount(log.cached_input_tokens)}</span>
               <span>{formatTokenCount(log.output_tokens)}</span>
               <b>{log.status === "success" ? 1 : 0}</b>
-              <b>{log.total_tokens ? formatMoney(log.estimated_cost, log.currency) : "-"}</b>
+              <b>{formatTokenCount(log.total_tokens)}</b>
             </div>
           ))}
         </div>
@@ -2850,32 +2833,22 @@ function RequestLogsScreen({
             <span>Token（非缓存 / 缓存 / 输出）</span>
             <span>首字延迟</span>
             <span>总耗时</span>
-            <span>消费</span>
             <span>路由结果</span>
           </header>
           {rows.map((log) => {
             const status = statusMeta(log.status);
-            const compactionAudit = remoteCompactionV2AuditLabel(log);
             return (
               <div className={log.route_attempts > 1 ? "selected" : ""} key={log.id}>
                 <div className="status-cell">
                   <span className={`dot ${status.tone}`} />
                   <b className={`${status.tone}-text`}>{status.label}</b>
                 </div>
-                <div>
-                  <strong>{formatLogTime(log.started_at_ms)}</strong>
-                  <small>今天</small>
-                </div>
+                <strong>{formatLogTime(log.started_at_ms)}</strong>
                 <strong>{log.model}</strong>
-                <div>
-                  <strong>{log.provider_name}</strong>
-                  <small>{log.error ?? log.upstream_chain.join(" → ")}</small>
-                  {compactionAudit && <small>{compactionAudit}</small>}
-                </div>
+                <strong>{log.provider_name}</strong>
                 <span>{formatTokenTriplet(log)}</span>
                 <b>{formatMs(log.first_byte_ms)}</b>
                 <b>{formatDuration(log.total_ms)}</b>
-                <b>{log.total_tokens ? formatMoney(log.estimated_cost, log.currency) : "-"}</b>
                 <span className={`route-result ${routeResultTone(log.route_result)}`}>
                   {log.route_result}
                 </span>
@@ -2899,10 +2872,9 @@ function RequestLogsScreen({
 function Dashboard(props: {
   activeProvider: ProviderSummary | null;
   cachedInput: number;
-  modelRows: Array<{ model: string; requests: number; tokens: number; cost: number }>;
+  modelRows: Array<{ model: string; requests: number; tokens: number }>;
   onRangeChange: (range: TimeRange) => Promise<void>;
   onTrendMetricChange: (metric: TrendMetric) => void;
-  officialCost: number;
   outputTokens: number;
   providers: ProviderSummary[];
   requestCount: number;
@@ -2918,7 +2890,6 @@ function Dashboard(props: {
     modelRows,
     onRangeChange,
     onTrendMetricChange,
-    officialCost,
     outputTokens,
     providers,
     requestCount,
@@ -2929,7 +2900,7 @@ function Dashboard(props: {
     trendMetric,
     uncachedInput,
   } = props;
-  const healthyProviders = providers.filter((provider) => provider.enabled && !provider.balance_error).length;
+  const availableProviders = providers.filter((provider) => provider.enabled && provider.status === "enabled").length;
   const successCount = stats?.success_count ?? Math.max(requestCount - (stats?.failed_count ?? 0), 0);
   const activeRequests = stats?.running_count ?? 0;
   const avgFirstByte = stats?.average_first_byte_ms ?? null;
@@ -2962,9 +2933,9 @@ function Dashboard(props: {
       </div>
 
       <div className="metric-grid">
-        <Metric title="消费" value={formatMoney(officialCost)} tone="purple" />
-        <Metric title="总 Token" value={formatCompact(totalTokens)} tone="cyan" tooltip={tokenTooltip} />
         <Metric title="请求数" value={String(Math.max(successCount, 0))} tone="green" />
+        <Metric title="总 Token" value={formatCompact(totalTokens)} tone="cyan" tooltip={tokenTooltip} />
+        <Metric title="成功率" value={`${successRate.toFixed(1)}%`} tone="purple" />
       </div>
 
       <div className="dashboard-grid">
@@ -2975,7 +2946,7 @@ function Dashboard(props: {
               <p>{rangeLabel(timeRange)} {bucketGranularityLabel(stats?.bucket_granularity)}的{trendMetricLabel(trendMetric)}</p>
             </div>
             <div className="mini-tabs">
-              {(["cost", "tokens", "requests"] as TrendMetric[]).map((metric) => (
+              {(["tokens", "requests"] as TrendMetric[]).map((metric) => (
                 <button
                   className={trendMetric === metric ? "active" : ""}
                   key={metric}
@@ -3001,25 +2972,35 @@ function Dashboard(props: {
           <div className="provider-health-list">
             {providers.slice(0, 4).map((provider) => {
               const status = providerStatus(provider);
+              const balance = providerBalanceMeta(provider);
+              const latency = providerLatencyMeta(provider);
               return (
                 <div className="provider-health" key={provider.id}>
                   <span className={`dot ${status.tone}`} />
-                  <div>
+                  <div className="provider-health-summary">
                     <strong>{provider.name}</strong>
-                    <small>{provider.enabled ? "已启用" : "已停用"}</small>
+                    <small>{status.label}</small>
                   </div>
-                  <b>{formatBalanceForCard(provider.balance_label)}</b>
-                  <small className={status.tone}>{provider.latency_label}</small>
+                  <div className="provider-health-facts">
+                    <span className={`provider-health-fact ${balance.tone}`} title={provider.balance_error ?? undefined}>
+                      <small>余额</small>
+                      <b>{balance.value}</b>
+                    </span>
+                    <span className={`provider-health-fact ${latency.tone}`} title={provider.latency_error ?? undefined}>
+                      <small>延迟</small>
+                      <b>{latency.value}</b>
+                    </span>
+                  </div>
                 </div>
               );
             })}
           </div>
           <div className="health-bar">
-            <span style={{ width: `${providers.length ? (healthyProviders / providers.length) * 100 : 0}%` }} />
+            <span style={{ width: `${providers.length ? (availableProviders / providers.length) * 100 : 0}%` }} />
           </div>
           <footer>
-            <span>健康供应商 {healthyProviders}/{providers.length}</span>
-            <b>{providers.length ? Math.round((healthyProviders / providers.length) * 100) : 0}%</b>
+            <span>可用供应商 {availableProviders}/{providers.length}</span>
+            <b>{providers.length ? Math.round((availableProviders / providers.length) * 100) : 0}%</b>
           </footer>
         </article>
 
@@ -3046,14 +3027,14 @@ function Dashboard(props: {
               <span>模型</span>
               <span>请求</span>
               <span>Token</span>
-              <span>估算</span>
+              <span>占比</span>
             </header>
-            {(modelRows.length ? modelRows : [{ model: "gpt-5.5", requests: 0, tokens: 0, cost: 0 }]).map((row, index) => (
+            {(modelRows.length ? modelRows : [{ model: "gpt-5.5", requests: 0, tokens: 0 }]).map((row, index) => (
               <div className="model-row" key={row.model}>
                 <strong>{row.model}</strong>
                 <span>{row.requests}</span>
                 <span>{formatCompact(row.tokens)}</span>
-                <b>{formatMoney(row.cost)}</b>
+                <b>{totalTokens ? `${Math.round((row.tokens / totalTokens) * 100)}%` : "0%"}</b>
                 <i style={{ width: `${Math.max(18, 92 - index * 27)}%` }} />
               </div>
             ))}
@@ -3119,7 +3100,7 @@ function TrendLineChart({
   const completedBuckets = completeTrendBuckets(buckets, range, granularity);
   const values = completedBuckets.map((bucket) => trendBucketValue(bucket, metric));
   const rawMax = Math.max(...values, 0);
-  const yMax = niceTrendMax(rawMax, metric);
+  const yMax = niceTrendMax(rawMax);
   const chartWidth = 640;
   const chartHeight = compact ? 172 : 210;
   const padding = { top: 12, right: 16, bottom: 24, left: 72 };
@@ -3159,8 +3140,8 @@ function TrendLineChart({
       <svg className="trend-svg" viewBox={`0 0 ${chartWidth} ${chartHeight}`} role="img" aria-label={`${trendMetricLabel(metric)}趋势`}>
         <defs>
           <linearGradient id={gradientId} x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="#6974ff" stopOpacity="0.22" />
-            <stop offset="100%" stopColor="#6974ff" stopOpacity="0.02" />
+            <stop offset="0%" stopColor="#0f8f68" stopOpacity="0.22" />
+            <stop offset="100%" stopColor="#0f8f68" stopOpacity="0.02" />
           </linearGradient>
         </defs>
         {yTicks.map((tick) => (
@@ -3217,7 +3198,11 @@ function TrendLineChart({
           }}
         >
           <strong>{formatTrendXAxisLabel(hoveredPoint.bucket.label, effectiveGranularity)}</strong>
-          <span>消费 {formatMoney(hoveredPoint.bucket.estimated_cost)}</span>
+          <span>
+            {metric === "tokens"
+              ? `${formatTokenCount(hoveredPoint.bucket.total_tokens)} Token`
+              : `${hoveredPoint.bucket.request_count} 次调用`}
+          </span>
           <small>{formatTokenCount(hoveredPoint.bucket.total_tokens)} Token · {hoveredPoint.bucket.request_count} 次</small>
         </div>
       )}
@@ -3241,6 +3226,119 @@ function Quality({ label, value, tone }: { label: string; value: string; tone: s
       <span className={`dot ${tone}`} />
       <em>{label}</em>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function ProviderLatencyDialog({
+  onClose,
+  onModelChange,
+  onPromptChange,
+  onStreamingChange,
+  onTest,
+  state,
+}: {
+  onClose: () => void;
+  onModelChange: (model: string) => void;
+  onPromptChange: (prompt: string) => void;
+  onStreamingChange: (streaming: boolean) => void;
+  onTest: () => void;
+  state: ProviderLatencyDialogState;
+}) {
+  const canTest = !state.preparing && !state.testing && Boolean(state.selectedModel) && Boolean(state.prompt.trim());
+  return (
+    <div
+      className="latency-dialog-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !state.testing) onClose();
+      }}
+    >
+      <section aria-labelledby="latency-dialog-title" aria-modal="true" className="latency-dialog" role="dialog">
+        <header>
+          <div className="latency-dialog-title">
+            <span><ToolIcon type="latency" /></span>
+            <div>
+              <h2 id="latency-dialog-title">模型测速</h2>
+              <p>{state.provider.name} · {state.provider.base_url}</p>
+            </div>
+          </div>
+          <button aria-label="关闭" className="close" disabled={state.testing} onClick={onClose} title="关闭" type="button">×</button>
+        </header>
+
+        <div className="latency-dialog-body">
+          <div className="latency-mode-field">
+            <span>请求方式</span>
+            <div aria-label="请求方式" className="latency-mode-control" role="group">
+              <button
+                className={!state.streaming ? "active" : ""}
+                disabled={state.testing}
+                onClick={() => onStreamingChange(false)}
+                type="button"
+              >
+                同步
+              </button>
+              <button
+                className={state.streaming ? "active" : ""}
+                disabled={state.testing}
+                onClick={() => onStreamingChange(true)}
+                type="button"
+              >
+                流式
+              </button>
+            </div>
+          </div>
+
+          <label className="field">
+            <span>测试模型</span>
+            <select
+              disabled={state.preparing || state.testing || state.models.length === 0}
+              value={state.selectedModel}
+              onChange={(event) => onModelChange(event.currentTarget.value)}
+            >
+              {state.preparing && <option value="">正在读取模型…</option>}
+              {!state.preparing && state.models.length === 0 && <option value="">没有可用模型</option>}
+              {state.models.map((model) => <option key={model} value={model}>{model}</option>)}
+            </select>
+          </label>
+
+          <label className="field">
+            <span>测试内容</span>
+            <textarea
+              disabled={state.testing}
+              maxLength={2000}
+              rows={4}
+              value={state.prompt}
+              onChange={(event) => onPromptChange(event.currentTarget.value)}
+            />
+            <small>{state.prompt.length} / 2000</small>
+          </label>
+
+          {state.result && (
+            <div aria-live="polite" className={`latency-test-result ${state.result.ok ? "ok" : "failed"}`}>
+              <div className="latency-result-summary">
+                <span className={`dot ${state.result.ok ? "green" : "danger"}`} />
+                <div>
+                  <strong>{state.result.ok ? `${state.result.latencyMs} ms` : "测速失败"}</strong>
+                  <p>{state.result.message}</p>
+                </div>
+              </div>
+              {state.result.ok && (
+                <div className="latency-reply">
+                  <span>模型回复</span>
+                  <pre>{state.result.reply?.trim() || "未返回文本内容"}</pre>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <footer>
+          <button className="ghost" disabled={state.testing} onClick={onClose} type="button">取消</button>
+          <button className="primary" disabled={!canTest} onClick={onTest} type="button">
+            {state.testing ? "正在测速…" : state.result ? "重新测速" : "开始测速"}
+          </button>
+        </footer>
+      </section>
     </div>
   );
 }
@@ -3269,6 +3367,7 @@ function ProvidersScreen({
   providers: ProviderSummary[];
 }) {
   const [draggingProviderId, setDraggingProviderId] = useState<string | null>(null);
+  const [dragOverProviderId, setDragOverProviderId] = useState<string | null>(null);
   const draggingProviderIdRef = useRef<string | null>(null);
   const dragStartY = useRef(0);
 
@@ -3302,6 +3401,7 @@ function ProvidersScreen({
     if (draggingProviderIdRef.current !== providerId) return;
     draggingProviderIdRef.current = null;
     setDraggingProviderId(null);
+    setDragOverProviderId(null);
     if (Math.abs(clientY - dragStartY.current) < 4) return;
 
     const currentIds = providers.map((provider) => provider.id);
@@ -3326,6 +3426,18 @@ function ProvidersScreen({
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
     finishPointerReorder(providerId, event.clientY);
+  }
+
+  function handlePointerMove(event: PointerEvent<HTMLButtonElement>, providerId: string) {
+    if (draggingProviderIdRef.current !== providerId) return;
+    const targetRow = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-provider-row-id]"),
+    ).find((row) => {
+      if (row.dataset.providerRowId === providerId) return false;
+      const bounds = row.getBoundingClientRect();
+      return event.clientY >= bounds.top && event.clientY <= bounds.bottom;
+    });
+    setDragOverProviderId(targetRow?.dataset.providerRowId ?? null);
   }
 
   return (
@@ -3370,16 +3482,17 @@ function ProvidersScreen({
           <span>状态</span>
           <span>供应商</span>
           <span>余额</span>
-          <span>消耗</span>
           <span>延迟</span>
           <span>启用</span>
           <span>操作</span>
         </header>
         {providers.map((provider) => {
           const status = providerStatus(provider);
+          const balance = providerBalanceMeta(provider);
+          const latency = providerLatencyMeta(provider);
           return (
             <div
-              className={`provider-line ${provider.status === "enabled" ? "selected" : ""} ${draggingProviderId === provider.id ? "dragging" : ""}`}
+              className={`provider-line ${provider.status === "enabled" ? "selected" : ""} ${draggingProviderId === provider.id ? "dragging" : ""} ${dragOverProviderId === provider.id ? "drop-target" : ""}`}
               data-provider-row-id={provider.id}
               key={provider.id}
             >
@@ -3390,15 +3503,24 @@ function ProvidersScreen({
                 onPointerCancel={() => {
                   draggingProviderIdRef.current = null;
                   setDraggingProviderId(null);
+                  setDragOverProviderId(null);
                 }}
                 onPointerDown={(event) => handlePointerDown(event, provider.id)}
+                onPointerMove={(event) => handlePointerMove(event, provider.id)}
                 onPointerUp={(event) => handlePointerUp(event, provider.id)}
                 title="拖动调整优先级"
                 type="button"
               >
-                ⋮⋮
+                <span aria-hidden="true" className="drag-grip">
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                </span>
               </button>
-              <div className="provider-status">
+              <div className={`provider-status ${status.tone}`}>
                 <span className={`dot ${status.tone}`} />
                 <b>{status.label}</b>
               </div>
@@ -3406,44 +3528,33 @@ function ProvidersScreen({
                 <strong>{provider.name}</strong>
                 <small>{provider.base_url || "未配置 Base URL"}</small>
               </div>
-              <div className="balance-cell">
-                <strong
-                  className={provider.balance_error ? "warn-text" : ""}
-                  title={provider.balance_error ?? undefined}
-                >
-                  {formatBalanceForCard(provider.balance_label)}
-                </strong>
+              <div
+                className={`balance-cell provider-fact ${balance.tone}`}
+                title={provider.balance_error ?? undefined}
+              >
+                <strong>{balance.value}</strong>
+                <small>{balance.detail}</small>
               </div>
-              <div className="provider-cost-cell">
-                <strong>{formatMoney(provider.provider_today_cost, provider.provider_currency)}</strong>
-                <small>
-                  本月 {formatMoney(provider.provider_month_cost, provider.provider_currency)}
-                  {provider.provider_pricing_count ? ` · ${provider.provider_pricing_count} 个价格` : " · 未计价"}
-                </small>
-                <span
-                  className={`price-sync-line ${provider.pricing_sync_ok ? "ok" : "missing"}`}
-                  title={provider.pricing_sync_error ?? undefined}
-                >
-                  <i />
-                  {provider.pricing_sync_label || "未同步"}
-                </span>
-              </div>
-              <b
-                className={providerLatencyTone(provider)}
+              <div
+                className={`latency-cell provider-fact ${latency.tone}`}
                 title={provider.latency_error ?? undefined}
               >
-                {provider.latency_label}
-              </b>
+                <strong>{latency.value}</strong>
+                <small>{latency.detail}</small>
+              </div>
               <Toggle checked={provider.status === "enabled"} disabled={busy} onChange={(checked) => onToggle(provider, checked)} />
               <div className="provider-toolbox">
-                <button aria-label="设置" className="icon-button" disabled={busy} onClick={() => onEdit(provider, "base")} title="设置" type="button">
+                <button aria-label="设置" className="provider-action-button main-action" disabled={busy} onClick={() => onEdit(provider, "base")} title="设置" type="button">
                   <ToolIcon type="settings" />
+                  <span>设置</span>
                 </button>
-                <button aria-label="测试延迟" className="icon-button" disabled={busy} onClick={() => void onTestLatency(provider)} title="测试延迟" type="button">
+                <button aria-label="测试延迟" className="provider-action-button" disabled={busy} onClick={() => void onTestLatency(provider)} title="测试延迟" type="button">
                   <ToolIcon type="latency" />
+                  <span>测速</span>
                 </button>
-                <button aria-label="刷新余额" className="icon-button" disabled={busy} onClick={() => void onRefreshBalance(provider)} title="刷新余额" type="button">
+                <button aria-label="刷新余额" className="provider-action-button" disabled={busy} onClick={() => void onRefreshBalance(provider)} title="刷新余额" type="button">
                   <ToolIcon type="balance" />
+                  <span>余额</span>
                 </button>
               </div>
             </div>
@@ -3461,41 +3572,29 @@ function ProviderEditor(props: {
   balanceTestStatus: BalanceStatus | null;
   balanceTokenVisible: boolean;
   busy: boolean;
-  connectionTestResult: ProviderConnectionTestResult | null;
   modelMappings: ModelMapping[];
   onBalanceTokenVisible: (visible: boolean) => void;
   onClose: () => void;
   onDelete: () => void;
   onLoadProviderModels: () => void;
   onSave: () => void;
-  onSyncProviderPricing: () => void;
   onTab: (tab: EditorTab) => void;
   onTestBalance: () => void;
-  onTestConnection: () => void;
   onUpdateBalance: (patch: Partial<BalanceQueryConfig>) => void;
-  pricingSyncError: string | null;
-  pricingSyncLabel: string;
-  pricingSyncOk: boolean;
   providerApiKey: string;
   providerBaseUrl: string;
-  providerEnabled: boolean;
   providerModels: string[];
   providerName: string;
-  providerPricing: PricingRule[];
-  providerServiceTier: string;
-  providerTestModel: string;
+  providerFastMode: boolean;
   providerWireApi: ProviderWireApi;
   secretVisible: boolean;
   setAllowedModels: (models: string[]) => void;
   setProviderApiKey: (value: string) => void;
   setProviderApiKeyDirty: (dirty: boolean) => void;
   setProviderBaseUrl: (value: string) => void;
-  setProviderEnabled: (value: boolean) => void;
   setModelMappings: (mappings: ModelMapping[]) => void;
-  setProviderPricing: (pricing: PricingRule[]) => void;
   setProviderName: (value: string) => void;
-  setProviderServiceTier: (value: string) => void;
-  setProviderTestModel: (value: string) => void;
+  setProviderFastMode: (value: boolean) => void;
   setProviderWireApi: (value: ProviderWireApi) => void;
   setSecretVisible: (value: boolean) => void;
   tab: EditorTab;
@@ -3506,63 +3605,43 @@ function ProviderEditor(props: {
     balanceTestStatus,
     balanceTokenVisible,
     busy,
-    connectionTestResult,
     modelMappings,
     onBalanceTokenVisible,
     onClose,
     onDelete,
     onLoadProviderModels,
     onSave,
-    onSyncProviderPricing,
     onTab,
     onTestBalance,
-    onTestConnection,
     onUpdateBalance,
-    pricingSyncError,
-    pricingSyncLabel,
-    pricingSyncOk,
     providerApiKey,
     providerBaseUrl,
-    providerEnabled,
     providerModels,
     providerName,
-    providerPricing,
-    providerServiceTier,
-    providerTestModel,
+    providerFastMode,
     providerWireApi,
     secretVisible,
     setAllowedModels,
     setProviderApiKey,
     setProviderApiKeyDirty,
     setProviderBaseUrl,
-    setProviderEnabled,
     setModelMappings,
-    setProviderPricing,
     setProviderName,
-    setProviderServiceTier,
-    setProviderTestModel,
+    setProviderFastMode,
     setProviderWireApi,
     setSecretVisible,
     tab,
   } = props;
   const [customAllowedModel, setCustomAllowedModel] = useState("");
   const [deleteConfirming, setDeleteConfirming] = useState(false);
-  const modelOptions = providerTestModel && !providerModels.includes(providerTestModel)
-    ? [providerTestModel, ...providerModels]
-    : providerModels;
+  const [modelSearch, setModelSearch] = useState("");
   const allowedModelOptions = normalizeModelNames([...providerModels, ...allowedModels]);
+  const visibleModelOptions = allowedModelOptions.filter((model) =>
+    model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
+  );
   const allModelsAllowed = allowedModels.length === 0;
   const upstreamPath = providerWireApi === "chat_completions" ? "chat/completions" : "responses";
   const updateAllowedModels = (models: string[]) => setAllowedModels(normalizeModelNames(models));
-  const updateProviderPricing = (pricing: PricingRule[]) => setProviderPricing(pricing);
-  const changePricingRule = (index: number, patch: Partial<PricingRule>) => {
-    const next = [...providerPricing];
-    next[index] = { ...next[index], ...patch };
-    updateProviderPricing(next);
-  };
-  const addPricingRule = () => {
-    updateProviderPricing([...providerPricing, defaultPricingRule()]);
-  };
   const toggleAllowedModel = (model: string, checked: boolean) => {
     const currentModels = allModelsAllowed ? allowedModelOptions : allowedModels;
     updateAllowedModels(
@@ -3584,18 +3663,15 @@ function ProviderEditor(props: {
         <header>
           <div>
             <h2>编辑供应商</h2>
-            <p>
-              {providerName || "未命名供应商"}
-              <span className="dot green" /> 连接正常
-            </p>
+            <p>{providerName || "未命名供应商"}</p>
           </div>
           <button className="close" onClick={onClose}>×</button>
         </header>
 
         <nav className="drawer-tabs">
           <button className={tab === "base" ? "active" : ""} onClick={() => onTab("base")}>基础配置</button>
+          <button className={tab === "models" ? "active" : ""} onClick={() => onTab("models")}>模型配置</button>
           <button className={tab === "balance" ? "active" : ""} onClick={() => onTab("balance")}>余额查询</button>
-          <button className={tab === "route" ? "active" : ""} onClick={() => onTab("route")}>路由设置</button>
         </nav>
 
         <section className="drawer-body">
@@ -3627,66 +3703,177 @@ function ProviderEditor(props: {
                   </button>
                 </div>
               </label>
-              <div className="switch-row-card">
-                <div>
-                  <strong>启用供应商</strong>
-                  <p>关闭后将停止接收新的转发请求</p>
-                </div>
-                <Toggle checked={providerEnabled} onChange={setProviderEnabled} />
+              <label className="field">
+                <span>接口协议</span>
+                <select
+                  value={providerWireApi}
+                  onChange={(event) => setProviderWireApi(event.currentTarget.value as ProviderWireApi)}
+                >
+                  <option value="responses">Responses API</option>
+                  <option value="chat_completions">Chat Completions 兼容</option>
+                </select>
+                <small>上游不支持 Responses API 时选择 Chat Completions 兼容模式</small>
+              </label>
+              <div className="provider-fast-mode-row">
+                <strong>强制启用 Fast 模式</strong>
+                <Toggle
+                  checked={providerFastMode}
+                  label="强制启用 Fast 模式"
+                  onChange={setProviderFastMode}
+                />
               </div>
-              <div className="test-box">
+            </>
+          )}
+
+          {tab === "models" && (
+            <>
+              <section className="model-config-intro">
                 <div>
-                  <strong>连接测试</strong>
-                  <p>保存前验证鉴权与模型列表</p>
+                  <span className="section-kicker">模型来源</span>
+                  <h3>配置可路由模型</h3>
+                  <p>{providerBaseUrl || "尚未配置 Base URL"}</p>
                 </div>
-                <div className="test-actions">
-                  <button className="ghost small" disabled={busy} onClick={onLoadProviderModels} type="button">
-                    刷新模型
-                  </button>
-                  <button className="ghost small" disabled={busy} onClick={onTestConnection} type="button">
-                    {busy ? "测试中" : "重新测试"}
-                  </button>
+                <button className="primary model-fetch-button" disabled={busy} onClick={onLoadProviderModels} type="button">
+                  <ToolIcon type="models" />
+                  {busy ? "正在获取" : providerModels.length ? "重新从上游获取" : "从上游获取模型"}
+                </button>
+              </section>
+
+              <div className="model-config-stats">
+                <div>
+                  <span>上游已发现</span>
+                  <strong>{providerModels.length}</strong>
+                  <small>个模型</small>
                 </div>
-                <label className="test-model-row">
-                  <span>测试模型</span>
-                  <select
-                    disabled={busy}
-                    value={providerTestModel}
-                    onChange={(event) => {
-                      setProviderTestModel(event.currentTarget.value);
-                    }}
+                <div>
+                  <span>当前已启用</span>
+                  <strong>{allModelsAllowed ? "全部" : allowedModels.length}</strong>
+                  <small>{allModelsAllowed ? "兼容任意模型" : "个模型"}</small>
+                </div>
+              </div>
+
+              <div className="model-filter-box model-manager">
+                <div className="mapping-box-head">
+                  <div>
+                    <strong>启用模型</strong>
+                    <p>取消不希望参与路由的模型；修改会在保存供应商后生效。</p>
+                  </div>
+                  <button
+                    className="ghost small"
+                    disabled={allowedModelOptions.length === 0}
+                    onClick={() => updateAllowedModels(allowedModelOptions)}
+                    type="button"
                   >
-                    {!modelOptions.length && <option value="">先刷新模型列表</option>}
-                    {modelOptions.map((model) => (
-                      <option key={model} value={model}>
-                        {model}
-                      </option>
-                    ))}
-                  </select>
+                    全部启用
+                  </button>
+                </div>
+                <label className="model-search-field">
+                  <span aria-hidden="true" />
+                  <input
+                    placeholder="搜索上游模型"
+                    type="search"
+                    value={modelSearch}
+                    onChange={(event) => setModelSearch(event.currentTarget.value)}
+                  />
                 </label>
-                <ul>
-                  {(connectionTestResult?.steps.length
-                    ? connectionTestResult.steps
-                    : [
-                        {
-                          key: "pending",
-                          label: "等待测试",
-                          status: "warn",
-                          latency_ms: null,
-                          message: "使用当前 Base URL 与 API Key 读取模型列表",
-                        },
-                      ]).map((step) => (
-                    <li key={step.key}>
-                      <span className={`dot ${step.status === "failed" ? "danger" : step.status === "warn" ? "amber" : "green"}`} />
-                      <span>{step.label}</span>
-                      <b className={step.status === "failed" ? "danger-text" : step.status === "warn" ? "warn-text" : "ok-text"}>
-                        {step.status === "failed" ? "失败" : step.status === "warn" ? "注意" : "正常"}
-                      </b>
-                      <em>{step.latency_ms == null ? "-" : `${step.latency_ms} ms`}</em>
-                      <small>{step.message}</small>
-                    </li>
+                <div className="model-option-grid">
+                  {allowedModelOptions.length === 0 && (
+                    <div className="model-empty-state">
+                      <strong>还没有上游模型</strong>
+                      <p>确认 Base URL 和 API Key 后，从上游读取可用模型。</p>
+                      <button className="ghost small" disabled={busy} onClick={onLoadProviderModels} type="button">
+                        从上游获取
+                      </button>
+                    </div>
+                  )}
+                  {allowedModelOptions.length > 0 && visibleModelOptions.length === 0 && (
+                    <p className="mapping-empty">没有匹配“{modelSearch.trim()}”的模型。</p>
+                  )}
+                  {visibleModelOptions.map((model) => {
+                    const checked = allModelsAllowed || allowedModels.some((current) => current.toLowerCase() === model.toLowerCase());
+                    return (
+                      <label className={checked ? "model-option selected" : "model-option"} key={model}>
+                        <input
+                          checked={checked}
+                          onChange={(event) => toggleAllowedModel(model, event.currentTarget.checked)}
+                          type="checkbox"
+                        />
+                        <span>{model}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <div className="custom-model-row">
+                  <input
+                    placeholder="手动添加未出现在上游列表中的模型"
+                    value={customAllowedModel}
+                    onChange={(event) => setCustomAllowedModel(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        addCustomAllowedModel();
+                      }
+                    }}
+                  />
+                  <button className="ghost small" disabled={!customAllowedModel.trim()} onClick={addCustomAllowedModel} type="button">
+                    添加模型
+                  </button>
+                </div>
+              </div>
+
+              <div className="mapping-box">
+                <div className="mapping-box-head">
+                  <div>
+                    <strong>模型映射</strong>
+                    <p>客户端模型匹配后，转发为此供应商支持的上游模型。</p>
+                  </div>
+                  <button
+                    className="ghost small"
+                    onClick={() => setModelMappings([...modelMappings, { source: "", target: "" }])}
+                    type="button"
+                  >
+                    添加映射
+                  </button>
+                </div>
+                <div className="mapping-grid">
+                  <span>客户端模型</span>
+                  <span>上游模型</span>
+                  <span />
+                  {modelMappings.length === 0 && (
+                    <p className="mapping-empty">未配置映射时，请求模型将原样转发。</p>
+                  )}
+                  {modelMappings.map((mapping, index) => (
+                    <div className="mapping-row" key={index}>
+                      <input
+                        placeholder="gpt-5.5"
+                        value={mapping.source}
+                        onChange={(event) => {
+                          const next = [...modelMappings];
+                          next[index] = { ...mapping, source: event.currentTarget.value };
+                          setModelMappings(next);
+                        }}
+                      />
+                      <input
+                        placeholder="deepseek-v4-pro"
+                        value={mapping.target}
+                        onChange={(event) => {
+                          const next = [...modelMappings];
+                          next[index] = { ...mapping, target: event.currentTarget.value };
+                          setModelMappings(next);
+                        }}
+                      />
+                      <button
+                        aria-label="删除映射"
+                        className="icon-button"
+                        onClick={() => setModelMappings(modelMappings.filter((_, rowIndex) => rowIndex !== index))}
+                        title="删除映射"
+                        type="button"
+                      >
+                        ×
+                      </button>
+                    </div>
                   ))}
-                </ul>
+                </div>
               </div>
             </>
           )}
@@ -3803,251 +3990,6 @@ function ProviderEditor(props: {
             </>
           )}
 
-          {tab === "route" && (
-            <>
-              <div className="switch-row-card">
-                <div>
-                  <strong>参与自动路由</strong>
-                  <p>关闭后仅保留配置，不会被自动选择</p>
-                </div>
-                <Toggle checked={providerEnabled} onChange={setProviderEnabled} />
-              </div>
-              <div className="form-row">
-                <label className="field">
-                  <span>路由顺序</span>
-                  <input readOnly value="1" />
-                  <small>数字越小，优先级越高</small>
-                </label>
-                <label className="field">
-                  <span>会话固定</span>
-                  <select defaultValue="global">
-                    <option value="global">跟随全局</option>
-                  </select>
-                </label>
-              </div>
-              <div className="model-filter-box">
-                <div className="mapping-box-head">
-                  <div>
-                    <strong>允许模型</strong>
-                    <p>{allModelsAllowed ? "当前接收所有客户端模型" : `仅接收 ${allowedModels.length} 个客户端模型`}</p>
-                  </div>
-                  <button
-                    className="ghost small"
-                    onClick={() => updateAllowedModels([])}
-                    type="button"
-                  >
-                    全部模型
-                  </button>
-                </div>
-                <div className="model-option-grid">
-                  {allowedModelOptions.length === 0 && (
-                    <p className="mapping-empty">刷新远端模型，或在下方手动添加客户端模型名。</p>
-                  )}
-                  {allowedModelOptions.map((model) => {
-                    const checked = allModelsAllowed || allowedModels.some((current) => current.toLowerCase() === model.toLowerCase());
-                    return (
-                      <label className={checked ? "model-option selected" : "model-option"} key={model}>
-                        <input
-                          checked={checked}
-                          onChange={(event) => toggleAllowedModel(model, event.currentTarget.checked)}
-                          type="checkbox"
-                        />
-                        <span>{model}</span>
-                      </label>
-                    );
-                  })}
-                </div>
-                <div className="custom-model-row">
-                  <input
-                    placeholder="手动输入模型，例如 gpt-5.3-codex"
-                    value={customAllowedModel}
-                    onChange={(event) => setCustomAllowedModel(event.currentTarget.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        addCustomAllowedModel();
-                      }
-                    }}
-                  />
-                  <button className="ghost small" onClick={addCustomAllowedModel} type="button">
-                    添加
-                  </button>
-                </div>
-              </div>
-              <label className="field">
-                <span>接口协议</span>
-                <select
-                  value={providerWireApi}
-                  onChange={(event) => setProviderWireApi(event.currentTarget.value as ProviderWireApi)}
-                >
-                  <option value="responses">Responses API</option>
-                  <option value="chat_completions">Chat Completions 兼容</option>
-                </select>
-                <small>DeepSeek、GLM 等不支持 Responses 时选择兼容模式</small>
-              </label>
-              <label className="field">
-                <span>强制 service_tier</span>
-                <input
-                  placeholder="例如 priority；留空则跟随客户端"
-                  value={providerServiceTier}
-                  onChange={(event) => setProviderServiceTier(event.currentTarget.value)}
-                />
-                <small>保存后，转发给此供应商的 JSON 请求会覆盖 service_tier。</small>
-              </label>
-              <div className="route-box">
-                <strong>故障处理</strong>
-                <div className="form-row">
-                  <label className="field">
-                    <span>连续失败</span>
-                    <input readOnly value="3 次" />
-                  </label>
-                  <label className="field">
-                    <span>冷却时间</span>
-                    <input readOnly value="60 秒" />
-                  </label>
-                </div>
-                <div className="mini-toggle-line">
-                  <span>连接异常时切换至下一供应商</span>
-                  <Toggle checked onChange={() => undefined} />
-                </div>
-                <div className="mini-toggle-line">
-                  <span>余额低于阈值时跳过此供应商（即将支持）</span>
-                  <Toggle checked={false} disabled onChange={() => undefined} />
-                </div>
-              </div>
-              <div className="mapping-box">
-                <div className="mapping-box-head">
-                  <div>
-                    <strong>模型映射</strong>
-                    <p>客户端模型匹配后转发为此供应商支持的模型</p>
-                  </div>
-                  <button
-                    className="ghost small"
-                    onClick={() => setModelMappings([...modelMappings, { source: "", target: "" }])}
-                    type="button"
-                  >
-                    添加映射
-                  </button>
-                </div>
-                <div className="mapping-grid">
-                  <span>客户端模型</span>
-                  <span>上游模型</span>
-                  <span />
-                  {modelMappings.length === 0 && (
-                    <p className="mapping-empty">未配置映射时，请求模型将原样转发。</p>
-                  )}
-                  {modelMappings.map((mapping, index) => (
-                    <div className="mapping-row" key={index}>
-                      <input
-                        placeholder="gpt-5.5"
-                        value={mapping.source}
-                        onChange={(event) => {
-                          const next = [...modelMappings];
-                          next[index] = { ...mapping, source: event.currentTarget.value };
-                          setModelMappings(next);
-                        }}
-                      />
-                      <input
-                        placeholder="deepseek-v4-pro"
-                        value={mapping.target}
-                        onChange={(event) => {
-                          const next = [...modelMappings];
-                          next[index] = { ...mapping, target: event.currentTarget.value };
-                          setModelMappings(next);
-                        }}
-                      />
-                      <button
-                        aria-label="删除映射"
-                        className="icon-button"
-                        onClick={() => setModelMappings(modelMappings.filter((_, rowIndex) => rowIndex !== index))}
-                        title="删除映射"
-                        type="button"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <div className="pricing-box">
-                <div className="mapping-box-head">
-                  <div>
-                    <strong>供应商计价</strong>
-                    <p>使用上游模型名计算独立消耗，不影响官方估算</p>
-                  </div>
-                  <div className="pricing-actions">
-                    <span
-                      className={`price-sync-line drawer-sync ${pricingSyncOk ? "ok" : "missing"}`}
-                      title={pricingSyncError ?? undefined}
-                    >
-                      <i />
-                      {pricingSyncLabel}
-                    </span>
-                    <button className="ghost small" disabled={busy} onClick={onSyncProviderPricing} type="button">
-                      {busy ? "同步中" : "同步 New API"}
-                    </button>
-                    <button className="ghost small" onClick={addPricingRule} type="button">
-                      添加价格
-                    </button>
-                  </div>
-                </div>
-                <div className="pricing-grid">
-                  <span>上游模型</span>
-                  <span>输入 / 1M</span>
-                  <span>缓存 / 1M</span>
-                  <span>输出 / 1M</span>
-                  <span>请求 / 次</span>
-                  <span>币种</span>
-                  <span />
-                  {providerPricing.length === 0 && (
-                    <p className="mapping-empty">未配置价格时，供应商消耗按 0 估算。</p>
-                  )}
-                  {providerPricing.map((rule, index) => (
-                    <div className="pricing-row" key={rule.id || index}>
-                      <input
-                        placeholder="glm-5.2"
-                        value={rule.model_match}
-                        onChange={(event) => changePricingRule(index, { model_match: event.currentTarget.value })}
-                      />
-                      <input
-                        inputMode="decimal"
-                        value={String(rule.input_per_million)}
-                        onChange={(event) => changePricingRule(index, { input_per_million: Number(event.currentTarget.value) || 0 })}
-                      />
-                      <input
-                        inputMode="decimal"
-                        value={String(rule.cached_input_per_million)}
-                        onChange={(event) => changePricingRule(index, { cached_input_per_million: Number(event.currentTarget.value) || 0 })}
-                      />
-                      <input
-                        inputMode="decimal"
-                        value={String(rule.output_per_million)}
-                        onChange={(event) => changePricingRule(index, { output_per_million: Number(event.currentTarget.value) || 0 })}
-                      />
-                      <input
-                        inputMode="decimal"
-                        value={String(rule.request_price ?? 0)}
-                        onChange={(event) => changePricingRule(index, { request_price: Number(event.currentTarget.value) || 0 })}
-                      />
-                      <input
-                        value={rule.currency}
-                        onChange={(event) => changePricingRule(index, { currency: event.currentTarget.value.toUpperCase() })}
-                      />
-                      <button
-                        aria-label="删除价格"
-                        className="icon-button"
-                        onClick={() => updateProviderPricing(providerPricing.filter((_, rowIndex) => rowIndex !== index))}
-                        title="删除价格"
-                        type="button"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </>
-          )}
         </section>
 
         <footer>
@@ -4080,21 +4022,15 @@ function ClaudeProviderEditor(props: {
   onSave: () => void;
   providerApiKey: string;
   providerBaseUrl: string;
-  providerEnabled: boolean;
   providerModels: string[];
   providerName: string;
-  providerPricing: PricingRule[];
-  providerTestModel: string;
   secretVisible: boolean;
   setAllowedModels: (models: string[]) => void;
   setModelMappings: (mappings: ModelMapping[]) => void;
   setProviderApiKey: (value: string) => void;
   setProviderApiKeyDirty: (dirty: boolean) => void;
   setProviderBaseUrl: (value: string) => void;
-  setProviderEnabled: (value: boolean) => void;
   setProviderName: (value: string) => void;
-  setProviderPricing: (pricing: PricingRule[]) => void;
-  setProviderTestModel: (value: string) => void;
   setSecretVisible: (value: boolean) => void;
 }) {
   const {
@@ -4107,27 +4043,25 @@ function ClaudeProviderEditor(props: {
     onSave,
     providerApiKey,
     providerBaseUrl,
-    providerEnabled,
     providerModels,
     providerName,
-    providerPricing,
-    providerTestModel,
     secretVisible,
     setAllowedModels,
     setModelMappings,
     setProviderApiKey,
     setProviderApiKeyDirty,
     setProviderBaseUrl,
-    setProviderEnabled,
     setProviderName,
-    setProviderPricing,
-    setProviderTestModel,
     setSecretVisible,
   } = props;
   const [customAllowedModel, setCustomAllowedModel] = useState("");
   const [deleteConfirming, setDeleteConfirming] = useState(false);
+  const [modelSearch, setModelSearch] = useState("");
   const updateAllowedModels = (models: string[]) => setAllowedModels(normalizeModelNames(models));
   const allowedModelOptions = normalizeModelNames([...providerModels, ...allowedModels]);
+  const visibleModelOptions = allowedModelOptions.filter((model) =>
+    model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
+  );
   const allModelsAllowed = allowedModels.length === 0;
   const toggleAllowedModel = (model: string, checked: boolean) => {
     const currentModels = allModelsAllowed ? allowedModelOptions : allowedModels;
@@ -4141,13 +4075,7 @@ function ClaudeProviderEditor(props: {
     const model = customAllowedModel.trim();
     if (!model) return;
     updateAllowedModels([...(allModelsAllowed ? allowedModelOptions : allowedModels), model]);
-    if (!providerTestModel) setProviderTestModel(model);
     setCustomAllowedModel("");
-  };
-  const changePricingRule = (index: number, patch: Partial<PricingRule>) => {
-    const next = [...providerPricing];
-    next[index] = { ...next[index], ...patch };
-    setProviderPricing(next);
   };
 
   return (
@@ -4192,41 +4120,55 @@ function ClaudeProviderEditor(props: {
               </button>
             </div>
           </label>
-          <div className="switch-row-card">
+          <section className="model-config-intro compact">
             <div>
-              <strong>启用 Claude 供应商</strong>
-              <p>关闭后不会参与 Claude 原生消息路由</p>
+              <span className="section-kicker">模型来源</span>
+              <h3>模型配置</h3>
+              <p>{providerBaseUrl || "尚未配置 Base URL"}</p>
             </div>
-            <Toggle checked={providerEnabled} onChange={setProviderEnabled} />
-          </div>
-          <label className="field">
-            <span>默认测试模型</span>
-            <input
-              placeholder="claude-sonnet-4-5"
-              value={providerTestModel}
-              onChange={(event) => setProviderTestModel(event.currentTarget.value)}
-            />
-          </label>
-          <div className="model-filter-box">
+            <button className="primary model-fetch-button" disabled={busy} onClick={onLoadProviderModels} type="button">
+              <ToolIcon type="models" />
+              {busy ? "正在获取" : providerModels.length ? "重新获取" : "从上游获取模型"}
+            </button>
+          </section>
+          <div className="model-filter-box model-manager">
             <div className="mapping-box-head">
               <div>
-                <strong>允许模型</strong>
-                <p>{allowedModels.length ? `仅接收 ${allowedModels.length} 个 Claude 模型` : "当前接收所有 Claude 模型"}</p>
+                <strong>启用模型</strong>
+                <p>{allowedModels.length ? `已启用 ${allowedModels.length} 个 Claude 模型` : "当前兼容任意 Claude 模型"}</p>
               </div>
-              <div className="test-actions">
-                <button className="ghost small" disabled={busy} onClick={onLoadProviderModels} type="button">
-                  刷新模型
-                </button>
-                <button className="ghost small" onClick={() => updateAllowedModels([])} type="button">
-                  全部模型
-                </button>
-              </div>
+              <button
+                className="ghost small"
+                disabled={allowedModelOptions.length === 0}
+                onClick={() => updateAllowedModels(allowedModelOptions)}
+                type="button"
+              >
+                全部启用
+              </button>
             </div>
+            <label className="model-search-field">
+              <span aria-hidden="true" />
+              <input
+                placeholder="搜索 Claude 模型"
+                type="search"
+                value={modelSearch}
+                onChange={(event) => setModelSearch(event.currentTarget.value)}
+              />
+            </label>
             <div className="model-option-grid">
               {allowedModelOptions.length === 0 && (
-                <p className="mapping-empty">刷新远端模型，或在下方手动添加 Claude 模型名。未配置允许模型时，此供应商接收所有 Claude 请求模型。</p>
+                <div className="model-empty-state">
+                  <strong>还没有上游模型</strong>
+                  <p>确认 Base URL 和 API Key 后，从上游读取可用模型。</p>
+                  <button className="ghost small" disabled={busy} onClick={onLoadProviderModels} type="button">
+                    从上游获取
+                  </button>
+                </div>
               )}
-              {allowedModelOptions.map((model) => {
+              {allowedModelOptions.length > 0 && visibleModelOptions.length === 0 && (
+                <p className="mapping-empty">没有匹配“{modelSearch.trim()}”的模型。</p>
+              )}
+              {visibleModelOptions.map((model) => {
                 const checked = allModelsAllowed || allowedModels.some((current) => current.toLowerCase() === model.toLowerCase());
                 return (
                   <label className={checked ? "model-option selected" : "model-option"} key={model}>
@@ -4252,8 +4194,8 @@ function ClaudeProviderEditor(props: {
                   }
                 }}
               />
-              <button className="ghost small" onClick={addCustomAllowedModel} type="button">
-                添加
+              <button className="ghost small" disabled={!customAllowedModel.trim()} onClick={addCustomAllowedModel} type="button">
+                添加模型
               </button>
             </div>
           </div>
@@ -4303,75 +4245,6 @@ function ClaudeProviderEditor(props: {
                     className="icon-button"
                     onClick={() => setModelMappings(modelMappings.filter((_, rowIndex) => rowIndex !== index))}
                     title="删除映射"
-                    type="button"
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div className="pricing-box">
-            <div className="mapping-box-head">
-              <div>
-                <strong>供应商计价</strong>
-                <p>阶段 3 接入 Claude 日志统计后用于费用估算</p>
-              </div>
-              <button
-                className="ghost small"
-                onClick={() => setProviderPricing([...providerPricing, defaultPricingRule()])}
-                type="button"
-              >
-                添加价格
-              </button>
-            </div>
-            <div className="pricing-grid">
-              <span>上游模型</span>
-              <span>输入 / 1M</span>
-              <span>缓存 / 1M</span>
-              <span>输出 / 1M</span>
-              <span>请求 / 次</span>
-              <span>币种</span>
-              <span />
-              {providerPricing.length === 0 && (
-                <p className="mapping-empty">未配置价格时，暂不估算 Claude 供应商消耗。</p>
-              )}
-              {providerPricing.map((rule, index) => (
-                <div className="pricing-row" key={rule.id || index}>
-                  <input
-                    placeholder="claude-*"
-                    value={rule.model_match}
-                    onChange={(event) => changePricingRule(index, { model_match: event.currentTarget.value })}
-                  />
-                  <input
-                    inputMode="decimal"
-                    value={String(rule.input_per_million)}
-                    onChange={(event) => changePricingRule(index, { input_per_million: Number(event.currentTarget.value) || 0 })}
-                  />
-                  <input
-                    inputMode="decimal"
-                    value={String(rule.cached_input_per_million)}
-                    onChange={(event) => changePricingRule(index, { cached_input_per_million: Number(event.currentTarget.value) || 0 })}
-                  />
-                  <input
-                    inputMode="decimal"
-                    value={String(rule.output_per_million)}
-                    onChange={(event) => changePricingRule(index, { output_per_million: Number(event.currentTarget.value) || 0 })}
-                  />
-                  <input
-                    inputMode="decimal"
-                    value={String(rule.request_price ?? 0)}
-                    onChange={(event) => changePricingRule(index, { request_price: Number(event.currentTarget.value) || 0 })}
-                  />
-                  <input
-                    value={rule.currency}
-                    onChange={(event) => changePricingRule(index, { currency: event.currentTarget.value.toUpperCase() })}
-                  />
-                  <button
-                    aria-label="删除价格"
-                    className="icon-button"
-                    onClick={() => setProviderPricing(providerPricing.filter((_, rowIndex) => rowIndex !== index))}
-                    title="删除价格"
                     type="button"
                   >
                     ×

@@ -33,20 +33,22 @@ use tauri::Manager;
 use tokio::sync::oneshot;
 use toml_edit::{Array, DocumentMut, Item, Value as TomlValue};
 
-const MARKER: &str = "# managed-by: codex-config-manager";
+const MARKER: &str = "# managed-by: xxswitch";
+const LEGACY_MARKER: &str = "# managed-by: codex-config-manager";
 const DEFAULT_ROUTER_HOST: &str = "127.0.0.1";
 const DEFAULT_ROUTER_PORT: u16 = 18080;
-const DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
+const DEFAULT_ROUTER_TOKEN: &str = "xxswitch-local-token";
+const LEGACY_DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
 const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
 const CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT: i64 = 243_200;
 const CODEX_MODEL_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
-const PI_PROVIDER_ID: &str = "codex-helper";
+const PI_PROVIDER_ID: &str = "xxswitch";
+const LEGACY_PI_PROVIDER_ID: &str = "codex-helper";
 const PI_PROVIDER_API: &str = "openai-responses";
 static ROUTE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROVIDER_HEALTH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const AUTO_DISABLE_FAILURE_THRESHOLD: u32 = 3;
-const DEFAULT_NEW_API_QUOTA_PER_USD: f64 = 500_000.0;
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_SHOW_ID: &str = "show";
 const TRAY_QUIT_ID: &str = "quit";
@@ -55,7 +57,7 @@ const GITHUB_RELEASES_LATEST_URL: &str =
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Hlongyu/codex_helper/releases/download/";
 #[cfg(target_os = "macos")]
-const MACOS_BUNDLE_IDENTIFIER: &str = "com.local.codex-config-manager";
+const MACOS_BUNDLE_IDENTIFIER: &str = "com.local.xxswitch";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderConfig {
@@ -83,10 +85,6 @@ struct ProviderConfig {
     allowed_models: Vec<String>,
     #[serde(default)]
     model_mappings: Vec<ModelMapping>,
-    #[serde(default)]
-    provider_pricing: Vec<PricingRule>,
-    #[serde(default)]
-    pricing_sync_status: Option<PricingSyncStatus>,
     #[serde(default)]
     balance_query: BalanceQueryConfig,
     #[serde(default)]
@@ -118,8 +116,6 @@ struct ClaudeProviderConfig {
     allowed_models: Vec<String>,
     #[serde(default)]
     model_mappings: Vec<ModelMapping>,
-    #[serde(default)]
-    provider_pricing: Vec<PricingRule>,
     #[serde(default)]
     connection_status: Option<ConnectionStatus>,
 }
@@ -454,8 +450,6 @@ struct ManagerState {
     #[serde(default)]
     applied_history: Vec<AppliedProviderSnapshot>,
     #[serde(default)]
-    pricing: Vec<PricingRule>,
-    #[serde(default)]
     router: RouterConfig,
     #[serde(default)]
     clients: ClientConfigs,
@@ -520,63 +514,6 @@ struct AppliedProviderSnapshot {
     applied_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PricingRule {
-    id: String,
-    provider_match: String,
-    model_match: String,
-    input_per_million: f64,
-    cached_input_per_million: f64,
-    output_per_million: f64,
-    reasoning_output_per_million: f64,
-    #[serde(default)]
-    request_price: f64,
-    currency: String,
-    #[serde(default)]
-    source: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PricingSyncStatus {
-    ok: bool,
-    label: String,
-    checked_at: Option<u64>,
-    error: Option<String>,
-    #[serde(default)]
-    group: String,
-    #[serde(default)]
-    group_ratio: f64,
-    #[serde(default)]
-    pricing_count: usize,
-}
-
-fn pricing_sync_label(group: &str, group_ratio: f64, pricing_count: usize) -> String {
-    let group = group.trim();
-    let group_label = if group.is_empty() {
-        "默认分组"
-    } else {
-        group
-    };
-    format!("可用 · {group_label} × {group_ratio:.4} · {pricing_count} 个价格")
-}
-
-impl Default for PricingRule {
-    fn default() -> Self {
-        Self {
-            id: "default".to_string(),
-            provider_match: "*".to_string(),
-            model_match: "*".to_string(),
-            input_per_million: 0.0,
-            cached_input_per_million: 0.0,
-            output_per_million: 0.0,
-            reasoning_output_per_million: 0.0,
-            request_price: 0.0,
-            currency: "USD".to_string(),
-            source: String::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct TokenUsage {
     #[serde(default)]
@@ -591,8 +528,8 @@ struct TokenUsage {
     total_tokens: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct UsageSummary {
+#[derive(Debug, Clone, Serialize, Default)]
+struct RouteUsageSummary {
     request_count: usize,
     input_tokens: i64,
     uncached_input_tokens: i64,
@@ -600,103 +537,6 @@ struct UsageSummary {
     output_tokens: i64,
     reasoning_output_tokens: i64,
     total_tokens: i64,
-    estimated_cost: f64,
-    currency: String,
-}
-
-impl Default for UsageSummary {
-    fn default() -> Self {
-        Self {
-            request_count: 0,
-            input_tokens: 0,
-            uncached_input_tokens: 0,
-            cached_input_tokens: 0,
-            output_tokens: 0,
-            reasoning_output_tokens: 0,
-            total_tokens: 0,
-            estimated_cost: 0.0,
-            currency: "USD".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct UsageDailyPoint {
-    day: String,
-    request_count: usize,
-    total_tokens: i64,
-    estimated_cost: f64,
-    providers: Vec<UsageProviderPoint>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct UsageProviderPoint {
-    provider_key: String,
-    provider_name: String,
-    request_count: usize,
-    input_tokens: i64,
-    uncached_input_tokens: i64,
-    cached_input_tokens: i64,
-    output_tokens: i64,
-    reasoning_output_tokens: i64,
-    total_tokens: i64,
-    estimated_cost: f64,
-    known: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct UsageMonthlyPoint {
-    month: String,
-    request_count: usize,
-    total_tokens: i64,
-    estimated_cost: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct UsageDetailRow {
-    timestamp: String,
-    day: String,
-    session_id: String,
-    provider_key: String,
-    provider_name: String,
-    model: String,
-    input_tokens: i64,
-    uncached_input_tokens: i64,
-    cached_input_tokens: i64,
-    output_tokens: i64,
-    reasoning_output_tokens: i64,
-    total_tokens: i64,
-    estimated_cost: f64,
-    cost_breakdown: String,
-    pricing_model_match: String,
-    pricing_source: String,
-    currency: String,
-    source: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct UsageStats {
-    generated_at_ms: i64,
-    source_dir: String,
-    filters: UsageStatsFilter,
-    summary: UsageSummary,
-    today: UsageSummary,
-    this_month: UsageSummary,
-    daily: Vec<UsageDailyPoint>,
-    monthly: Vec<UsageMonthlyPoint>,
-    providers: Vec<UsageProviderPoint>,
-    details: Vec<UsageDetailRow>,
-    pricing: Vec<PricingRule>,
-    available_providers: Vec<UsageFilterOption>,
-    available_models: Vec<String>,
-    available_days: Vec<String>,
-    unknown_provider_count: usize,
-    parsed_files: usize,
-    parsed_events: usize,
-    filtered_events: usize,
-    detail_page: usize,
-    detail_page_size: usize,
-    detail_total_pages: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -718,13 +558,6 @@ struct ProviderSummary {
     latency_ms: Option<u64>,
     latency_label: String,
     latency_error: Option<String>,
-    provider_today_cost: f64,
-    provider_month_cost: f64,
-    provider_currency: String,
-    provider_pricing_count: usize,
-    pricing_sync_ok: bool,
-    pricing_sync_label: String,
-    pricing_sync_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -821,7 +654,6 @@ struct SaveProviderPayload {
     connection_test_model: Option<String>,
     allowed_models: Option<Vec<String>>,
     model_mappings: Option<Vec<ModelMapping>>,
-    provider_pricing: Option<Vec<PricingRule>>,
     wire_api: Option<ProviderWireApi>,
     service_tier: Option<String>,
     enabled: Option<bool>,
@@ -839,7 +671,6 @@ struct SaveClaudeProviderPayload {
     connection_test_model: Option<String>,
     allowed_models: Option<Vec<String>>,
     model_mappings: Option<Vec<ModelMapping>>,
-    provider_pricing: Option<Vec<PricingRule>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -923,18 +754,20 @@ struct TestProviderConnectionPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct TestProviderLatencyPayload {
+    provider_id: String,
+    provider_kind: AgentClientKind,
+    model: String,
+    prompt: String,
+    #[serde(default)]
+    stream: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct LoadProviderModelsPayload {
     provider_id: String,
     base_url: Option<String>,
     api_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SyncProviderPricingPayload {
-    provider_id: String,
-    base_url: Option<String>,
-    api_key: Option<String>,
-    balance_query: Option<BalanceQueryConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -943,19 +776,12 @@ struct ProviderModelsResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ProviderPricingSyncResponse {
-    state: AppState,
-    pricing: Vec<PricingRule>,
+struct ProviderLatencyTestResponse {
+    app_state: AppState,
     ok: bool,
-    message: String,
-}
-
-#[derive(Debug, Clone)]
-struct ProviderPricingSyncData {
-    pricing: Vec<PricingRule>,
-    group: String,
-    group_ratio: f64,
-    pricing_count: usize,
+    latency_ms: Option<u64>,
+    error: Option<String>,
+    reply: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -971,38 +797,6 @@ struct ProviderConnectionTestStep {
 struct ProviderConnectionTestResult {
     ok: bool,
     steps: Vec<ProviderConnectionTestStep>,
-}
-
-#[derive(Debug, Clone)]
-struct UsageEvent {
-    timestamp: DateTime<Utc>,
-    day: String,
-    month: String,
-    session_id: String,
-    provider_key: String,
-    provider_name: String,
-    provider_known: bool,
-    model: String,
-    usage: TokenUsage,
-    estimated_cost: f64,
-    cost_breakdown: String,
-    pricing_model_match: String,
-    pricing_source: String,
-    currency: String,
-    source: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct UsageCache {
-    events: Vec<UsageEvent>,
-    source_dir: String,
-    parsed_files: usize,
-    loaded_at_ms: i64,
-}
-
-#[derive(Default)]
-struct UsageCacheState {
-    cache: Mutex<Option<UsageCache>>,
 }
 
 #[derive(Default)]
@@ -1026,15 +820,6 @@ impl Drop for RouterHandle {
 #[derive(Clone)]
 struct ProxyState {
     client: reqwest::Client,
-}
-
-#[derive(Debug, Clone)]
-struct CostEstimate {
-    amount: f64,
-    currency: String,
-    breakdown: String,
-    pricing_model_match: String,
-    pricing_source: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1088,7 +873,8 @@ struct ChatToolCallState {
 }
 
 const REASONING_CONTENT_FIELD: &str = "reasoning_content";
-const LOCAL_REASONING_ENCRYPTED_PREFIX: &str = "codex-helper-local-reasoning-v1:";
+const LOCAL_REASONING_ENCRYPTED_PREFIX: &str = "xxswitch-local-reasoning-v1:";
+const LEGACY_LOCAL_REASONING_ENCRYPTED_PREFIX: &str = "codex-helper-local-reasoning-v1:";
 const MISSING_REASONING_CONTENT_FALLBACK: &str =
     "Previous reasoning content was unavailable in Responses history.";
 
@@ -1143,42 +929,10 @@ fn local_reasoning_encrypted_content(reasoning_content: &str) -> String {
 }
 
 fn local_reasoning_from_encrypted_content(value: &str) -> Option<String> {
-    let encoded = value.strip_prefix(LOCAL_REASONING_ENCRYPTED_PREFIX)?;
+    let encoded = value
+        .strip_prefix(LOCAL_REASONING_ENCRYPTED_PREFIX)
+        .or_else(|| value.strip_prefix(LEGACY_LOCAL_REASONING_ENCRYPTED_PREFIX))?;
     String::from_utf8(hex_decode(encoded)?).ok()
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct UsageStatsFilter {
-    #[serde(default)]
-    start_day: Option<String>,
-    #[serde(default)]
-    end_day: Option<String>,
-    #[serde(default)]
-    provider_key: Option<String>,
-    #[serde(default)]
-    provider_name: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    page: Option<usize>,
-    #[serde(default)]
-    page_size: Option<usize>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct LoadUsageStatsPayload {
-    #[serde(default)]
-    filter: Option<UsageStatsFilter>,
-    #[serde(default)]
-    force_refresh: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct UsageFilterOption {
-    provider_key: String,
-    provider_name: String,
-    request_count: usize,
-    known: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1224,21 +978,6 @@ struct RouteRequestLog {
     output_tokens: i64,
     reasoning_output_tokens: i64,
     total_tokens: i64,
-    estimated_cost: f64,
-    currency: String,
-    cost_breakdown: String,
-    pricing_model_match: String,
-    pricing_source: String,
-    #[serde(default)]
-    provider_estimated_cost: f64,
-    #[serde(default = "default_currency")]
-    provider_currency: String,
-    #[serde(default)]
-    provider_cost_breakdown: String,
-    #[serde(default)]
-    provider_pricing_model_match: String,
-    #[serde(default)]
-    provider_pricing_source: String,
     first_byte_ms: Option<u64>,
     total_ms: u64,
 }
@@ -1351,7 +1090,6 @@ struct RouteUsageBucket {
     cached_input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
-    estimated_cost: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1364,15 +1102,14 @@ struct RouteUsageBreakdown {
     cached_input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
-    estimated_cost: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct RouteUsageStats {
     generated_at_ms: i64,
     filters: RouteLogFilter,
-    summary: UsageSummary,
-    today: UsageSummary,
+    summary: RouteUsageSummary,
+    today: RouteUsageSummary,
     failed_count: usize,
     success_count: usize,
     running_count: usize,
@@ -1410,7 +1147,6 @@ struct PendingRouteLog {
     route_attempts: usize,
     error: Option<String>,
     start: Instant,
-    provider_pricing: Vec<PricingRule>,
 }
 
 struct RouteStreamState {
@@ -1481,10 +1217,6 @@ fn default_router_token() -> String {
     random_router_token()
 }
 
-fn default_currency() -> String {
-    "USD".to_string()
-}
-
 fn random_router_token() -> String {
     let mut bytes = [0_u8; 32];
     if getrandom::fill(&mut bytes).is_ok() {
@@ -1492,11 +1224,11 @@ fn random_router_token() -> String {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        format!("codex-helper-{encoded}")
+        format!("xxswitch-{encoded}")
     } else {
         let fallback = current_epoch_ms().unwrap_or_default();
         let sequence = ROUTE_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        format!("codex-helper-{fallback:x}-{sequence:x}")
+        format!("xxswitch-{fallback:x}-{sequence:x}")
     }
 }
 
@@ -2018,7 +1750,7 @@ fn exposure_health(path: &Path, library_path: &Path) -> (String, String) {
             } else {
                 (
                     "broken".to_string(),
-                    "路径存在但不是 Codex Helper 管理的 symlink".to_string(),
+                    "路径存在但不是 XXSwitch 管理的 symlink".to_string(),
                 )
             }
         }
@@ -2154,7 +1886,7 @@ fn build_skill_management_view(state: &ManagerState) -> Result<SkillManagementVi
                     .unwrap_or_default();
                 let message = if !target_path.is_empty() && PathBuf::from(&target_path).exists() {
                     format!(
-                        "{} 的目标路径已有非 Codex Helper 管理的同名入口",
+                        "{} 的目标路径已有非 XXSwitch 管理的同名入口",
                         client.label()
                     )
                 } else {
@@ -2424,10 +2156,6 @@ fn find_discovered_skill(
         .ok_or_else(|| "未在该 Agent Client 的 Skill Locations 中发现指定 Skill".to_string())
 }
 
-fn sessions_dir() -> Result<PathBuf, String> {
-    Ok(codex_home()?.join("sessions"))
-}
-
 fn default_state() -> ManagerState {
     ManagerState {
         active_provider_id: String::new(),
@@ -2439,7 +2167,6 @@ fn default_state() -> ManagerState {
         claude_providers: vec![],
         last_applied: None,
         applied_history: vec![],
-        pricing: default_pricing_rules(),
         router: RouterConfig::default(),
         clients: ClientConfigs::default(),
         router_backup: None,
@@ -2494,64 +2221,6 @@ fn set_provider_status_fields(
     }
 }
 
-fn default_pricing_rules() -> Vec<PricingRule> {
-    const SOURCE: &str = "OpenAI API pricing, standard GPT models, USD per 1M tokens";
-
-    fn rule(id: &str, model: &str, input: f64, cached_input: f64, output: f64) -> PricingRule {
-        PricingRule {
-            id: id.to_string(),
-            provider_match: "*".to_string(),
-            model_match: model.to_string(),
-            input_per_million: input,
-            cached_input_per_million: cached_input,
-            output_per_million: output,
-            reasoning_output_per_million: 0.0,
-            request_price: 0.0,
-            currency: "USD".to_string(),
-            source: SOURCE.to_string(),
-        }
-    }
-
-    vec![
-        rule("gpt-5-5-pro", "gpt-5.5-pro*", 30.0, 0.0, 180.0),
-        rule("gpt-5-5", "gpt-5.5*", 5.0, 0.5, 30.0),
-        rule("gpt-5-4-pro", "gpt-5.4-pro*", 30.0, 0.0, 180.0),
-        rule("gpt-5-4-mini", "gpt-5.4-mini*", 0.75, 0.075, 4.5),
-        rule("gpt-5-4-nano", "gpt-5.4-nano*", 0.2, 0.02, 1.25),
-        rule("gpt-5-4", "gpt-5.4*", 2.5, 0.25, 15.0),
-        rule("gpt-5-3-codex", "gpt-5.3-codex*", 1.75, 0.175, 14.0),
-        rule("gpt-5-3-chat", "gpt-5.3-chat-latest", 1.75, 0.175, 14.0),
-        rule("gpt-5-2-pro", "gpt-5.2-pro*", 21.0, 0.0, 168.0),
-        rule("gpt-5-2-codex", "gpt-5.2-codex*", 1.75, 0.175, 14.0),
-        rule("gpt-5-2-chat", "gpt-5.2-chat-latest", 1.75, 0.175, 14.0),
-        rule("gpt-5-2", "gpt-5.2*", 1.75, 0.175, 14.0),
-        rule(
-            "gpt-5-1-codex-mini",
-            "gpt-5.1-codex-mini*",
-            0.25,
-            0.025,
-            2.0,
-        ),
-        rule("gpt-5-1-codex", "gpt-5.1-codex*", 1.25, 0.125, 10.0),
-        rule("gpt-5-1-chat", "gpt-5.1-chat-latest", 1.25, 0.125, 10.0),
-        rule("gpt-5-1", "gpt-5.1*", 1.25, 0.125, 10.0),
-        rule("gpt-5-codex", "gpt-5-codex*", 1.25, 0.125, 10.0),
-        rule("gpt-5-pro", "gpt-5-pro*", 15.0, 0.0, 120.0),
-        rule("gpt-5-mini", "gpt-5-mini*", 0.25, 0.025, 2.0),
-        rule("gpt-5-nano", "gpt-5-nano*", 0.05, 0.005, 0.4),
-        rule("gpt-5-chat", "gpt-5-chat-latest", 1.25, 0.125, 10.0),
-        rule("gpt-5", "gpt-5*", 1.25, 0.125, 10.0),
-        rule("codex-mini-latest", "codex-mini-latest", 1.5, 0.375, 6.0),
-        rule("chat-latest", "chat-latest", 5.0, 0.5, 30.0),
-        rule("gpt-4-1-mini", "gpt-4.1-mini*", 0.4, 0.1, 1.6),
-        rule("gpt-4-1-nano", "gpt-4.1-nano*", 0.1, 0.025, 0.4),
-        rule("gpt-4-1", "gpt-4.1*", 2.0, 0.5, 8.0),
-        rule("gpt-4o-2024-05-13", "gpt-4o-2024-05-13", 5.0, 0.0, 15.0),
-        rule("gpt-4o-mini", "gpt-4o-mini*", 0.15, 0.075, 0.6),
-        rule("gpt-4o", "gpt-4o*", 2.5, 1.25, 10.0),
-    ]
-}
-
 fn ensure_state_file() -> Result<(), String> {
     fs::create_dir_all(manager_dir()?).map_err(|err| format!("无法创建管理目录: {err}"))?;
 
@@ -2604,7 +2273,6 @@ fn load_state_file() -> Result<ManagerState, String> {
 }
 
 fn normalize_state(mut state: ManagerState) -> ManagerState {
-    state.pricing = default_pricing_rules();
     let today = provider_day_now();
     for provider in &mut state.providers {
         let previous_status = provider.status;
@@ -2628,8 +2296,6 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
             normalize_model_names(std::mem::take(&mut provider.allowed_models));
         provider.model_mappings =
             normalize_model_mappings(std::mem::take(&mut provider.model_mappings));
-        provider.provider_pricing =
-            normalize_provider_pricing(std::mem::take(&mut provider.provider_pricing));
     }
     for provider in &mut state.claude_providers {
         let previous_status = provider.status;
@@ -2653,11 +2319,10 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
             normalize_model_names(std::mem::take(&mut provider.allowed_models));
         provider.model_mappings =
             normalize_model_mappings(std::mem::take(&mut provider.model_mappings));
-        provider.provider_pricing =
-            normalize_provider_pricing(std::mem::take(&mut provider.provider_pricing));
     }
     if state.router.local_token.trim().is_empty()
         || state.router.local_token == DEFAULT_ROUTER_TOKEN
+        || state.router.local_token == LEGACY_DEFAULT_ROUTER_TOKEN
     {
         state.router.local_token = random_router_token();
     }
@@ -2928,15 +2593,6 @@ fn provider_type(provider: &ProviderConfig) -> String {
     }
 }
 
-fn model_provider_name(provider: &ProviderConfig) -> String {
-    provider
-        .config
-        .pointer("/model_provider")
-        .and_then(Value::as_str)
-        .unwrap_or("custom")
-        .to_string()
-}
-
 fn normalize_model_mappings(mappings: Vec<ModelMapping>) -> Vec<ModelMapping> {
     let mut seen = BTreeSet::new();
     let mut normalized = Vec::new();
@@ -2956,479 +2612,6 @@ fn normalize_model_mappings(mappings: Vec<ModelMapping>) -> Vec<ModelMapping> {
         });
     }
     normalized
-}
-
-fn normalize_provider_pricing(pricing: Vec<PricingRule>) -> Vec<PricingRule> {
-    let mut seen = BTreeSet::new();
-    let mut normalized = Vec::new();
-    for (index, mut rule) in pricing.into_iter().enumerate() {
-        rule.provider_match = "*".to_string();
-        rule.model_match = rule.model_match.trim().to_string();
-        if rule.model_match.is_empty() {
-            continue;
-        }
-        let key = rule.model_match.to_lowercase();
-        if !seen.insert(key) {
-            continue;
-        }
-        if rule.id.trim().is_empty() {
-            rule.id = format!("provider-price-{index}");
-        } else {
-            rule.id = rule.id.trim().to_string();
-        }
-        rule.input_per_million = rule.input_per_million.max(0.0);
-        rule.cached_input_per_million = rule.cached_input_per_million.max(0.0);
-        rule.output_per_million = rule.output_per_million.max(0.0);
-        rule.reasoning_output_per_million = rule.reasoning_output_per_million.max(0.0);
-        rule.request_price = rule.request_price.max(0.0);
-        rule.currency = rule.currency.trim().to_uppercase();
-        if rule.currency.is_empty() {
-            rule.currency = default_currency();
-        }
-        rule.source = if rule.source.trim().is_empty() {
-            "供应商手动价格".to_string()
-        } else {
-            rule.source.trim().to_string()
-        };
-        normalized.push(rule);
-    }
-    normalized
-}
-
-fn provider_price_rule_id(model: &str) -> String {
-    let slug = model
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    if slug.is_empty() {
-        "provider-price".to_string()
-    } else {
-        format!("provider-price-{slug}")
-    }
-}
-
-fn newapi_endpoint_from_base_url(base_url: &str) -> String {
-    let mut endpoint = base_url.trim().trim_end_matches('/').to_string();
-    if endpoint.to_ascii_lowercase().ends_with("/v1") {
-        endpoint.truncate(endpoint.len().saturating_sub(3));
-        endpoint = endpoint.trim_end_matches('/').to_string();
-    }
-    endpoint
-}
-
-fn finite_number(value: f64) -> Option<f64> {
-    value.is_finite().then_some(value)
-}
-
-fn scalar_number(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(number) => number.as_f64().and_then(finite_number),
-        Value::String(text) => text.trim().parse::<f64>().ok().and_then(finite_number),
-        _ => None,
-    }
-}
-
-fn object_get_ci<'a>(map: &'a Map<String, Value>, keys: &[&str]) -> Option<(&'a str, &'a Value)> {
-    for (key, value) in map {
-        if keys
-            .iter()
-            .any(|candidate| key.eq_ignore_ascii_case(candidate))
-        {
-            return Some((key.as_str(), value));
-        }
-    }
-    None
-}
-
-fn object_number_ci(map: &Map<String, Value>, keys: &[&str]) -> Option<f64> {
-    object_get_ci(map, keys).and_then(|(_, value)| scalar_number(value))
-}
-
-fn object_string_ci(map: &Map<String, Value>, keys: &[&str]) -> Option<String> {
-    object_get_ci(map, keys).and_then(|(_, value)| match value {
-        Value::String(text) => Some(text.trim().to_string()).filter(|text| !text.is_empty()),
-        Value::Number(number) => Some(number.to_string()),
-        _ => None,
-    })
-}
-
-fn normalize_price_per_million(field_name: &str, value: f64) -> f64 {
-    let field = field_name.to_ascii_lowercase();
-    if field.contains("per_token") || field.contains("per-token") || field.contains("/token") {
-        value * 1_000_000.0
-    } else if field.contains("per_1k")
-        || field.contains("per-k")
-        || field.contains("per_k")
-        || field.contains("1k")
-        || field.contains("thousand")
-    {
-        value * 1_000.0
-    } else {
-        value
-    }
-}
-
-fn object_price_per_million_ci(map: &Map<String, Value>, keys: &[&str]) -> Option<f64> {
-    object_get_ci(map, keys)
-        .and_then(|(key, value)| scalar_number(value).map(|price| (key, price)))
-        .map(|(key, price)| normalize_price_per_million(key, price).max(0.0))
-}
-
-fn newapi_ratio_source(source: &str, quota_per_usd: f64) -> String {
-    if (quota_per_usd.fract()).abs() < f64::EPSILON {
-        format!("{source} ratio, {:.0} quota/USD", quota_per_usd)
-    } else {
-        format!("{source} ratio, {quota_per_usd:.4} quota/USD")
-    }
-}
-
-fn newapi_rule_from_record(
-    model_key: Option<&str>,
-    record: &Map<String, Value>,
-    source: &str,
-    quota_per_usd: f64,
-) -> Option<PricingRule> {
-    let model = object_string_ci(record, &["model_name", "model", "name", "id"])
-        .or_else(|| model_key.map(str::trim).map(str::to_string))
-        .filter(|model| !model.is_empty())?;
-
-    let input_price = object_price_per_million_ci(
-        record,
-        &[
-            "input_price",
-            "input_price_usd",
-            "input_per_million",
-            "input_usd_per_million",
-            "input_price_per_million",
-            "input_price_per_1m",
-            "input_price_per_1k",
-            "input_price_per_token",
-            "prompt_price",
-            "prompt_price_usd",
-            "prompt_per_million",
-            "prompt_usd_per_million",
-            "prompt_price_per_million",
-            "prompt_price_per_1m",
-            "prompt_price_per_1k",
-            "prompt_price_per_token",
-        ],
-    );
-    let output_price = object_price_per_million_ci(
-        record,
-        &[
-            "output_price",
-            "output_price_usd",
-            "output_per_million",
-            "output_usd_per_million",
-            "output_price_per_million",
-            "output_price_per_1m",
-            "output_price_per_1k",
-            "output_price_per_token",
-            "completion_price",
-            "completion_price_usd",
-            "completion_per_million",
-            "completion_usd_per_million",
-            "completion_price_per_million",
-            "completion_price_per_1m",
-            "completion_price_per_1k",
-            "completion_price_per_token",
-        ],
-    );
-    let cached_input_price = object_price_per_million_ci(
-        record,
-        &[
-            "cached_input_price",
-            "cached_input_price_usd",
-            "cached_input_per_million",
-            "cached_input_usd_per_million",
-            "cached_input_price_per_million",
-            "cached_input_price_per_1m",
-            "cached_input_price_per_1k",
-            "cached_input_price_per_token",
-            "cache_read_price",
-            "cache_read_price_per_million",
-            "cache_read_price_per_1m",
-            "cached_prompt_price",
-            "cached_prompt_price_per_million",
-        ],
-    );
-    let cache_ratio = object_number_ci(
-        record,
-        &[
-            "cache_ratio",
-            "cacheRatio",
-            "cached_ratio",
-            "cachedRatio",
-            "cache_read_ratio",
-            "cacheReadRatio",
-            "cached_input_ratio",
-            "cachedInputRatio",
-            "prompt_cache_ratio",
-            "promptCacheRatio",
-        ],
-    )
-    .map(|ratio| ratio.max(0.0));
-    let reasoning_price = object_price_per_million_ci(
-        record,
-        &[
-            "reasoning_output_price",
-            "reasoning_output_price_usd",
-            "reasoning_output_per_million",
-            "reasoning_output_price_per_million",
-        ],
-    );
-
-    if input_price.is_some() || output_price.is_some() {
-        let input = input_price.or(output_price).unwrap_or_default().max(0.0);
-        let output = output_price.unwrap_or(input).max(0.0);
-        return Some(PricingRule {
-            id: provider_price_rule_id(&model),
-            provider_match: "*".to_string(),
-            model_match: model,
-            input_per_million: input,
-            cached_input_per_million: cached_input_price
-                .or_else(|| cache_ratio.map(|ratio| input * ratio))
-                .unwrap_or(input)
-                .max(0.0),
-            output_per_million: output,
-            reasoning_output_per_million: reasoning_price.unwrap_or(0.0).max(0.0),
-            request_price: object_price_per_million_ci(
-                record,
-                &["request_price", "request_price_usd", "price_per_request"],
-            )
-            .unwrap_or(0.0)
-            .max(0.0),
-            currency: "USD".to_string(),
-            source: format!("{source} explicit price"),
-        });
-    }
-
-    let quota_type = object_number_ci(record, &["quota_type", "quotaType"])
-        .map(|value| value.round() as i64)
-        .unwrap_or(0);
-    if quota_type == 1 {
-        let model_price = object_number_ci(
-            record,
-            &[
-                "model_price",
-                "modelPrice",
-                "request_price",
-                "requestPrice",
-                "price",
-            ],
-        )
-        .unwrap_or(0.0)
-        .max(0.0);
-        if model_price <= 0.0 {
-            return None;
-        }
-        return Some(PricingRule {
-            id: provider_price_rule_id(&model),
-            provider_match: "*".to_string(),
-            model_match: model,
-            input_per_million: 0.0,
-            cached_input_per_million: 0.0,
-            output_per_million: 0.0,
-            reasoning_output_per_million: 0.0,
-            request_price: model_price,
-            currency: "USD".to_string(),
-            source: format!("{source} fixed request price"),
-        });
-    }
-
-    let model_ratio = object_number_ci(record, &["model_ratio", "modelRatio", "ratio"])?;
-    let completion_ratio = object_number_ci(
-        record,
-        &[
-            "completion_ratio",
-            "completionRatio",
-            "output_ratio",
-            "outputRatio",
-        ],
-    )
-    .unwrap_or(1.0)
-    .max(0.0);
-    let input = model_ratio.max(0.0) * 1_000_000.0 / quota_per_usd;
-    let cached_input = input * cache_ratio.unwrap_or(1.0);
-    let output = input * completion_ratio;
-
-    Some(PricingRule {
-        id: provider_price_rule_id(&model),
-        provider_match: "*".to_string(),
-        model_match: model,
-        input_per_million: input,
-        cached_input_per_million: cached_input,
-        output_per_million: output,
-        reasoning_output_per_million: 0.0,
-        request_price: 0.0,
-        currency: "USD".to_string(),
-        source: newapi_ratio_source(source, quota_per_usd),
-    })
-}
-
-fn collect_newapi_record_rules(
-    value: &Value,
-    model_key: Option<&str>,
-    source: &str,
-    quota_per_usd: f64,
-    rules: &mut Vec<PricingRule>,
-) {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                collect_newapi_record_rules(item, None, source, quota_per_usd, rules);
-            }
-        }
-        Value::Object(map) => {
-            if let Some(rule) = newapi_rule_from_record(model_key, map, source, quota_per_usd) {
-                rules.push(rule);
-                return;
-            }
-
-            for (key, child) in map {
-                if key.eq_ignore_ascii_case("model_ratio")
-                    || key.eq_ignore_ascii_case("completion_ratio")
-                    || key.eq_ignore_ascii_case("model_price")
-                    || key.eq_ignore_ascii_case("cache_ratio")
-                    || key.eq_ignore_ascii_case("cacheRatio")
-                {
-                    continue;
-                }
-                let child_model_key = if child.is_object()
-                    && !matches!(
-                        key.as_str(),
-                        "data" | "result" | "pricing" | "prices" | "models" | "items" | "list"
-                    ) {
-                    Some(key.as_str())
-                } else {
-                    None
-                };
-                collect_newapi_record_rules(child, child_model_key, source, quota_per_usd, rules);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn find_object_by_key_ci<'a>(value: &'a Value, target_key: &str) -> Option<&'a Map<String, Value>> {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                if key.eq_ignore_ascii_case(target_key) {
-                    if let Some(child_map) = child.as_object() {
-                        return Some(child_map);
-                    }
-                }
-            }
-            for child in map.values() {
-                if let Some(found) = find_object_by_key_ci(child, target_key) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(items) => items
-            .iter()
-            .find_map(|item| find_object_by_key_ci(item, target_key)),
-        _ => None,
-    }
-}
-
-fn map_number_for_key_ci(map: &Map<String, Value>, target_key: &str) -> Option<f64> {
-    map.iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(target_key))
-        .and_then(|(_, value)| scalar_number(value))
-}
-
-fn append_newapi_ratio_config_rules(
-    value: &Value,
-    source: &str,
-    quota_per_usd: f64,
-    rules: &mut Vec<PricingRule>,
-) {
-    if let Some(model_price_map) = find_object_by_key_ci(value, "model_price") {
-        for (model, price_value) in model_price_map {
-            let model = model.trim();
-            if model.is_empty() {
-                continue;
-            }
-            let Some(model_price) = scalar_number(price_value) else {
-                continue;
-            };
-            if model_price <= 0.0 {
-                continue;
-            }
-            rules.push(PricingRule {
-                id: provider_price_rule_id(model),
-                provider_match: "*".to_string(),
-                model_match: model.to_string(),
-                input_per_million: 0.0,
-                cached_input_per_million: 0.0,
-                output_per_million: 0.0,
-                reasoning_output_per_million: 0.0,
-                request_price: model_price,
-                currency: "USD".to_string(),
-                source: format!("{source} fixed request price"),
-            });
-        }
-    }
-
-    let Some(model_ratio_map) = find_object_by_key_ci(value, "model_ratio") else {
-        return;
-    };
-    let completion_ratio_map = find_object_by_key_ci(value, "completion_ratio");
-    let cache_ratio_map = find_object_by_key_ci(value, "cache_ratio")
-        .or_else(|| find_object_by_key_ci(value, "cacheRatio"));
-    let source = newapi_ratio_source(source, quota_per_usd);
-
-    for (model, ratio_value) in model_ratio_map {
-        let model = model.trim();
-        if model.is_empty() {
-            continue;
-        }
-        let Some(model_ratio) = scalar_number(ratio_value) else {
-            continue;
-        };
-        let completion_ratio = completion_ratio_map
-            .and_then(|map| map_number_for_key_ci(map, model))
-            .unwrap_or(1.0)
-            .max(0.0);
-        let cache_ratio = cache_ratio_map
-            .and_then(|map| map_number_for_key_ci(map, model))
-            .unwrap_or(1.0)
-            .max(0.0);
-        let input = model_ratio.max(0.0) * 1_000_000.0 / quota_per_usd;
-        rules.push(PricingRule {
-            id: provider_price_rule_id(model),
-            provider_match: "*".to_string(),
-            model_match: model.to_string(),
-            input_per_million: input,
-            cached_input_per_million: input * cache_ratio,
-            output_per_million: input * completion_ratio,
-            reasoning_output_per_million: 0.0,
-            request_price: 0.0,
-            currency: "USD".to_string(),
-            source: source.clone(),
-        });
-    }
-}
-
-fn parse_newapi_pricing_value(value: &Value, source: &str, quota_per_usd: f64) -> Vec<PricingRule> {
-    let quota_per_usd = if quota_per_usd > 0.0 {
-        quota_per_usd
-    } else {
-        DEFAULT_NEW_API_QUOTA_PER_USD
-    };
-    let mut rules = Vec::new();
-    collect_newapi_record_rules(value, None, source, quota_per_usd, &mut rules);
-    if rules.is_empty() {
-        append_newapi_ratio_config_rules(value, source, quota_per_usd, &mut rules);
-    }
-    normalize_provider_pricing(rules)
 }
 
 fn normalize_model_names(models: Vec<String>) -> Vec<String> {
@@ -3620,7 +2803,7 @@ fn update_asset_for_platform<'a>(
 
 fn github_release_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .user_agent(format!("Codex Helper/{}", env!("CODEX_HELPER_VERSION")))
+        .user_agent(format!("XXSwitch/{}", env!("XXSWITCH_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(300))
         .build()
@@ -3642,7 +2825,7 @@ async fn fetch_latest_github_release() -> Result<GithubRelease, String> {
 }
 
 fn update_check_info(release: &GithubRelease) -> Result<UpdateCheckInfo, String> {
-    let current_version = env!("CODEX_HELPER_VERSION").to_string();
+    let current_version = env!("XXSWITCH_VERSION").to_string();
     let latest_version = release.tag_name.trim().to_string();
     let available = update_is_available(&current_version, &latest_version)?;
     let asset = available
@@ -3665,7 +2848,7 @@ fn update_download_path(asset_name: &str) -> Result<PathBuf, String> {
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "更新包文件名无效".to_string())?;
-    let directory = std::env::temp_dir().join("codex-helper-updates");
+    let directory = std::env::temp_dir().join("xxswitch-updates");
     fs::create_dir_all(&directory).map_err(|err| format!("无法创建更新下载目录: {err}"))?;
     let timestamp = current_epoch_ms().unwrap_or_default();
     Ok(directory.join(format!("{timestamp}-{file_name}")))
@@ -3927,10 +3110,10 @@ fn install_macos_update_from_dmg(
     }
 
     let work_dir = std::env::temp_dir()
-        .join("codex-helper-updates")
+        .join("xxswitch-updates")
         .join(format!("macos-{}", current_epoch_ms().unwrap_or_default()));
     let mount_dir = work_dir.join("mount");
-    let staged_app = work_dir.join("Codex Helper.app");
+    let staged_app = work_dir.join("XXSwitch.app");
     fs::create_dir_all(&mount_dir).map_err(|err| format!("无法创建 DMG 挂载目录: {err}"))?;
 
     run_macos_command(
@@ -3965,7 +3148,7 @@ fn install_macos_update_from_dmg(
 
     let current_app = current_app.expect("checked above");
     let target_app = if current_app.starts_with("/Volumes") {
-        PathBuf::from("/Applications/Codex Helper.app")
+        PathBuf::from("/Applications/XXSwitch.app")
     } else {
         current_app
     };
@@ -3973,7 +3156,7 @@ fn install_macos_update_from_dmg(
         .parent()
         .ok_or_else(|| "无法确定应用安装目录".to_string())?;
     let backup_app = target_parent.join(format!(
-        ".Codex Helper.app.codex-helper-backup-{}",
+        ".XXSwitch.app.xxswitch-backup-{}",
         current_epoch_ms().unwrap_or_default()
     ));
 
@@ -3990,7 +3173,7 @@ fn install_macos_update_from_dmg(
         .args([
             "-c",
             "sleep 1; exec /usr/bin/open \"$1\"",
-            "codex-helper-relaunch",
+            "xxswitch-relaunch",
         ])
         .arg(&target_app)
         .spawn()
@@ -4002,7 +3185,7 @@ fn install_macos_update_from_dmg(
         app_for_exit.exit(0);
     });
     Ok(UpdateInstallResult {
-        message: "更新已安装，Codex Helper 即将重启。".to_string(),
+        message: "更新已安装，XXSwitch 即将重启。".to_string(),
         manual_install: false,
     })
 }
@@ -4049,42 +3232,6 @@ fn merge_balance_config_draft(
         draft.query_token = provider.balance_query.query_token.clone();
     }
     normalize_balance_config(draft, provider)
-}
-
-fn newapi_pricing_auth_from_config(
-    provider: &ProviderConfig,
-    endpoint: &str,
-) -> Option<(String, String)> {
-    let config = normalize_balance_config(provider.balance_query.clone(), provider);
-    if !matches!(config.query_type, BalanceQueryType::NewApi) {
-        return None;
-    }
-    if newapi_endpoint_from_base_url(&config.endpoint) != endpoint {
-        return None;
-    }
-    let token = match config.auth_mode {
-        BalanceAuthMode::SeparateToken => config.query_token.trim().to_string(),
-        BalanceAuthMode::ProviderToken => String::new(),
-    };
-    let user_id = config.new_api_user_id.trim().to_string();
-    if token.is_empty() || user_id.is_empty() {
-        return None;
-    }
-    Some((token, user_id))
-}
-
-fn newapi_pricing_auth_for_endpoint(
-    state: &ManagerState,
-    provider: &ProviderConfig,
-    endpoint: &str,
-) -> Option<(String, String)> {
-    newapi_pricing_auth_from_config(provider, endpoint).or_else(|| {
-        state
-            .providers
-            .iter()
-            .filter(|candidate| candidate.id != provider.id)
-            .find_map(|candidate| newapi_pricing_auth_from_config(candidate, endpoint))
-    })
 }
 
 fn apply_provider_connection_draft(
@@ -4469,6 +3616,286 @@ async fn run_provider_connection_test(
     ProviderConnectionTestResult { ok, steps }
 }
 
+fn latency_error_message(status: reqwest::StatusCode, body: &str) -> String {
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.split_whitespace().collect::<Vec<_>>().join(" "));
+    let message = message.chars().take(240).collect::<String>();
+    if message.is_empty() {
+        format!("模型请求返回 HTTP {}", status.as_u16())
+    } else {
+        format!("模型请求返回 HTTP {}: {message}", status.as_u16())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LatencyResponseFormat {
+    Responses,
+    ChatCompletions,
+    ClaudeMessages,
+}
+
+#[derive(Debug)]
+struct ProviderLatencyProbe {
+    latency_ms: u64,
+    reply: String,
+}
+
+fn reply_from_response_value(value: &Value, format: LatencyResponseFormat) -> String {
+    match format {
+        LatencyResponseFormat::Responses => {
+            if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+                return text.to_string();
+            }
+            value
+                .get("output")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("content").and_then(json_string_content))
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        }
+        LatencyResponseFormat::ChatCompletions => value
+            .pointer("/choices/0/message/content")
+            .and_then(json_string_content)
+            .unwrap_or_default(),
+        LatencyResponseFormat::ClaudeMessages => value
+            .get("content")
+            .and_then(json_string_content)
+            .unwrap_or_default(),
+    }
+}
+
+fn reply_from_stream_event(value: &Value, format: LatencyResponseFormat) -> Option<String> {
+    match format {
+        LatencyResponseFormat::Responses => {
+            if value.get("type").and_then(Value::as_str) == Some("response.output_text.delta") {
+                return value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            value
+                .pointer("/choices/0/delta/content")
+                .and_then(json_string_content)
+        }
+        LatencyResponseFormat::ChatCompletions => value
+            .pointer("/choices/0/delta/content")
+            .and_then(json_string_content),
+        LatencyResponseFormat::ClaudeMessages => {
+            if value.get("type").and_then(Value::as_str) == Some("content_block_delta") {
+                return value
+                    .pointer("/delta/text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            None
+        }
+    }
+}
+
+fn reply_from_response_text(text: &str, format: LatencyResponseFormat, stream: bool) -> String {
+    if !stream {
+        return serde_json::from_str::<Value>(text)
+            .ok()
+            .map(|value| reply_from_response_value(&value, format))
+            .unwrap_or_default();
+    }
+
+    let mut reply = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(data) {
+            if let Some(delta) = reply_from_stream_event(&value, format) {
+                reply.push_str(&delta);
+            }
+        }
+    }
+    if reply.is_empty() {
+        serde_json::from_str::<Value>(text)
+            .ok()
+            .map(|value| reply_from_response_value(&value, format))
+            .unwrap_or_default()
+    } else {
+        reply
+    }
+}
+
+async fn finish_latency_request(
+    response: Result<reqwest::Response, reqwest::Error>,
+    started: Instant,
+    format: LatencyResponseFormat,
+    stream: bool,
+) -> Result<ProviderLatencyProbe, String> {
+    let response = response.map_err(|err| format!("模型请求失败: {err}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| format!("读取模型响应失败: {err}"))?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    if status.is_success() {
+        Ok(ProviderLatencyProbe {
+            latency_ms,
+            reply: reply_from_response_text(&body, format, stream),
+        })
+    } else {
+        Err(latency_error_message(status, &body))
+    }
+}
+
+async fn measure_codex_provider_latency(
+    provider: &ProviderConfig,
+    model: &str,
+    prompt: &str,
+    stream: bool,
+) -> Result<ProviderLatencyProbe, String> {
+    let base_url = custom_provider_base_url(provider)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Base URL 为空".to_string())?;
+    let token = custom_provider_token(provider)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "API Key 为空".to_string())?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|err| format!("创建 HTTP 客户端失败: {err}"))?;
+    let (path, format, mut body) = match provider.wire_api {
+        ProviderWireApi::Responses => (
+            "responses",
+            LatencyResponseFormat::Responses,
+            json!({
+                "model": model,
+                "input": prompt,
+                "max_output_tokens": 16,
+                "stream": stream,
+            }),
+        ),
+        ProviderWireApi::ChatCompletions => (
+            "chat/completions",
+            LatencyResponseFormat::ChatCompletions,
+            json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": prompt }],
+                "max_tokens": 16,
+                "stream": stream,
+            }),
+        ),
+    };
+    if !provider.service_tier.trim().is_empty() {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "service_tier".to_string(),
+                Value::String(provider.service_tier.trim().to_string()),
+            );
+        }
+    }
+
+    let started = Instant::now();
+    let response = client
+        .post(join_url(&base_url, path))
+        .bearer_auth(token.trim())
+        .header(
+            "accept",
+            if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        )
+        .json(&body)
+        .send()
+        .await;
+    finish_latency_request(response, started, format, stream).await
+}
+
+async fn measure_claude_provider_latency(
+    provider: &ClaudeProviderConfig,
+    model: &str,
+    prompt: &str,
+    stream: bool,
+) -> Result<ProviderLatencyProbe, String> {
+    let base_url = provider.base_url.trim();
+    if base_url.is_empty() {
+        return Err("Base URL 为空".to_string());
+    }
+    let api_key = provider.api_key.trim();
+    if api_key.is_empty() {
+        return Err("API Key 为空".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|err| format!("创建 HTTP 客户端失败: {err}"))?;
+    let body = json!({
+        "model": model,
+        "max_tokens": 16,
+        "messages": [{ "role": "user", "content": prompt }],
+        "stream": stream,
+    });
+    let started = Instant::now();
+    let response = client
+        .post(join_url(base_url, "messages"))
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header(
+            "accept",
+            if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        )
+        .json(&body)
+        .send()
+        .await;
+    finish_latency_request(
+        response,
+        started,
+        LatencyResponseFormat::ClaudeMessages,
+        stream,
+    )
+    .await
+}
+
+fn latency_connection_status(result: Result<u64, String>) -> ConnectionStatus {
+    match result {
+        Ok(latency_ms) => ConnectionStatus {
+            ok: true,
+            latency_ms: Some(latency_ms),
+            checked_at: now_epoch_seconds().ok(),
+            error: None,
+        },
+        Err(error) => ConnectionStatus {
+            ok: false,
+            latency_ms: None,
+            checked_at: now_epoch_seconds().ok(),
+            error: Some(error),
+        },
+    }
+}
+
 async fn fetch_provider_models(provider: &ProviderConfig) -> Result<(Vec<String>, u64), String> {
     let base_url = custom_provider_base_url(provider)
         .filter(|value| !value.trim().is_empty())
@@ -4651,7 +4078,7 @@ fn read_current_toml() -> Result<(DocumentMut, bool, String, bool), String> {
     }
 
     let raw = fs::read_to_string(&path).map_err(|err| format!("无法读取 Codex 配置: {err}"))?;
-    let marker_present = raw.contains(MARKER);
+    let marker_present = raw.contains(MARKER) || raw.contains(LEGACY_MARKER);
     let doc = raw
         .parse::<DocumentMut>()
         .map_err(|err| format!("Codex 配置 TOML 无效: {err}"))?;
@@ -5268,6 +4695,7 @@ fn render_pi_models_config(
     models: &[String],
 ) -> Result<String, String> {
     let providers = ensure_pi_providers_object(&mut config)?;
+    providers.remove(LEGACY_PI_PROVIDER_ID);
     providers.insert(
         PI_PROVIDER_ID.to_string(),
         pi_provider_value(router, models),
@@ -5280,6 +4708,7 @@ fn restore_pi_models_config(
     backup: Option<&PiApplyBackup>,
 ) -> Result<String, String> {
     let providers = ensure_pi_providers_object(&mut config)?;
+    providers.remove(LEGACY_PI_PROVIDER_ID);
     if let Some(backup) = backup {
         if backup.provider.existed {
             if let Some(value) = backup.provider.value.as_ref() {
@@ -5621,23 +5050,14 @@ fn openai_models_value(models: Vec<String>) -> Value {
                 "id": model,
                 "object": "model",
                 "created": 0,
-                "owned_by": "codex-helper"
+                "owned_by": "xxswitch"
             })
         })
         .collect::<Vec<_>>();
     json!({ "object": "list", "data": data })
 }
 
-fn load_codex_model_catalog_templates() -> Vec<Value> {
-    let Ok(path) = codex_home().map(|path| path.join("models_cache.json")) else {
-        return Vec::new();
-    };
-    let Ok(raw) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return Vec::new();
-    };
+fn codex_model_catalog_templates_from_value(value: &Value) -> Vec<Value> {
     value
         .get("models")
         .and_then(Value::as_array)
@@ -5645,32 +5065,197 @@ fn load_codex_model_catalog_templates() -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn is_gpt_5_6_model(model: &str) -> bool {
+fn read_codex_model_catalog_templates(path: &Path) -> Vec<Value> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    codex_model_catalog_templates_from_value(&value)
+}
+
+fn load_cached_codex_model_catalog_templates() -> Vec<Value> {
+    let Ok(path) = codex_home().map(|path| path.join("models_cache.json")) else {
+        return Vec::new();
+    };
+    read_codex_model_catalog_templates(&path)
+}
+
+fn codex_cli_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut push = |path: PathBuf| {
+        if !path.as_os_str().is_empty() && seen.insert(path.clone()) {
+            candidates.push(path);
+        }
+    };
+
+    if let Some(path) = std::env::var_os("CODEX_CLI_PATH") {
+        push(PathBuf::from(path));
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            #[cfg(target_os = "windows")]
+            push(parent.join("codex.exe"));
+            #[cfg(not(target_os = "windows"))]
+            push(parent.join("codex"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        for app_name in ["ChatGPT.app", "Codex.app"] {
+            push(
+                Path::new("/Applications")
+                    .join(app_name)
+                    .join("Contents/Resources/codex"),
+            );
+        }
+        if let Ok(home) = home_dir() {
+            for app_name in ["ChatGPT.app", "Codex.app"] {
+                push(
+                    home.join("Applications")
+                        .join(app_name)
+                        .join("Contents/Resources/codex"),
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let local_app_data = PathBuf::from(local_app_data);
+            for app_name in ["ChatGPT", "Codex"] {
+                push(
+                    local_app_data
+                        .join("Programs")
+                        .join(app_name)
+                        .join("resources/codex.exe"),
+                );
+                push(local_app_data.join(app_name).join("resources/codex.exe"));
+            }
+        }
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            let program_files = PathBuf::from(program_files);
+            for app_name in ["ChatGPT", "Codex"] {
+                push(program_files.join(app_name).join("resources/codex.exe"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    push(PathBuf::from("codex.exe"));
+    #[cfg(not(target_os = "windows"))]
+    push(PathBuf::from("codex"));
+
+    candidates
+}
+
+fn load_bundled_codex_model_catalog_templates() -> Vec<Value> {
+    for candidate in codex_cli_candidates() {
+        let Ok(output) = Command::new(candidate)
+            .args(["debug", "models", "--bundled"])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
+            continue;
+        };
+        let templates = codex_model_catalog_templates_from_value(&value);
+        if !templates.is_empty() {
+            return templates;
+        }
+    }
+    Vec::new()
+}
+
+fn merge_codex_model_catalog_templates(preferred: Vec<Value>, fallback: Vec<Value>) -> Vec<Value> {
+    let mut seen = BTreeSet::new();
+    let mut merged = Vec::with_capacity(preferred.len() + fallback.len());
+    for entry in preferred.into_iter().chain(fallback) {
+        if let Some(slug) = entry.get("slug").and_then(Value::as_str) {
+            if !seen.insert(slug.trim().to_ascii_lowercase()) {
+                continue;
+            }
+        }
+        merged.push(entry);
+    }
+    merged
+}
+
+fn load_codex_model_catalog_templates() -> Vec<Value> {
+    static TEMPLATES: OnceLock<Vec<Value>> = OnceLock::new();
+    TEMPLATES
+        .get_or_init(|| {
+            merge_codex_model_catalog_templates(
+                load_bundled_codex_model_catalog_templates(),
+                load_cached_codex_model_catalog_templates(),
+            )
+        })
+        .clone()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexGpt56Variant {
+    Generic,
+    Sol,
+    Terra,
+    Luna,
+}
+
+fn codex_gpt_5_6_variant(model: &str) -> Option<CodexGpt56Variant> {
     let model = model.trim().to_ascii_lowercase();
-    model == "gpt-5.6" || model.starts_with("gpt-5.6-")
+    match model.as_str() {
+        "gpt-5.6" => Some(CodexGpt56Variant::Generic),
+        "gpt-5.6-sol" => Some(CodexGpt56Variant::Sol),
+        "gpt-5.6-terra" => Some(CodexGpt56Variant::Terra),
+        "gpt-5.6-luna" => Some(CodexGpt56Variant::Luna),
+        _ if model.starts_with("gpt-5.6-") => Some(CodexGpt56Variant::Generic),
+        _ => None,
+    }
+}
+
+fn is_gpt_5_6_model(model: &str) -> bool {
+    codex_gpt_5_6_variant(model).is_some()
 }
 
 fn codex_reasoning_level_specs(model: &str) -> Vec<(&'static str, &'static str)> {
     let mut levels = vec![
         ("low", "Fast responses with lighter reasoning"),
-        ("medium", "Balances speed and reasoning depth"),
-        ("high", "Greater reasoning depth for complex work"),
-        ("xhigh", "Extra high reasoning depth for complex work"),
+        (
+            "medium",
+            "Balances speed and reasoning depth for everyday tasks",
+        ),
+        ("high", "Greater reasoning depth for complex problems"),
+        ("xhigh", "Extra high reasoning depth for complex problems"),
     ];
-    if is_gpt_5_6_model(model) {
-        levels.extend([
-            ("max", "Maximum reasoning depth for the hardest tasks"),
-            (
-                "ultra",
-                "Maximum reasoning with parallel agent support for long-running tasks",
-            ),
-        ]);
+    if let Some(variant) = codex_gpt_5_6_variant(model) {
+        levels.push(("max", "Maximum reasoning depth for the hardest problems"));
+        if variant != CodexGpt56Variant::Luna {
+            levels.push(("ultra", "Maximum reasoning with automatic task delegation"));
+        }
     }
     levels
 }
 
 fn codex_reasoning_level_entry(effort: &str, description: &str) -> Value {
     json!({ "effort": effort, "description": description })
+}
+
+fn codex_reasoning_efforts_equal(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn codex_reasoning_effort_allowed(model: &str, effort: &str) -> bool {
+    !matches!(codex_gpt_5_6_variant(model), Some(CodexGpt56Variant::Luna))
+        || !effort.trim().eq_ignore_ascii_case("ultra")
 }
 
 fn apply_codex_model_reasoning_levels(model: &str, object: &mut Map<String, Value>) {
@@ -5693,7 +5278,7 @@ fn apply_codex_model_reasoning_levels(model: &str, object: &mut Map<String, Valu
                     entry
                         .get("effort")
                         .and_then(Value::as_str)
-                        .is_some_and(|value| value.eq_ignore_ascii_case(effort))
+                        .is_some_and(|value| codex_reasoning_efforts_equal(value, effort))
                 })
                 .cloned()
                 .unwrap_or_else(|| codex_reasoning_level_entry(effort, description))
@@ -5704,11 +5289,14 @@ fn apply_codex_model_reasoning_levels(model: &str, object: &mut Map<String, Valu
         let Some(effort) = entry.get("effort").and_then(Value::as_str) else {
             continue;
         };
+        if !codex_reasoning_effort_allowed(model, effort) {
+            continue;
+        }
         if levels.iter().any(|existing| {
             existing
                 .get("effort")
                 .and_then(Value::as_str)
-                .is_some_and(|value| value.eq_ignore_ascii_case(effort))
+                .is_some_and(|value| codex_reasoning_efforts_equal(value, effort))
         }) {
             continue;
         }
@@ -5721,6 +5309,44 @@ fn apply_codex_model_reasoning_levels(model: &str, object: &mut Map<String, Valu
     );
 }
 
+fn apply_codex_gpt_5_6_profile(model: &str, object: &mut Map<String, Value>) {
+    let Some(variant) = codex_gpt_5_6_variant(model) else {
+        return;
+    };
+    let (display_name, default_reasoning_level, multi_agent_version) = match variant {
+        CodexGpt56Variant::Sol => ("GPT-5.6-Sol".to_string(), "low", "v2"),
+        CodexGpt56Variant::Terra => ("GPT-5.6-Terra".to_string(), "medium", "v2"),
+        CodexGpt56Variant::Luna => ("GPT-5.6-Luna".to_string(), "medium", "v1"),
+        CodexGpt56Variant::Generic => {
+            let display_name = if model.trim().eq_ignore_ascii_case("gpt-5.6") {
+                "GPT-5.6".to_string()
+            } else {
+                model.trim().to_string()
+            };
+            (display_name, "medium", "v2")
+        }
+    };
+
+    object.insert("display_name".to_string(), Value::String(display_name));
+    object.insert(
+        "default_reasoning_level".to_string(),
+        Value::String(default_reasoning_level.to_string()),
+    );
+    object.insert(
+        "multi_agent_version".to_string(),
+        Value::String(multi_agent_version.to_string()),
+    );
+    object.insert("use_responses_lite".to_string(), Value::Bool(true));
+    object.insert(
+        "tool_mode".to_string(),
+        Value::String("code_mode_only".to_string()),
+    );
+    object.insert(
+        "supports_parallel_tool_calls".to_string(),
+        Value::Bool(true),
+    );
+}
+
 fn fallback_codex_model_catalog_entry(model: &str) -> Value {
     let supported_reasoning_levels = codex_reasoning_level_specs(model)
         .into_iter()
@@ -5729,7 +5355,7 @@ fn fallback_codex_model_catalog_entry(model: &str) -> Value {
     json!({
         "slug": model,
         "display_name": model,
-        "description": "Routed by Codex Helper.",
+        "description": "Routed by XXSwitch.",
         "default_reasoning_level": "medium",
         "supported_reasoning_levels": supported_reasoning_levels,
         "shell_type": "shell_command",
@@ -5785,15 +5411,32 @@ fn apply_codex_model_context_fields(object: &mut Map<String, Value>) {
 }
 
 fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Value {
-    let mut entry = templates
-        .iter()
-        .find(|entry| {
-            entry
-                .get("slug")
-                .and_then(Value::as_str)
-                .is_some_and(|slug| slug.eq_ignore_ascii_case(model))
-        })
+    let exact_template = templates.iter().find(|entry| {
+        entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| slug.eq_ignore_ascii_case(model))
+    });
+    let matched_exact_template = exact_template.is_some();
+    let mut entry = exact_template
         .cloned()
+        .or_else(|| {
+            if !is_gpt_5_6_model(model) {
+                return None;
+            }
+            templates
+                .iter()
+                .find(|entry| {
+                    entry
+                        .get("slug")
+                        .and_then(Value::as_str)
+                        .is_some_and(|slug| {
+                            slug.eq_ignore_ascii_case("gpt-5.6-sol")
+                                || slug.eq_ignore_ascii_case("gpt-5.6-terra")
+                        })
+                })
+                .cloned()
+        })
         .or_else(|| {
             templates
                 .iter()
@@ -5801,7 +5444,10 @@ fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Value {
                     entry
                         .get("slug")
                         .and_then(Value::as_str)
-                        .is_some_and(|slug| slug == "gpt-5.4" || slug == "gpt-5.5")
+                        .is_some_and(|slug| {
+                            slug.eq_ignore_ascii_case("gpt-5.4")
+                                || slug.eq_ignore_ascii_case("gpt-5.5")
+                        })
                 })
                 .cloned()
         })
@@ -5810,8 +5456,15 @@ fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Value {
 
     if let Some(object) = entry.as_object_mut() {
         object.insert("slug".to_string(), Value::String(model.to_string()));
-        object.insert("display_name".to_string(), Value::String(model.to_string()));
+        let has_display_name = object
+            .get("display_name")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !matched_exact_template || !has_display_name {
+            object.insert("display_name".to_string(), Value::String(model.to_string()));
+        }
         apply_codex_model_reasoning_levels(model, object);
+        apply_codex_gpt_5_6_profile(model, object);
         apply_codex_model_context_fields(object);
         object.insert("visibility".to_string(), Value::String("list".to_string()));
         object.insert("supported_in_api".to_string(), Value::Bool(true));
@@ -7655,24 +7308,6 @@ fn finish_route_log(
 ) {
     let total_ms = pending.start.elapsed().as_millis() as u64;
     let (day, hour) = timestamp_to_route_parts(pending.started_at_ms);
-    let pricing_model = pending
-        .upstream_model
-        .as_deref()
-        .unwrap_or(pending.model.as_str());
-    let cost = estimate_cost(
-        &default_pricing_rules(),
-        &pending.provider_id,
-        &pending.provider_name,
-        pricing_model,
-        &usage,
-    );
-    let provider_cost = estimate_provider_cost(
-        &pending.provider_pricing,
-        &pending.provider_id,
-        &pending.provider_name,
-        pricing_model,
-        &usage,
-    );
     let status = if pending.error.is_some() || !status_success {
         "failed"
     } else {
@@ -7706,16 +7341,6 @@ fn finish_route_log(
         output_tokens: usage.output_tokens,
         reasoning_output_tokens: usage.reasoning_output_tokens,
         total_tokens: usage.total_tokens,
-        estimated_cost: cost.amount,
-        currency: cost.currency,
-        cost_breakdown: cost.breakdown,
-        pricing_model_match: cost.pricing_model_match,
-        pricing_source: cost.pricing_source,
-        provider_estimated_cost: provider_cost.amount,
-        provider_currency: provider_cost.currency,
-        provider_cost_breakdown: provider_cost.breakdown,
-        provider_pricing_model_match: provider_cost.pricing_model_match,
-        provider_pricing_source: provider_cost.pricing_source,
         first_byte_ms,
         total_ms,
     };
@@ -7774,7 +7399,6 @@ fn build_pending_route_log(
         route_attempts,
         error,
         start,
-        provider_pricing: candidate.provider.provider_pricing.clone(),
     }
 }
 
@@ -8959,302 +8583,6 @@ async fn fetch_newapi_quota_per_unit(client: &reqwest::Client, endpoint: &str) -
         .or_else(|| number_at_path(&body, &["quota_per_unit"]))
 }
 
-async fn fetch_newapi_json(
-    client: &reqwest::Client,
-    endpoint: &str,
-    path: &str,
-    token: Option<&str>,
-    user_id: Option<&str>,
-) -> Result<Value, String> {
-    let url = join_url(endpoint, path);
-    let mut request = client.get(url).header("accept", "application/json");
-    if let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) {
-        request = request.bearer_auth(token);
-    }
-    if let Some(user_id) = user_id.map(str::trim).filter(|user_id| !user_id.is_empty()) {
-        request = request.header("New-Api-User", user_id);
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|err| format!("请求 {path} 失败: {err}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("{path} 返回 HTTP {}", status.as_u16()));
-    }
-    response
-        .json::<Value>()
-        .await
-        .map_err(|err| format!("{path} 响应不是有效 JSON: {err}"))
-}
-
-fn newapi_failure_message(value: &Value) -> Option<String> {
-    let success = value.get("success").and_then(Value::as_bool)?;
-    if success {
-        return None;
-    }
-    value
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("error").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .map(str::to_string)
-        .or_else(|| Some("接口返回 success=false".to_string()))
-}
-
-fn bearer_token_core(token: &str) -> String {
-    token
-        .trim()
-        .strip_prefix("Bearer ")
-        .or_else(|| token.trim().strip_prefix("bearer "))
-        .unwrap_or_else(|| token.trim())
-        .strip_prefix("sk-")
-        .unwrap_or_else(|| {
-            token
-                .trim()
-                .strip_prefix("Bearer ")
-                .or_else(|| token.trim().strip_prefix("bearer "))
-                .unwrap_or_else(|| token.trim())
-        })
-        .to_string()
-}
-
-fn masked_key_matches(masked: &str, full_token: &str) -> bool {
-    let masked = masked.trim().strip_prefix("sk-").unwrap_or(masked.trim());
-    let token = bearer_token_core(full_token);
-    if masked.is_empty() || token.is_empty() {
-        return false;
-    }
-    if masked == token {
-        return true;
-    }
-    if token.len() <= 8 {
-        return false;
-    }
-    let prefix = &token[..4];
-    let suffix = &token[token.len() - 4..];
-    masked.starts_with(prefix) && masked.ends_with(suffix)
-}
-
-fn value_array_at<'a>(value: &'a Value, paths: &[&[&str]]) -> Option<&'a Vec<Value>> {
-    paths
-        .iter()
-        .find_map(|path| value_at_path(value, path).and_then(Value::as_array))
-}
-
-fn group_ratio_for_pricing_record(
-    record: &Map<String, Value>,
-    group_ratios: &Map<String, Value>,
-    key_group: &str,
-) -> f64 {
-    let key_group = key_group.trim();
-    let groups = record
-        .get("enable_groups")
-        .or_else(|| record.get("enable_group"))
-        .and_then(Value::as_array)
-        .map(|groups| {
-            groups
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|group| !group.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    if !key_group.is_empty() && groups.iter().any(|group| *group == key_group) {
-        return map_number_for_key_ci(group_ratios, key_group).unwrap_or(1.0);
-    }
-
-    groups
-        .iter()
-        .filter_map(|group| map_number_for_key_ci(group_ratios, group))
-        .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or_else(|| {
-            if key_group.is_empty() {
-                1.0
-            } else {
-                map_number_for_key_ci(group_ratios, key_group).unwrap_or(1.0)
-            }
-        })
-}
-
-fn group_ratio_for_key(group_ratios: &Map<String, Value>, key_group: &str) -> Option<f64> {
-    let key_group = key_group.trim();
-    if key_group.is_empty() {
-        return None;
-    }
-    map_number_for_key_ci(group_ratios, key_group)
-}
-
-fn apply_pricing_multiplier(mut rule: PricingRule, multiplier: f64, group: &str) -> PricingRule {
-    let multiplier = if multiplier.is_finite() && multiplier >= 0.0 {
-        multiplier
-    } else {
-        1.0
-    };
-    rule.input_per_million *= multiplier;
-    rule.cached_input_per_million *= multiplier;
-    rule.output_per_million *= multiplier;
-    rule.reasoning_output_per_million *= multiplier;
-    rule.request_price *= multiplier;
-    if multiplier != 1.0 || !group.trim().is_empty() {
-        let group = if group.trim().is_empty() {
-            "默认分组"
-        } else {
-            group.trim()
-        };
-        rule.source = format!("{} · group {group} × {multiplier:.4}", rule.source);
-    }
-    rule
-}
-
-fn parse_newapi_pricing_with_group(
-    value: &Value,
-    source: &str,
-    quota_per_usd: f64,
-    key_group: &str,
-) -> Vec<PricingRule> {
-    let Some(items) = value_array_at(value, &[&["data"], &["pricing"], &["prices"]]) else {
-        return parse_newapi_pricing_value(value, source, quota_per_usd);
-    };
-    let Some(group_ratios) = value.get("group_ratio").and_then(Value::as_object) else {
-        return parse_newapi_pricing_value(value, source, quota_per_usd);
-    };
-    let key_group_ratio = group_ratio_for_key(group_ratios, key_group);
-
-    let quota_per_usd = if quota_per_usd > 0.0 {
-        quota_per_usd
-    } else {
-        DEFAULT_NEW_API_QUOTA_PER_USD
-    };
-    let mut pricing = Vec::new();
-    for item in items {
-        let Some(record) = item.as_object() else {
-            continue;
-        };
-        let Some(rule) = newapi_rule_from_record(None, record, source, quota_per_usd) else {
-            continue;
-        };
-        let multiplier = key_group_ratio
-            .unwrap_or_else(|| group_ratio_for_pricing_record(record, group_ratios, key_group));
-        pricing.push(apply_pricing_multiplier(rule, multiplier, key_group));
-    }
-    normalize_provider_pricing(pricing)
-}
-
-fn token_group_from_list(value: &Value, provider_token: &str) -> Option<String> {
-    let items = value_array_at(
-        value,
-        &[
-            &["data", "items"],
-            &["items"],
-            &["data", "tokens"],
-            &["tokens"],
-        ],
-    )?;
-    for item in items {
-        let Some(map) = item.as_object() else {
-            continue;
-        };
-        let masked = object_string_ci(map, &["key", "token"])?;
-        if masked_key_matches(&masked, provider_token) {
-            return object_string_ci(map, &["group", "token_group"]);
-        }
-    }
-    None
-}
-
-async fn fetch_newapi_token_group(
-    client: &reqwest::Client,
-    endpoint: &str,
-    auth: Option<(&str, &str)>,
-    provider_token: &str,
-) -> Option<String> {
-    let (token, user_id) = auth?;
-    let body = fetch_newapi_json(
-        client,
-        endpoint,
-        "/api/token/search?page=1&page_size=100",
-        Some(token),
-        Some(user_id),
-    )
-    .await
-    .ok()?;
-    token_group_from_list(&body, provider_token)
-}
-
-async fn fetch_newapi_provider_pricing(
-    provider: &ProviderConfig,
-    auth: Option<(String, String)>,
-) -> Result<ProviderPricingSyncData, String> {
-    let base_url = custom_provider_base_url(provider)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "Base URL 为空".to_string())?;
-    let endpoint = newapi_endpoint_from_base_url(&base_url);
-    if endpoint.trim().is_empty() {
-        return Err("New API 地址为空".to_string());
-    }
-    let auth_ref = auth
-        .as_ref()
-        .map(|(token, user_id)| (token.as_str(), user_id.as_str()));
-    let provider_token = custom_provider_token(provider).unwrap_or_default();
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|err| format!("创建 HTTP 客户端失败: {err}"))?;
-    let quota_per_usd = fetch_newapi_quota_per_unit(&client, &endpoint)
-        .await
-        .filter(|value| *value > 0.0)
-        .unwrap_or(DEFAULT_NEW_API_QUOTA_PER_USD);
-    let key_group = fetch_newapi_token_group(&client, &endpoint, auth_ref, &provider_token)
-        .await
-        .unwrap_or_default();
-
-    let attempts = [
-        ("/api/pricing", "New API /api/pricing", auth_ref),
-        ("/api/ratio_config", "New API /api/ratio_config", None),
-    ];
-    let mut errors = Vec::new();
-    for (path, source, request_auth) in attempts {
-        let (request_token, request_user_id) = request_auth
-            .map(|(token, user_id)| (Some(token), Some(user_id)))
-            .unwrap_or((None, None));
-        match fetch_newapi_json(&client, &endpoint, path, request_token, request_user_id).await {
-            Ok(body) => {
-                if let Some(message) = newapi_failure_message(&body) {
-                    errors.push(format!("{path} 返回失败: {message}"));
-                    continue;
-                }
-                let pricing =
-                    parse_newapi_pricing_with_group(&body, source, quota_per_usd, &key_group);
-                if !pricing.is_empty() {
-                    let group_ratio = body
-                        .get("group_ratio")
-                        .and_then(Value::as_object)
-                        .and_then(|ratios| map_number_for_key_ci(ratios, &key_group))
-                        .unwrap_or(1.0);
-                    let pricing_count = pricing.len();
-                    return Ok(ProviderPricingSyncData {
-                        pricing,
-                        group: key_group,
-                        group_ratio,
-                        pricing_count,
-                    });
-                }
-                errors.push(format!("{path} 未解析到可用价格"));
-            }
-            Err(err) => errors.push(err),
-        }
-    }
-
-    Err(format!("未能从 New API 同步价格：{}", errors.join("；")))
-}
-
 async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
     let config = normalize_balance_config(provider.balance_query.clone(), provider);
     let checked_at = now_epoch_seconds().ok();
@@ -9431,39 +8759,6 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
         checked_at,
         error: Some("未识别余额字段".to_string()),
     }
-}
-
-fn collect_jsonl_files(dir: PathBuf, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    if !dir.exists() {
-        return Ok(());
-    }
-
-    for entry in
-        fs::read_dir(&dir).map_err(|err| format!("无法读取目录 {}: {err}", dir.display()))?
-    {
-        let entry = entry.map_err(|err| format!("无法读取目录项: {err}"))?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_jsonl_files(path, out)?;
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-            out.push(path);
-        }
-    }
-
-    Ok(())
-}
-
-fn timestamp_to_local_parts(timestamp: DateTime<Utc>) -> (String, String) {
-    let local = timestamp.with_timezone(&Local);
-    (
-        format!(
-            "{:04}-{:02}-{:02}",
-            local.year(),
-            local.month(),
-            local.day()
-        ),
-        format!("{:04}-{:02}", local.year(), local.month()),
-    )
 }
 
 fn timestamp_to_route_parts(timestamp_ms: i64) -> (String, String) {
@@ -9711,16 +9006,6 @@ fn record_provider_failure(
     }
 }
 
-fn usage_from_route_log(log: &RouteRequestLog) -> TokenUsage {
-    TokenUsage {
-        input_tokens: log.input_tokens,
-        cached_input_tokens: log.cached_input_tokens,
-        output_tokens: log.output_tokens,
-        reasoning_output_tokens: log.reasoning_output_tokens,
-        total_tokens: log.total_tokens,
-    }
-}
-
 fn route_log_matches_filter(log: &RouteRequestLog, filter: &RouteLogFilter) -> bool {
     if let Some(query) = normalize_route_filter_text(filter.query.clone()) {
         let query = query.to_lowercase();
@@ -9766,11 +9051,14 @@ fn route_log_matches_filter(log: &RouteRequestLog, filter: &RouteLogFilter) -> b
     true
 }
 
-fn add_route_log_usage(summary: &mut UsageSummary, log: &RouteRequestLog) {
-    if summary.request_count == 0 {
-        summary.currency = log.currency.clone();
-    }
-    add_usage(summary, &usage_from_route_log(log), log.estimated_cost);
+fn add_route_log_usage(summary: &mut RouteUsageSummary, log: &RouteRequestLog) {
+    summary.request_count += 1;
+    summary.input_tokens += log.input_tokens;
+    summary.uncached_input_tokens += log.uncached_input_tokens;
+    summary.cached_input_tokens += log.cached_input_tokens;
+    summary.output_tokens += log.output_tokens;
+    summary.reasoning_output_tokens += log.reasoning_output_tokens;
+    summary.total_tokens += log.total_tokens;
 }
 
 fn is_success_route_log(log: &RouteRequestLog) -> bool {
@@ -9843,7 +9131,6 @@ fn route_breakdown_by(
                 cached_input_tokens: 0,
                 output_tokens: 0,
                 total_tokens: 0,
-                estimated_cost: 0.0,
             });
         entry.request_count += 1;
         entry.input_tokens += log.input_tokens;
@@ -9851,43 +9138,10 @@ fn route_breakdown_by(
         entry.cached_input_tokens += log.cached_input_tokens;
         entry.output_tokens += log.output_tokens;
         entry.total_tokens += log.total_tokens;
-        entry.estimated_cost += log.estimated_cost;
     }
     let mut rows = map.into_values().collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        right
-            .estimated_cost
-            .partial_cmp(&left.estimated_cost)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| right.request_count.cmp(&left.request_count))
-    });
+    rows.sort_by(|left, right| right.request_count.cmp(&left.request_count));
     rows
-}
-
-fn provider_cost_for_range(
-    logs: &[RouteRequestLog],
-    provider_id: &str,
-    day_key: &str,
-    month_key: &str,
-) -> (f64, f64, String) {
-    let mut today_cost = 0.0;
-    let mut month_cost = 0.0;
-    let mut currency = default_currency();
-    for log in logs
-        .iter()
-        .filter(|log| log.provider_id == provider_id && is_success_route_log(log))
-    {
-        if !log.provider_currency.trim().is_empty() {
-            currency = log.provider_currency.clone();
-        }
-        if log.day == day_key {
-            today_cost += log.provider_estimated_cost;
-        }
-        if log.day.starts_with(month_key) {
-            month_cost += log.provider_estimated_cost;
-        }
-    }
-    (today_cost, month_cost, currency)
 }
 
 fn route_bucket_label(log: &RouteRequestLog, filter: &RouteLogFilter) -> (String, String) {
@@ -9953,8 +9207,8 @@ fn build_route_usage_stats(
         .collect::<Vec<_>>();
     let now = Local::now();
     let today_key = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
-    let mut summary = UsageSummary::default();
-    let mut today = UsageSummary::default();
+    let mut summary = RouteUsageSummary::default();
+    let mut today = RouteUsageSummary::default();
     let mut failed_count = 0;
     let mut success_count = 0;
     let mut running_count = 0;
@@ -10000,7 +9254,6 @@ fn build_route_usage_stats(
                 cached_input_tokens: 0,
                 output_tokens: 0,
                 total_tokens: 0,
-                estimated_cost: 0.0,
             });
         entry.request_count += 1;
         entry.input_tokens += log.input_tokens;
@@ -10008,7 +9261,6 @@ fn build_route_usage_stats(
         entry.cached_input_tokens += log.cached_input_tokens;
         entry.output_tokens += log.output_tokens;
         entry.total_tokens += log.total_tokens;
-        entry.estimated_cost += log.estimated_cost;
     }
 
     let page_size = normalized_page_size(filter.page_size);
@@ -10080,14 +9332,6 @@ fn build_route_usage_stats(
     })
 }
 
-fn parse_event_timestamp(value: &Value) -> Option<DateTime<Utc>> {
-    value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-}
-
 fn usage_from_value(value: &Value) -> TokenUsage {
     let input_tokens = scalar_number_at_path(value, &["input_tokens"])
         .or_else(|| scalar_number_at_path(value, &["prompt_tokens"]))
@@ -10126,571 +9370,6 @@ fn usage_is_zero(usage: &TokenUsage) -> bool {
         && usage.total_tokens == 0
 }
 
-fn usage_delta(current: &TokenUsage, previous: Option<&TokenUsage>) -> TokenUsage {
-    if let Some(previous) = previous {
-        TokenUsage {
-            input_tokens: current.input_tokens.saturating_sub(previous.input_tokens),
-            cached_input_tokens: current
-                .cached_input_tokens
-                .saturating_sub(previous.cached_input_tokens),
-            output_tokens: current.output_tokens.saturating_sub(previous.output_tokens),
-            reasoning_output_tokens: current
-                .reasoning_output_tokens
-                .saturating_sub(previous.reasoning_output_tokens),
-            total_tokens: current.total_tokens.saturating_sub(previous.total_tokens),
-        }
-    } else {
-        current.clone()
-    }
-}
-
-fn add_usage(summary: &mut UsageSummary, usage: &TokenUsage, cost: f64) {
-    summary.request_count += 1;
-    summary.input_tokens += usage.input_tokens;
-    summary.uncached_input_tokens += usage
-        .input_tokens
-        .saturating_sub(usage.cached_input_tokens)
-        .max(0);
-    summary.cached_input_tokens += usage.cached_input_tokens;
-    summary.output_tokens += usage.output_tokens;
-    summary.reasoning_output_tokens += usage.reasoning_output_tokens;
-    summary.total_tokens += usage.total_tokens;
-    summary.estimated_cost += cost;
-}
-
-fn add_event_usage(summary: &mut UsageSummary, event: &UsageEvent) {
-    if summary.request_count == 0 {
-        summary.currency = event.currency.clone();
-    }
-    add_usage(summary, &event.usage, event.estimated_cost);
-}
-
-fn matches_pricing_pattern(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.trim().to_lowercase();
-    let value = value.trim().to_lowercase();
-
-    if pattern.is_empty() || pattern == "*" {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return value.starts_with(prefix);
-    }
-    pattern == value
-}
-
-fn pricing_specificity(pattern: &str) -> i32 {
-    let pattern = pattern.trim();
-    if pattern.is_empty() || pattern == "*" {
-        0
-    } else if pattern.ends_with('*') {
-        100 + pattern.trim_end_matches('*').len() as i32
-    } else {
-        10_000 + pattern.len() as i32
-    }
-}
-
-fn select_pricing_rule<'a>(
-    pricing: &'a [PricingRule],
-    provider_key: &str,
-    provider_name: &str,
-    model: &str,
-) -> Option<&'a PricingRule> {
-    pricing
-        .iter()
-        .filter(|rule| {
-            let provider_matches = matches_pricing_pattern(&rule.provider_match, provider_key)
-                || matches_pricing_pattern(&rule.provider_match, provider_name);
-            provider_matches && matches_pricing_pattern(&rule.model_match, model)
-        })
-        .max_by_key(|rule| {
-            pricing_specificity(&rule.provider_match) + pricing_specificity(&rule.model_match) * 2
-        })
-}
-
-fn estimate_cost(
-    pricing: &[PricingRule],
-    provider_key: &str,
-    provider_name: &str,
-    model: &str,
-    usage: &TokenUsage,
-) -> CostEstimate {
-    let rule = select_pricing_rule(pricing, provider_key, provider_name, model).cloned();
-    let rule = rule.unwrap_or_else(|| PricingRule {
-        id: "unpriced".to_string(),
-        provider_match: "*".to_string(),
-        model_match: "未匹配官方 GPT 价格".to_string(),
-        input_per_million: 0.0,
-        cached_input_per_million: 0.0,
-        output_per_million: 0.0,
-        reasoning_output_per_million: 0.0,
-        request_price: 0.0,
-        currency: "USD".to_string(),
-        source: "未匹配到 OpenAI GPT 官方价格，按 0 估算".to_string(),
-    });
-
-    let million = 1_000_000.0;
-    let billable_input_tokens = usage
-        .input_tokens
-        .saturating_sub(usage.cached_input_tokens)
-        .max(0);
-    let input_cost = billable_input_tokens as f64 / million * rule.input_per_million;
-    let cached_input_cost =
-        usage.cached_input_tokens as f64 / million * rule.cached_input_per_million;
-    let output_cost = usage.output_tokens as f64 / million * rule.output_per_million;
-    let reasoning_cost =
-        usage.reasoning_output_tokens as f64 / million * rule.reasoning_output_per_million;
-    let request_cost = rule.request_price.max(0.0);
-    let cost = input_cost + cached_input_cost + output_cost + reasoning_cost + request_cost;
-    let source = if rule.source.trim().is_empty() {
-        "OpenAI API pricing, USD per 1M tokens".to_string()
-    } else {
-        rule.source.clone()
-    };
-    let mut breakdown = vec![
-        format!(
-            "模型匹配: {}",
-            if rule.model_match.trim().is_empty() {
-                "未匹配"
-            } else {
-                rule.model_match.as_str()
-            }
-        ),
-        format!(
-            "输入: {} tokens × ${:.4}/1M = ${:.6}",
-            billable_input_tokens, rule.input_per_million, input_cost
-        ),
-        format!(
-            "缓存输入: {} tokens × ${:.4}/1M = ${:.6}",
-            usage.cached_input_tokens, rule.cached_input_per_million, cached_input_cost
-        ),
-        format!(
-            "输出: {} tokens × ${:.4}/1M = ${:.6}",
-            usage.output_tokens, rule.output_per_million, output_cost
-        ),
-    ];
-    if request_cost > 0.0 {
-        breakdown.push(format!("固定请求: ${request_cost:.6}/次"));
-    }
-    if usage.reasoning_output_tokens > 0 {
-        if rule.reasoning_output_per_million > 0.0 {
-            breakdown.push(format!(
-                "推理输出: {} tokens × ${:.4}/1M = ${:.6}",
-                usage.reasoning_output_tokens, rule.reasoning_output_per_million, reasoning_cost
-            ));
-        } else {
-            breakdown.push(format!(
-                "推理输出: {} tokens，作为输出细分展示，不重复计费",
-                usage.reasoning_output_tokens
-            ));
-        }
-    }
-    breakdown.push(format!("合计: ${cost:.6} {}", rule.currency));
-    breakdown.push(format!("来源: {source}"));
-
-    CostEstimate {
-        amount: cost,
-        currency: rule.currency,
-        breakdown: breakdown.join("\n"),
-        pricing_model_match: rule.model_match,
-        pricing_source: source,
-    }
-}
-
-fn estimate_provider_cost(
-    provider_pricing: &[PricingRule],
-    provider_key: &str,
-    provider_name: &str,
-    model: &str,
-    usage: &TokenUsage,
-) -> CostEstimate {
-    if provider_pricing.is_empty() {
-        return CostEstimate {
-            amount: 0.0,
-            currency: default_currency(),
-            breakdown: "未配置供应商价格，按 0 估算".to_string(),
-            pricing_model_match: "未配置供应商价格".to_string(),
-            pricing_source: "未配置供应商价格".to_string(),
-        };
-    }
-    let mut cost = estimate_cost(provider_pricing, provider_key, provider_name, model, usage);
-    if cost.pricing_model_match == "未匹配官方 GPT 价格" {
-        cost.pricing_model_match = "未匹配供应商价格".to_string();
-        cost.pricing_source = "未匹配供应商价格，按 0 估算".to_string();
-        cost.breakdown = cost
-            .breakdown
-            .replace("未匹配官方 GPT 价格", "未匹配供应商价格")
-            .replace(
-                "未匹配到 OpenAI GPT 官方价格，按 0 估算",
-                "未匹配供应商价格，按 0 估算",
-            );
-    }
-    cost
-}
-
-fn provider_snapshot_at<'a>(
-    state: &'a ManagerState,
-    provider_key: &str,
-    timestamp_ms: i64,
-) -> Option<&'a AppliedProviderSnapshot> {
-    state
-        .applied_history
-        .iter()
-        .filter(|snapshot| {
-            snapshot.model_provider.eq_ignore_ascii_case(provider_key)
-                && snapshot.applied_at_ms <= timestamp_ms
-        })
-        .max_by_key(|snapshot| snapshot.applied_at_ms)
-}
-
-fn inferred_generic_provider(state: &ManagerState, provider_key: &str) -> Option<String> {
-    if let Some(applied_provider_id) = state.applied_provider_id.as_deref() {
-        if let Some(provider) = state.providers.iter().find(|provider| {
-            provider.id == applied_provider_id
-                && model_provider_name(provider).eq_ignore_ascii_case(provider_key)
-        }) {
-            return Some(provider.name.clone());
-        }
-    }
-
-    let matching_providers = state
-        .providers
-        .iter()
-        .filter(|provider| model_provider_name(provider).eq_ignore_ascii_case(provider_key))
-        .collect::<Vec<_>>();
-    if matching_providers.len() == 1 {
-        return Some(matching_providers[0].name.clone());
-    }
-
-    let matching_history = state
-        .applied_history
-        .iter()
-        .filter(|snapshot| snapshot.model_provider.eq_ignore_ascii_case(provider_key))
-        .collect::<Vec<_>>();
-    let mut names = matching_history
-        .iter()
-        .map(|snapshot| snapshot.provider_name.clone())
-        .collect::<Vec<_>>();
-    names.sort();
-    names.dedup();
-    if names.len() == 1 {
-        return names.pop();
-    }
-
-    None
-}
-
-fn resolve_provider(
-    state: &ManagerState,
-    provider_key: &str,
-    timestamp: DateTime<Utc>,
-) -> (String, bool) {
-    let provider_key = provider_key.trim();
-    if provider_key.is_empty() {
-        return ("未知供应商".to_string(), false);
-    }
-
-    if let Some(provider) = state.providers.iter().find(|provider| {
-        provider.id.eq_ignore_ascii_case(provider_key)
-            || provider.name.eq_ignore_ascii_case(provider_key)
-    }) {
-        return (provider.name.clone(), true);
-    }
-
-    let timestamp_ms = timestamp.timestamp_millis();
-    if let Some(snapshot) = provider_snapshot_at(state, provider_key, timestamp_ms) {
-        return (snapshot.provider_name.clone(), true);
-    }
-
-    let generic_provider_key = ["custom", "3rd", "unknown"]
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case(provider_key));
-    if generic_provider_key {
-        if let Some(provider_name) = inferred_generic_provider(state, provider_key) {
-            return (provider_name, true);
-        }
-        return (format!("未知供应商 · {provider_key}"), false);
-    }
-
-    let matching_providers = state
-        .providers
-        .iter()
-        .filter(|provider| model_provider_name(provider).eq_ignore_ascii_case(provider_key))
-        .collect::<Vec<_>>();
-    if matching_providers.len() == 1 {
-        return (matching_providers[0].name.clone(), true);
-    }
-
-    (format!("未知供应商 · {provider_key}"), false)
-}
-
-fn parse_session_usage_file(
-    path: &PathBuf,
-    state: &ManagerState,
-) -> Result<Vec<UsageEvent>, String> {
-    let file = fs::File::open(path)
-        .map_err(|err| format!("无法打开会话文件 {}: {err}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut session_id = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let mut provider_key = "unknown".to_string();
-    let mut current_model = "unknown".to_string();
-    let mut previous_total: Option<TokenUsage> = None;
-    let mut events = Vec::new();
-
-    for line in reader.lines() {
-        let line = line.map_err(|err| format!("无法读取会话文件 {}: {err}", path.display()))?;
-        let value = match serde_json::from_str::<Value>(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let payload = match value.get("payload").and_then(Value::as_object) {
-            Some(payload) => payload,
-            None => continue,
-        };
-        let event_type = value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        if event_type == "session_meta" {
-            if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                session_id = id.to_string();
-            }
-            if let Some(found) = payload.get("model_provider").and_then(Value::as_str) {
-                provider_key = found.to_string();
-            }
-            continue;
-        }
-
-        if event_type == "turn_context" {
-            if let Some(found) = payload.get("model").and_then(Value::as_str) {
-                current_model = found.to_string();
-            }
-            continue;
-        }
-
-        if event_type != "event_msg"
-            || payload.get("type").and_then(Value::as_str) != Some("token_count")
-        {
-            continue;
-        }
-
-        let timestamp = match parse_event_timestamp(&value) {
-            Some(timestamp) => timestamp,
-            None => continue,
-        };
-        let info = match payload.get("info").and_then(Value::as_object) {
-            Some(info) => info,
-            None => continue,
-        };
-        let last_usage = info
-            .get("last_token_usage")
-            .map(usage_from_value)
-            .unwrap_or_default();
-        let total_usage = info.get("total_token_usage").map(usage_from_value);
-        let usage = if let Some(total_usage) = total_usage {
-            let delta = usage_delta(&total_usage, previous_total.as_ref());
-            previous_total = Some(total_usage);
-            if usage_is_zero(&delta) {
-                continue;
-            }
-            delta
-        } else {
-            if usage_is_zero(&last_usage) {
-                continue;
-            }
-            last_usage
-        };
-
-        let (day, month) = timestamp_to_local_parts(timestamp);
-        let (provider_name, provider_known) = resolve_provider(state, &provider_key, timestamp);
-        let cost = estimate_cost(
-            &state.pricing,
-            &provider_key,
-            &provider_name,
-            &current_model,
-            &usage,
-        );
-
-        events.push(UsageEvent {
-            timestamp,
-            day,
-            month,
-            session_id: session_id.clone(),
-            provider_key: provider_key.clone(),
-            provider_name,
-            provider_known,
-            model: current_model.clone(),
-            usage,
-            estimated_cost: cost.amount,
-            cost_breakdown: cost.breakdown,
-            pricing_model_match: cost.pricing_model_match,
-            pricing_source: cost.pricing_source,
-            currency: cost.currency,
-            source: path.display().to_string(),
-        });
-    }
-
-    Ok(events)
-}
-
-fn group_provider_points(events: &[&UsageEvent]) -> Vec<UsageProviderPoint> {
-    let mut map = BTreeMap::<String, UsageProviderPoint>::new();
-    for event in events {
-        let entry = map
-            .entry(format!("{}::{}", event.provider_key, event.provider_name))
-            .or_insert_with(|| UsageProviderPoint {
-                provider_key: event.provider_key.clone(),
-                provider_name: event.provider_name.clone(),
-                request_count: 0,
-                input_tokens: 0,
-                uncached_input_tokens: 0,
-                cached_input_tokens: 0,
-                output_tokens: 0,
-                reasoning_output_tokens: 0,
-                total_tokens: 0,
-                estimated_cost: 0.0,
-                known: event.provider_known,
-            });
-        entry.request_count += 1;
-        entry.input_tokens += event.usage.input_tokens;
-        entry.uncached_input_tokens += event
-            .usage
-            .input_tokens
-            .saturating_sub(event.usage.cached_input_tokens)
-            .max(0);
-        entry.cached_input_tokens += event.usage.cached_input_tokens;
-        entry.output_tokens += event.usage.output_tokens;
-        entry.reasoning_output_tokens += event.usage.reasoning_output_tokens;
-        entry.total_tokens += event.usage.total_tokens;
-        entry.estimated_cost += event.estimated_cost;
-        entry.known = entry.known || event.provider_known;
-    }
-
-    let mut points = map.into_values().collect::<Vec<_>>();
-    points.sort_by(|left, right| {
-        right
-            .request_count
-            .cmp(&left.request_count)
-            .then_with(|| right.total_tokens.cmp(&left.total_tokens))
-    });
-    points
-}
-
-fn normalize_filter_text(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty() && value != "*")
-}
-
-fn usage_event_matches_filter(event: &UsageEvent, filter: &UsageStatsFilter) -> bool {
-    if let Some(start_day) = normalize_filter_text(filter.start_day.clone()) {
-        if event.day.as_str() < start_day.as_str() {
-            return false;
-        }
-    }
-    if let Some(end_day) = normalize_filter_text(filter.end_day.clone()) {
-        if event.day.as_str() > end_day.as_str() {
-            return false;
-        }
-    }
-    if let Some(provider_key) = normalize_filter_text(filter.provider_key.clone()) {
-        if !event.provider_key.eq_ignore_ascii_case(&provider_key) {
-            return false;
-        }
-    }
-    if let Some(provider_name) = normalize_filter_text(filter.provider_name.clone()) {
-        if !event.provider_name.eq_ignore_ascii_case(&provider_name) {
-            return false;
-        }
-    }
-    if let Some(model) = normalize_filter_text(filter.model.clone()) {
-        if !event.model.eq_ignore_ascii_case(&model) {
-            return false;
-        }
-    }
-    true
-}
-
-fn collect_available_providers(events: &[UsageEvent]) -> Vec<UsageFilterOption> {
-    let mut map = BTreeMap::<String, UsageFilterOption>::new();
-    for event in events {
-        let entry = map
-            .entry(format!("{}::{}", event.provider_key, event.provider_name))
-            .or_insert_with(|| UsageFilterOption {
-                provider_key: event.provider_key.clone(),
-                provider_name: event.provider_name.clone(),
-                request_count: 0,
-                known: event.provider_known,
-            });
-        entry.request_count += 1;
-        entry.known = entry.known || event.provider_known;
-    }
-
-    let mut providers = map.into_values().collect::<Vec<_>>();
-    providers.sort_by(|left, right| {
-        right
-            .request_count
-            .cmp(&left.request_count)
-            .then_with(|| left.provider_name.cmp(&right.provider_name))
-    });
-    providers
-}
-
-fn collect_available_models(events: &[UsageEvent]) -> Vec<String> {
-    let mut models = events
-        .iter()
-        .map(|event| event.model.clone())
-        .collect::<Vec<_>>();
-    models.sort();
-    models.dedup();
-    models
-}
-
-fn collect_available_days(events: &[UsageEvent]) -> Vec<String> {
-    let mut days = events
-        .iter()
-        .map(|event| event.day.clone())
-        .collect::<Vec<_>>();
-    days.sort();
-    days.dedup();
-    days
-}
-
-fn usage_detail_row(event: &UsageEvent) -> UsageDetailRow {
-    UsageDetailRow {
-        timestamp: event
-            .timestamp
-            .with_timezone(&Local)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string(),
-        day: event.day.clone(),
-        session_id: event.session_id.clone(),
-        provider_key: event.provider_key.clone(),
-        provider_name: event.provider_name.clone(),
-        model: event.model.clone(),
-        input_tokens: event.usage.input_tokens,
-        uncached_input_tokens: event
-            .usage
-            .input_tokens
-            .saturating_sub(event.usage.cached_input_tokens)
-            .max(0),
-        cached_input_tokens: event.usage.cached_input_tokens,
-        output_tokens: event.usage.output_tokens,
-        reasoning_output_tokens: event.usage.reasoning_output_tokens,
-        total_tokens: event.usage.total_tokens,
-        estimated_cost: event.estimated_cost,
-        cost_breakdown: event.cost_breakdown.clone(),
-        pricing_model_match: event.pricing_model_match.clone(),
-        pricing_source: event.pricing_source.clone(),
-        currency: event.currency.clone(),
-        source: event.source.clone(),
-    }
-}
-
 fn normalized_page_size(page_size: Option<usize>) -> usize {
     match page_size.unwrap_or(50) {
         0..=20 => 20,
@@ -10698,147 +9377,6 @@ fn normalized_page_size(page_size: Option<usize>) -> usize {
         51..=100 => 100,
         _ => 100,
     }
-}
-
-fn load_usage_cache(state: &ManagerState) -> Result<UsageCache, String> {
-    let sessions_dir = sessions_dir()?;
-    let mut files = Vec::new();
-    collect_jsonl_files(sessions_dir.clone(), &mut files)?;
-    files.sort();
-
-    let mut events = Vec::new();
-    let mut parsed_files = 0;
-    for file in files {
-        let file_events = parse_session_usage_file(&file, state)?;
-        if !file_events.is_empty() {
-            parsed_files += 1;
-        }
-        events.extend(file_events);
-    }
-    events.sort_by_key(|event| event.timestamp);
-
-    Ok(UsageCache {
-        events,
-        source_dir: sessions_dir.display().to_string(),
-        parsed_files,
-        loaded_at_ms: current_epoch_ms()?,
-    })
-}
-
-fn build_usage_stats_from_cache(
-    cache: &UsageCache,
-    filter: UsageStatsFilter,
-) -> Result<UsageStats, String> {
-    let events = &cache.events;
-    let available_providers = collect_available_providers(events);
-    let available_models = collect_available_models(events);
-    let available_days = collect_available_days(events);
-
-    let now = Local::now();
-    let today_key = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
-    let this_month_key = format!("{:04}-{:02}", now.year(), now.month());
-
-    let mut today = UsageSummary::default();
-    let mut this_month = UsageSummary::default();
-    for event in events {
-        if event.day == today_key {
-            add_event_usage(&mut today, event);
-        }
-        if event.month == this_month_key {
-            add_event_usage(&mut this_month, event);
-        }
-    }
-
-    let filtered_events = events
-        .iter()
-        .filter(|event| usage_event_matches_filter(event, &filter))
-        .collect::<Vec<_>>();
-
-    let mut summary = UsageSummary::default();
-    let mut daily_map = BTreeMap::<String, Vec<&UsageEvent>>::new();
-    let mut monthly_map = BTreeMap::<String, Vec<&UsageEvent>>::new();
-
-    for event in &filtered_events {
-        add_event_usage(&mut summary, event);
-        daily_map.entry(event.day.clone()).or_default().push(event);
-        monthly_map
-            .entry(event.month.clone())
-            .or_default()
-            .push(event);
-    }
-
-    let mut daily = daily_map
-        .into_iter()
-        .map(|(day, day_events)| {
-            let mut total = UsageSummary::default();
-            for event in &day_events {
-                add_event_usage(&mut total, event);
-            }
-            UsageDailyPoint {
-                day,
-                request_count: total.request_count,
-                total_tokens: total.total_tokens,
-                estimated_cost: total.estimated_cost,
-                providers: group_provider_points(&day_events),
-            }
-        })
-        .collect::<Vec<_>>();
-    daily.sort_by(|left, right| left.day.cmp(&right.day));
-
-    let monthly = monthly_map
-        .into_iter()
-        .map(|(month, month_events)| {
-            let mut total = UsageSummary::default();
-            for event in month_events {
-                add_event_usage(&mut total, event);
-            }
-            UsageMonthlyPoint {
-                month,
-                request_count: total.request_count,
-                total_tokens: total.total_tokens,
-                estimated_cost: total.estimated_cost,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let providers = group_provider_points(&filtered_events);
-    let unknown_provider_count = providers.iter().filter(|provider| !provider.known).count();
-    let page_size = normalized_page_size(filter.page_size);
-    let detail_total_pages = filtered_events.len().div_ceil(page_size).max(1);
-    let detail_page = filter.page.unwrap_or(1).clamp(1, detail_total_pages);
-    let start = (detail_page - 1) * page_size;
-
-    let details = filtered_events
-        .iter()
-        .rev()
-        .skip(start)
-        .take(page_size)
-        .map(|event| usage_detail_row(event))
-        .collect::<Vec<_>>();
-
-    Ok(UsageStats {
-        generated_at_ms: cache.loaded_at_ms,
-        source_dir: cache.source_dir.clone(),
-        filters: filter,
-        summary,
-        today,
-        this_month,
-        daily,
-        monthly,
-        providers,
-        details,
-        pricing: default_pricing_rules(),
-        available_providers,
-        available_models,
-        available_days,
-        unknown_provider_count,
-        parsed_files: cache.parsed_files,
-        parsed_events: events.len(),
-        filtered_events: filtered_events.len(),
-        detail_page,
-        detail_page_size: page_size,
-        detail_total_pages,
-    })
 }
 
 fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppState, String> {
@@ -10868,11 +9406,6 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
     let diffs = compute_diffs(&state, provider.as_ref(), &current_json, &desired);
     let redacted_diffs = diffs.iter().cloned().map(redacted_diff).collect::<Vec<_>>();
     let desired_flat = flatten(&desired);
-    let route_logs = read_route_logs().unwrap_or_default();
-    let now = Local::now();
-    let today_key = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
-    let month_key = format!("{:04}-{:02}", now.year(), now.month());
-
     let summary = desired_flat
         .iter()
         .take(10)
@@ -10898,9 +9431,6 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                 compute_diffs(&state, Some(provider), &current_json, &provider_desired).len();
             let balance_status = provider.balance_status.as_ref();
             let connection_status = provider.connection_status.as_ref();
-            let pricing_sync_status = provider.pricing_sync_status.as_ref();
-            let (provider_today_cost, provider_month_cost, provider_currency) =
-                provider_cost_for_range(&route_logs, &provider.id, &today_key, &month_key);
             ProviderSummary {
                 id: provider.id.clone(),
                 name: provider.name.clone(),
@@ -10924,15 +9454,6 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                     .map(|latency_ms| format!("{latency_ms} ms"))
                     .unwrap_or_else(|| "-".to_string()),
                 latency_error: connection_status.and_then(|status| status.error.clone()),
-                provider_today_cost,
-                provider_month_cost,
-                provider_currency,
-                provider_pricing_count: provider.provider_pricing.len(),
-                pricing_sync_ok: pricing_sync_status.is_some_and(|status| status.ok),
-                pricing_sync_label: pricing_sync_status
-                    .map(|status| status.label.clone())
-                    .unwrap_or_else(|| "未同步".to_string()),
-                pricing_sync_error: pricing_sync_status.and_then(|status| status.error.clone()),
             }
         })
         .collect();
@@ -10964,19 +9485,12 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                     .map(|latency_ms| format!("{latency_ms} ms"))
                     .unwrap_or_else(|| "-".to_string()),
                 latency_error: connection_status.and_then(|status| status.error.clone()),
-                provider_today_cost: 0.0,
-                provider_month_cost: 0.0,
-                provider_currency: default_currency(),
-                provider_pricing_count: provider.provider_pricing.len(),
-                pricing_sync_ok: false,
-                pricing_sync_label: "未同步".to_string(),
-                pricing_sync_error: None,
             }
         })
         .collect();
 
     Ok(AppState {
-        app_version: env!("CODEX_HELPER_VERSION").to_string(),
+        app_version: env!("XXSWITCH_VERSION").to_string(),
         codex_config_path: codex_config_path()?.display().to_string(),
         claude_settings_path: claude_settings_path()?.display().to_string(),
         pi_models_path: pi_models_path()?.display().to_string(),
@@ -11044,7 +9558,7 @@ async fn install_update(app: tauri::AppHandle) -> Result<UpdateInstallResult, St
             app_for_exit.exit(0);
         });
         return Ok(UpdateInstallResult {
-            message: "已启动更新安装程序，Codex Helper 即将退出。".to_string(),
+            message: "已启动更新安装程序，XXSwitch 即将退出。".to_string(),
             manual_install: false,
         });
     }
@@ -11087,7 +9601,6 @@ fn get_provider(provider_id: String) -> Result<ProviderConfig, String> {
         .providers
         .into_iter()
         .find(|provider| provider.id == provider_id)
-        .map(redacted_provider)
         .ok_or_else(|| "供应商不存在".to_string())
 }
 
@@ -11097,7 +9610,6 @@ fn get_claude_provider(provider_id: String) -> Result<ClaudeProviderConfig, Stri
         .claude_providers
         .into_iter()
         .find(|provider| provider.id == provider_id)
-        .map(redacted_claude_provider)
         .ok_or_else(|| "Claude 供应商不存在".to_string())
 }
 
@@ -11151,9 +9663,6 @@ fn save_provider(
     }
     if let Some(model_mappings) = payload.model_mappings {
         provider.model_mappings = normalize_model_mappings(model_mappings);
-    }
-    if let Some(provider_pricing) = payload.provider_pricing {
-        provider.provider_pricing = normalize_provider_pricing(provider_pricing);
     }
     if payload.base_url.is_some() || payload.api_key.is_some() {
         apply_provider_connection_draft(
@@ -11229,9 +9738,6 @@ fn save_claude_provider(
     }
     if let Some(model_mappings) = payload.model_mappings {
         provider.model_mappings = normalize_model_mappings(model_mappings);
-    }
-    if let Some(provider_pricing) = payload.provider_pricing {
-        provider.provider_pricing = normalize_provider_pricing(provider_pricing);
     }
 
     save_state(&state)?;
@@ -11381,9 +9887,6 @@ fn preview_provider(
     if let Some(model_mappings) = payload.model_mappings {
         provider.model_mappings = normalize_model_mappings(model_mappings);
     }
-    if let Some(provider_pricing) = payload.provider_pricing {
-        provider.provider_pricing = normalize_provider_pricing(provider_pricing);
-    }
     if let Some(balance_query) = payload.balance_query {
         provider.balance_query = merge_balance_config_draft(provider, balance_query);
         provider.balance_status = None;
@@ -11439,8 +9942,6 @@ fn add_provider(
         connection_test_model: String::new(),
         allowed_models: Vec::new(),
         model_mappings: Vec::new(),
-        provider_pricing: Vec::new(),
-        pricing_sync_status: None,
         balance_query: BalanceQueryConfig::default(),
         balance_status: None,
         connection_status: None,
@@ -11515,7 +10016,6 @@ fn add_claude_provider(
         connection_test_model: String::new(),
         allowed_models: Vec::new(),
         model_mappings: Vec::new(),
-        provider_pricing: Vec::new(),
         connection_status: None,
     });
 
@@ -11836,35 +10336,6 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
 }
 
 #[tauri::command]
-fn load_usage_stats(
-    payload: Option<LoadUsageStatsPayload>,
-    usage_cache: tauri::State<UsageCacheState>,
-) -> Result<UsageStats, String> {
-    let state = load_state_file()?;
-    let payload = payload.unwrap_or_default();
-    let filter = payload.filter.unwrap_or_default();
-
-    if !payload.force_refresh {
-        if let Some(cache) = usage_cache
-            .cache
-            .lock()
-            .map_err(|_| "统计缓存锁定失败".to_string())?
-            .clone()
-        {
-            return build_usage_stats_from_cache(&cache, filter);
-        }
-    }
-
-    let cache = load_usage_cache(&state)?;
-    let stats = build_usage_stats_from_cache(&cache, filter)?;
-    *usage_cache
-        .cache
-        .lock()
-        .map_err(|_| "统计缓存锁定失败".to_string())? = Some(cache);
-    Ok(stats)
-}
-
-#[tauri::command]
 fn load_route_logs(payload: Option<LoadRouteLogsPayload>) -> Result<RouteLogsResponse, String> {
     let filter = payload
         .and_then(|payload| payload.filter)
@@ -11922,82 +10393,6 @@ async fn load_claude_provider_models(
     )?;
     let (models, _) = fetch_claude_provider_models(&test_provider).await?;
     Ok(ProviderModelsResponse { models })
-}
-
-#[tauri::command]
-async fn sync_provider_pricing(
-    payload: SyncProviderPricingPayload,
-    router_runtime: tauri::State<'_, RouterRuntime>,
-) -> Result<ProviderPricingSyncResponse, String> {
-    let mut state = load_state_file()?;
-    let provider = state
-        .providers
-        .iter()
-        .find(|provider| provider.id == payload.provider_id)
-        .cloned()
-        .ok_or_else(|| "供应商不存在".to_string())?;
-    let mut test_provider = provider.clone();
-    apply_provider_connection_draft(
-        &mut test_provider,
-        payload.base_url.as_deref(),
-        payload.api_key.as_deref(),
-    )?;
-    if let Some(balance_query) = payload.balance_query {
-        test_provider.balance_query = merge_balance_config_draft(&test_provider, balance_query);
-    }
-
-    let base_url = custom_provider_base_url(&test_provider)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "Base URL 为空".to_string())?;
-    let endpoint = newapi_endpoint_from_base_url(&base_url);
-    let auth = newapi_pricing_auth_for_endpoint(&state, &test_provider, &endpoint);
-    let checked_at = now_epoch_seconds().ok();
-    let sync_result = fetch_newapi_provider_pricing(&test_provider, auth).await;
-    let (pricing, ok, message) = {
-        let provider = state
-            .providers
-            .iter_mut()
-            .find(|provider| provider.id == payload.provider_id)
-            .ok_or_else(|| "供应商不存在".to_string())?;
-        match sync_result {
-            Ok(sync) => {
-                let label = pricing_sync_label(&sync.group, sync.group_ratio, sync.pricing_count);
-                provider.provider_pricing = sync.pricing.clone();
-                provider.pricing_sync_status = Some(PricingSyncStatus {
-                    ok: true,
-                    label: label.clone(),
-                    checked_at,
-                    error: None,
-                    group: sync.group,
-                    group_ratio: sync.group_ratio,
-                    pricing_count: sync.pricing_count,
-                });
-                (sync.pricing, true, label)
-            }
-            Err(err) => {
-                let pricing = provider.provider_pricing.clone();
-                provider.pricing_sync_status = Some(PricingSyncStatus {
-                    ok: false,
-                    label: "不可用".to_string(),
-                    checked_at,
-                    error: Some(err.clone()),
-                    group: String::new(),
-                    group_ratio: 0.0,
-                    pricing_count: pricing.len(),
-                });
-                (pricing, false, err)
-            }
-        }
-    };
-
-    save_state(&state)?;
-    let app_state = build_app_state(state, &router_runtime)?;
-    Ok(ProviderPricingSyncResponse {
-        state: app_state,
-        pricing,
-        ok,
-        message,
-    })
 }
 
 #[tauri::command]
@@ -12100,6 +10495,83 @@ async fn test_provider_connection_state(
     build_app_state(state, &router_runtime)
 }
 
+#[tauri::command]
+async fn test_provider_latency_state(
+    payload: TestProviderLatencyPayload,
+    router_runtime: tauri::State<'_, RouterRuntime>,
+) -> Result<ProviderLatencyTestResponse, String> {
+    let model = payload.model.trim();
+    if model.is_empty() {
+        return Err("请选择测试模型".to_string());
+    }
+    let prompt = payload.prompt.trim();
+    if prompt.is_empty() {
+        return Err("测试内容不能为空".to_string());
+    }
+
+    let mut state = load_state_file()?;
+    let result = match payload.provider_kind {
+        AgentClientKind::Codex => {
+            let provider = state
+                .providers
+                .iter()
+                .find(|provider| provider.id == payload.provider_id)
+                .cloned()
+                .ok_or_else(|| "供应商不存在".to_string())?;
+            measure_codex_provider_latency(&provider, model, prompt, payload.stream).await
+        }
+        AgentClientKind::Claude => {
+            let provider = state
+                .claude_providers
+                .iter()
+                .find(|provider| provider.id == payload.provider_id)
+                .cloned()
+                .ok_or_else(|| "Claude 供应商不存在".to_string())?;
+            measure_claude_provider_latency(&provider, model, prompt, payload.stream).await
+        }
+        AgentClientKind::Pi => return Err("Pi 不支持供应商模型测速".to_string()),
+    };
+
+    let (ok, latency_ms, error, reply) = match result {
+        Ok(probe) => (true, Some(probe.latency_ms), None, probe.reply),
+        Err(error) => (false, None, Some(error), String::new()),
+    };
+    let status = latency_connection_status(match &error {
+        Some(error) => Err(error.clone()),
+        None => Ok(latency_ms.unwrap_or_default()),
+    });
+    match payload.provider_kind {
+        AgentClientKind::Codex => {
+            if let Some(provider) = state
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == payload.provider_id)
+            {
+                provider.connection_status = Some(status);
+            }
+        }
+        AgentClientKind::Claude => {
+            if let Some(provider) = state
+                .claude_providers
+                .iter_mut()
+                .find(|provider| provider.id == payload.provider_id)
+            {
+                provider.connection_status = Some(status);
+            }
+        }
+        AgentClientKind::Pi => unreachable!(),
+    }
+
+    save_state(&state)?;
+    Ok(ProviderLatencyTestResponse {
+        app_state: build_app_state(state, &router_runtime)?,
+        ok,
+        latency_ms,
+        error,
+        reply,
+    })
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
         return;
@@ -12119,7 +10591,6 @@ fn show_main_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(UsageCacheState::default())
         .manage(RouterRuntime::default())
         .setup(|app| {
             let show_item = MenuItem::with_id(app, TRAY_SHOW_ID, "显示主窗口", true, None::<&str>)?;
@@ -12128,7 +10599,7 @@ pub fn run() {
             let mut tray_builder = TrayIconBuilder::new()
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
-                .tooltip("Codex Helper")
+                .tooltip("XXSwitch")
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     TRAY_SHOW_ID => show_main_window(app),
                     TRAY_QUIT_ID => app.exit(0),
@@ -12201,15 +10672,14 @@ pub fn run() {
             set_skill_sharing_scope,
             delete_shared_skill,
             apply_config,
-            load_usage_stats,
             load_route_logs,
             load_route_usage_stats,
             load_provider_models,
             load_claude_provider_models,
-            sync_provider_pricing,
             query_provider_balance,
             test_provider_connection,
-            test_provider_connection_state
+            test_provider_connection_state,
+            test_provider_latency_state
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -12235,8 +10705,6 @@ mod tests {
             connection_test_model: String::new(),
             allowed_models: Vec::new(),
             model_mappings: Vec::new(),
-            provider_pricing: Vec::new(),
-            pricing_sync_status: None,
             balance_query: BalanceQueryConfig::default(),
             balance_status: None,
             connection_status: None,
@@ -12262,7 +10730,6 @@ mod tests {
             connection_test_model: String::new(),
             allowed_models: Vec::new(),
             model_mappings: Vec::new(),
-            provider_pricing: Vec::new(),
             connection_status: None,
         }
     }
@@ -12279,12 +10746,12 @@ mod tests {
     fn selects_release_asset_for_each_supported_update_platform() {
         let assets = vec![
             GithubReleaseAsset {
-                name: "Codex.Helper_1.1.8_universal.dmg".to_string(),
+                name: "XXSwitch_1.1.8_universal.dmg".to_string(),
                 browser_download_url: format!("{GITHUB_RELEASE_DOWNLOAD_PREFIX}v1.1.8/mac.dmg"),
                 digest: None,
             },
             GithubReleaseAsset {
-                name: "Codex.Helper_1.1.8_x64-setup.exe".to_string(),
+                name: "XXSwitch_1.1.8_x64-setup.exe".to_string(),
                 browser_download_url: format!("{GITHUB_RELEASE_DOWNLOAD_PREFIX}v1.1.8/windows.exe"),
                 digest: None,
             },
@@ -12293,12 +10760,12 @@ mod tests {
         assert_eq!(
             update_asset_for_platform(&assets, UpdatePlatform::Windows)
                 .map(|asset| asset.name.as_str()),
-            Some("Codex.Helper_1.1.8_x64-setup.exe")
+            Some("XXSwitch_1.1.8_x64-setup.exe")
         );
         assert_eq!(
             update_asset_for_platform(&assets, UpdatePlatform::Macos)
                 .map(|asset| asset.name.as_str()),
-            Some("Codex.Helper_1.1.8_universal.dmg")
+            Some("XXSwitch_1.1.8_universal.dmg")
         );
         assert!(update_asset_for_platform(&assets, UpdatePlatform::Unsupported).is_none());
     }
@@ -12317,21 +10784,20 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn locates_macos_app_bundle_from_executable_path() {
-        let executable =
-            Path::new("/Applications/Codex Helper.app/Contents/MacOS/codex-config-manager");
+        let executable = Path::new("/Applications/XXSwitch.app/Contents/MacOS/xxswitch");
         assert_eq!(
             macos_app_bundle_from_path(executable).as_deref(),
-            Some(Path::new("/Applications/Codex Helper.app"))
+            Some(Path::new("/Applications/XXSwitch.app"))
         );
-        assert!(macos_app_bundle_from_path(Path::new("/tmp/codex-config-manager")).is_none());
+        assert!(macos_app_bundle_from_path(Path::new("/tmp/xxswitch")).is_none());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn quotes_macos_update_paths_for_shell_commands() {
         assert_eq!(
-            shell_quote(Path::new("/Applications/Codex Helper.app")),
-            "'/Applications/Codex Helper.app'"
+            shell_quote(Path::new("/Applications/XXSwitch.app")),
+            "'/Applications/XXSwitch.app'"
         );
         assert_eq!(
             shell_quote(Path::new("/tmp/owner's app.app")),
@@ -12774,7 +11240,6 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 source: "claude-sonnet-4-5".to_string(),
                 target: "claude-3-5-sonnet-latest".to_string(),
             }],
-            provider_pricing: vec![],
             connection_status: None,
         };
 
@@ -12851,15 +11316,14 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(usage.total_tokens, 50);
     }
 
-    fn route_log_for_stats_test(status: &str, provider_id: &str, cost: f64) -> RouteRequestLog {
-        route_log_with_path_for_stats_test(status, provider_id, "/v1/responses", cost)
+    fn route_log_for_stats_test(status: &str, provider_id: &str) -> RouteRequestLog {
+        route_log_with_path_for_stats_test(status, provider_id, "/v1/responses")
     }
 
     fn route_log_with_path_for_stats_test(
         status: &str,
         provider_id: &str,
         path: &str,
-        cost: f64,
     ) -> RouteRequestLog {
         RouteRequestLog {
             id: format!("test-{status}-{provider_id}"),
@@ -12894,27 +11358,17 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             output_tokens: 3,
             reasoning_output_tokens: 1,
             total_tokens: 10,
-            estimated_cost: cost,
-            currency: "USD".to_string(),
-            cost_breakdown: String::new(),
-            pricing_model_match: "test-model".to_string(),
-            pricing_source: "test".to_string(),
-            provider_estimated_cost: cost * 2.0,
-            provider_currency: "USD".to_string(),
-            provider_cost_breakdown: String::new(),
-            provider_pricing_model_match: "test-model".to_string(),
-            provider_pricing_source: "provider-test".to_string(),
             first_byte_ms: Some(100),
             total_ms: 200,
         }
     }
 
     #[test]
-    fn route_usage_counts_and_cost_only_successful_requests() {
+    fn route_usage_counts_tokens_only_for_successful_requests() {
         let stats = build_route_usage_stats(
             vec![
-                route_log_for_stats_test("success", "provider-a", 0.000123),
-                route_log_for_stats_test("failed", "provider-b", 9.0),
+                route_log_for_stats_test("success", "provider-a"),
+                route_log_for_stats_test("failed", "provider-b"),
             ],
             RouteLogFilter {
                 start_day: Some("2026-06-27".to_string()),
@@ -12931,7 +11385,6 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(stats.failed_count, 1);
         assert_eq!(stats.summary.request_count, 1);
         assert_eq!(stats.summary.total_tokens, 10);
-        assert!((stats.summary.estimated_cost - 0.000123).abs() < f64::EPSILON);
         assert_eq!(stats.buckets.len(), 1);
         assert_eq!(stats.buckets[0].request_count, 1);
         assert_eq!(stats.providers.len(), 1);
@@ -12943,8 +11396,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     fn route_usage_ignores_successful_non_generation_requests() {
         let stats = build_route_usage_stats(
             vec![
-                route_log_for_stats_test("success", "provider-a", 0.000123),
-                route_log_with_path_for_stats_test("success", "provider-a", "/v1/models", 0.0),
+                route_log_for_stats_test("success", "provider-a"),
+                route_log_with_path_for_stats_test("success", "provider-a", "/v1/models"),
             ],
             RouteLogFilter {
                 start_day: Some("2026-06-27".to_string()),
@@ -12969,8 +11422,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     fn route_logs_ignore_non_generation_requests() {
         let response = build_route_logs_response(
             vec![
-                route_log_for_stats_test("success", "provider-a", 0.000123),
-                route_log_with_path_for_stats_test("success", "provider-b", "/v1/models", 0.0),
+                route_log_for_stats_test("success", "provider-a"),
+                route_log_with_path_for_stats_test("success", "provider-b", "/v1/models"),
             ],
             RouteLogFilter {
                 page_size: Some(50),
@@ -13010,8 +11463,6 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             connection_test_model: String::new(),
             allowed_models: Vec::new(),
             model_mappings: Vec::new(),
-            provider_pricing: Vec::new(),
-            pricing_sync_status: None,
             balance_query: BalanceQueryConfig {
                 enabled: true,
                 query_type: BalanceQueryType::NewApi,
@@ -13059,8 +11510,6 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     target: "deepseek-flash".to_string(),
                 },
             ],
-            provider_pricing: Vec::new(),
-            pricing_sync_status: None,
             balance_query: BalanceQueryConfig::default(),
             balance_status: None,
             connection_status: None,
@@ -13167,189 +11616,6 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
-    fn estimates_provider_cost_from_manual_price() {
-        let usage = TokenUsage {
-            input_tokens: 1_000,
-            cached_input_tokens: 200,
-            output_tokens: 500,
-            reasoning_output_tokens: 0,
-            total_tokens: 1_500,
-        };
-        let pricing = normalize_provider_pricing(vec![PricingRule {
-            id: String::new(),
-            provider_match: "ignored".to_string(),
-            model_match: " glm-5.2 ".to_string(),
-            input_per_million: 2.0,
-            cached_input_per_million: 0.5,
-            output_per_million: 8.0,
-            reasoning_output_per_million: 0.0,
-            request_price: 0.0,
-            currency: "usd".to_string(),
-            source: String::new(),
-        }]);
-
-        let cost = estimate_provider_cost(&pricing, "provider-b", "Provider B", "glm-5.2", &usage);
-
-        assert_eq!(pricing[0].provider_match, "*");
-        assert_eq!(pricing[0].currency, "USD");
-        assert_eq!(cost.pricing_model_match, "glm-5.2");
-        assert!((cost.amount - 0.0057).abs() < 0.0000001);
-    }
-
-    #[test]
-    fn parses_newapi_pricing_ratio_records() {
-        let pricing = parse_newapi_pricing_value(
-            &json!({
-                "data": [{
-                    "model_name": "glm-5.2",
-                    "model_ratio": 1.25,
-                    "completion_ratio": 4,
-                    "cache_ratio": 0.25,
-                    "quota_type": 0
-                }]
-            }),
-            "New API /api/pricing",
-            DEFAULT_NEW_API_QUOTA_PER_USD,
-        );
-
-        assert_eq!(pricing.len(), 1);
-        assert_eq!(pricing[0].model_match, "glm-5.2");
-        assert!((pricing[0].input_per_million - 2.5).abs() < 0.0000001);
-        assert!((pricing[0].cached_input_per_million - 0.625).abs() < 0.0000001);
-        assert!((pricing[0].output_per_million - 10.0).abs() < 0.0000001);
-        assert!(pricing[0].source.contains("/api/pricing"));
-    }
-
-    #[test]
-    fn parses_newapi_pricing_fixed_request_records() {
-        let pricing = parse_newapi_pricing_value(
-            &json!({
-                "success": true,
-                "data": [{
-                    "model_name": "glm-image",
-                    "quota_type": 1,
-                    "model_price": 0.02,
-                    "model_ratio": 0,
-                    "completion_ratio": 0
-                }]
-            }),
-            "New API /api/pricing",
-            DEFAULT_NEW_API_QUOTA_PER_USD,
-        );
-
-        assert_eq!(pricing.len(), 1);
-        assert_eq!(pricing[0].model_match, "glm-image");
-        assert_eq!(pricing[0].input_per_million, 0.0);
-        assert_eq!(pricing[0].output_per_million, 0.0);
-        assert!((pricing[0].request_price - 0.02).abs() < 0.0000001);
-
-        let cost = estimate_provider_cost(
-            &pricing,
-            "provider-b",
-            "Provider B",
-            "glm-image",
-            &TokenUsage::default(),
-        );
-        assert!((cost.amount - 0.02).abs() < 0.0000001);
-        assert!(cost.breakdown.contains("固定请求"));
-    }
-
-    #[test]
-    fn masked_key_matches_newapi_token_keys() {
-        assert!(masked_key_matches(
-            "JCoW****b1v4",
-            "sk-JCoWabcdefghijklmnob1v4"
-        ));
-        assert!(masked_key_matches("LiVt1234YDmL", "LiVt1234YDmL"));
-        assert!(!masked_key_matches(
-            "JCoW****b1v4",
-            "sk-JCoWabcdefghijklmnozzzz"
-        ));
-    }
-
-    #[test]
-    fn token_group_from_list_matches_masked_provider_key() {
-        let group = token_group_from_list(
-            &json!({
-                "data": {
-                    "items": [
-                        { "key": "LiVt****YDmL", "group": "gpt-pro" },
-                        { "key": "JCoW****b1v4", "group": "国模特价" }
-                    ]
-                }
-            }),
-            "sk-JCoWabcdefghijklmnob1v4",
-        );
-
-        assert_eq!(group.as_deref(), Some("国模特价"));
-    }
-
-    #[test]
-    fn parses_newapi_pricing_with_key_group_multiplier() {
-        let pricing = parse_newapi_pricing_with_group(
-            &json!({
-                "group_ratio": {
-                    "gpt-pro": 0.15,
-                    "国模特价": 0.1,
-                    "官方中转": 1
-                },
-                "data": [{
-                    "model_name": "glm-5.2",
-                    "quota_type": 0,
-                    "model_ratio": 4,
-                    "completion_ratio": 3.5,
-                    "cache_ratio": 0.25,
-                    "enable_groups": ["国模特价"]
-                }]
-            }),
-            "New API /api/pricing",
-            DEFAULT_NEW_API_QUOTA_PER_USD,
-            "国模特价",
-        );
-
-        assert_eq!(pricing.len(), 1);
-        assert_eq!(pricing[0].model_match, "glm-5.2");
-        assert!((pricing[0].input_per_million - 0.8).abs() < 0.0000001);
-        assert!((pricing[0].cached_input_per_million - 0.2).abs() < 0.0000001);
-        assert!((pricing[0].output_per_million - 2.8).abs() < 0.0000001);
-        assert!(pricing[0].source.contains("group 国模特价 × 0.1000"));
-    }
-
-    #[test]
-    fn parses_newapi_ratio_config_maps() {
-        let pricing = parse_newapi_pricing_value(
-            &json!({
-                "data": {
-                    "model_ratio": {
-                        "deepseek-chat": 0.25,
-                        "deepseek-reasoner": "0.5"
-                    },
-                    "completion_ratio": {
-                        "deepseek-chat": 4,
-                        "deepseek-reasoner": 8
-                    },
-                    "cache_ratio": {
-                        "deepseek-chat": 0.25,
-                        "deepseek-reasoner": "0.5"
-                    }
-                }
-            }),
-            "New API /api/ratio_config",
-            DEFAULT_NEW_API_QUOTA_PER_USD,
-        );
-
-        assert_eq!(pricing.len(), 2);
-        assert_eq!(pricing[0].model_match, "deepseek-chat");
-        assert!((pricing[0].input_per_million - 0.5).abs() < 0.0000001);
-        assert!((pricing[0].cached_input_per_million - 0.125).abs() < 0.0000001);
-        assert!((pricing[0].output_per_million - 2.0).abs() < 0.0000001);
-        assert_eq!(pricing[1].model_match, "deepseek-reasoner");
-        assert!((pricing[1].input_per_million - 1.0).abs() < 0.0000001);
-        assert!((pricing[1].cached_input_per_million - 0.5).abs() < 0.0000001);
-        assert!((pricing[1].output_per_million - 8.0).abs() < 0.0000001);
-    }
-
-    #[test]
     fn configured_route_models_merge_allowed_models_in_order() {
         let candidates = vec![
             UpstreamCandidate {
@@ -13372,8 +11638,6 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                         "gpt-5.4".to_string(),
                     ],
                     model_mappings: Vec::new(),
-                    provider_pricing: Vec::new(),
-                    pricing_sync_status: None,
                     balance_query: BalanceQueryConfig::default(),
                     balance_status: None,
                     connection_status: None,
@@ -13398,8 +11662,6 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     connection_test_model: String::new(),
                     allowed_models: vec!["GPT-5.4".to_string(), "gpt-5.3".to_string()],
                     model_mappings: Vec::new(),
-                    provider_pricing: Vec::new(),
-                    pricing_sync_status: None,
                     balance_query: BalanceQueryConfig::default(),
                     balance_status: None,
                     connection_status: None,
@@ -13436,8 +11698,6 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 source: "gpt-5.2".to_string(),
                 target: "glm-5.2".to_string(),
             }],
-            provider_pricing: Vec::new(),
-            pricing_sync_status: None,
             balance_query: BalanceQueryConfig::default(),
             balance_status: None,
             connection_status: None,
@@ -13471,8 +11731,6 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             connection_test_model: String::new(),
             allowed_models: Vec::new(),
             model_mappings: Vec::new(),
-            provider_pricing: Vec::new(),
-            pricing_sync_status: None,
             balance_query: BalanceQueryConfig::default(),
             balance_status: None,
             connection_status: None,
@@ -14176,6 +12434,73 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
+    fn latency_error_message_prefers_upstream_json_message() {
+        let message = latency_error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"model is unavailable"}}"#,
+        );
+
+        assert_eq!(message, "模型请求返回 HTTP 400: model is unavailable");
+    }
+
+    #[test]
+    fn latency_connection_status_records_success_and_failure() {
+        let success = latency_connection_status(Ok(245));
+        assert!(success.ok);
+        assert_eq!(success.latency_ms, Some(245));
+        assert!(success.error.is_none());
+
+        let failure = latency_connection_status(Err("timeout".to_string()));
+        assert!(!failure.ok);
+        assert_eq!(failure.latency_ms, None);
+        assert_eq!(failure.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn parses_synchronous_responses_reply() {
+        let body = r#"{
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Hi there"}]
+            }]
+        }"#;
+
+        assert_eq!(
+            reply_from_response_text(body, LatencyResponseFormat::Responses, false),
+            "Hi there"
+        );
+    }
+
+    #[test]
+    fn parses_chat_completion_stream_reply() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        assert_eq!(
+            reply_from_response_text(body, LatencyResponseFormat::ChatCompletions, true),
+            "Hi there"
+        );
+    }
+
+    #[test]
+    fn parses_claude_stream_reply() {
+        let body = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"!\"}}\n\n"
+        );
+
+        assert_eq!(
+            reply_from_response_text(body, LatencyResponseFormat::ClaudeMessages, true),
+            "Hello!"
+        );
+    }
+
+    #[test]
     fn parses_model_ids_from_models_response() {
         let models = models_from_response_value(&json!({
             "data": [
@@ -14244,7 +12569,6 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 source: "local-alias".to_string(),
                 target: "claude-sonnet-5".to_string(),
             }],
-            provider_pricing: vec![],
             connection_status: None,
         };
         let upstream = claude_model_values_from_response_value(&json!({
@@ -14352,7 +12676,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
-    fn codex_catalog_adds_max_and_ultra_for_gpt_5_6_family() {
+    fn codex_catalog_applies_gpt_5_6_variant_profiles() {
         let template = json!({
             "slug": "gpt-5.5",
             "display_name": "GPT-5.5",
@@ -14364,7 +12688,44 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             ]
         });
 
-        for model_name in ["gpt-5.6", "gpt-5.6-sol", "GPT-5.6-TERRA"] {
+        let max_and_ultra = ["low", "medium", "high", "xhigh", "max", "ultra"];
+        let max_only = ["low", "medium", "high", "xhigh", "max"];
+        for (
+            model_name,
+            expected_efforts,
+            expected_display_name,
+            expected_default_effort,
+            expected_multi_agent_version,
+        ) in [
+            (
+                "gpt-5.6",
+                max_and_ultra.as_slice(),
+                "GPT-5.6",
+                "medium",
+                "v2",
+            ),
+            (
+                "gpt-5.6-sol",
+                max_and_ultra.as_slice(),
+                "GPT-5.6-Sol",
+                "low",
+                "v2",
+            ),
+            (
+                "GPT-5.6-TERRA",
+                max_and_ultra.as_slice(),
+                "GPT-5.6-Terra",
+                "medium",
+                "v2",
+            ),
+            (
+                "gpt-5.6-luna",
+                max_only.as_slice(),
+                "GPT-5.6-Luna",
+                "medium",
+                "v1",
+            ),
+        ] {
             let catalog = codex_models_catalog_value_with_templates(
                 vec![model_name.to_string()],
                 std::slice::from_ref(&template),
@@ -14378,10 +12739,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 .filter_map(|level| level.get("effort").and_then(Value::as_str))
                 .collect::<Vec<_>>();
 
-            assert_eq!(
-                efforts,
-                vec!["low", "medium", "high", "xhigh", "max", "ultra"]
-            );
+            assert_eq!(efforts, expected_efforts);
             assert_eq!(
                 levels
                     .first()
@@ -14389,21 +12747,134 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     .and_then(Value::as_str),
                 Some("template low")
             );
+            assert_eq!(
+                catalog
+                    .pointer("/models/0/display_name")
+                    .and_then(Value::as_str),
+                Some(expected_display_name)
+            );
+            assert_eq!(
+                catalog
+                    .pointer("/models/0/default_reasoning_level")
+                    .and_then(Value::as_str),
+                Some(expected_default_effort)
+            );
+            assert_eq!(
+                catalog
+                    .pointer("/models/0/multi_agent_version")
+                    .and_then(Value::as_str),
+                Some(expected_multi_agent_version)
+            );
+            assert_eq!(
+                catalog
+                    .pointer("/models/0/use_responses_lite")
+                    .and_then(Value::as_bool),
+                Some(true)
+            );
+            assert_eq!(
+                catalog
+                    .pointer("/models/0/tool_mode")
+                    .and_then(Value::as_str),
+                Some("code_mode_only")
+            );
         }
 
-        let fallback_catalog =
-            codex_models_catalog_value_with_templates(vec!["gpt-5.6-sol".to_string()], &[]);
-        let fallback_efforts = fallback_catalog
+        for (model_name, expected_efforts) in [
+            ("gpt-5.6-sol", max_and_ultra.as_slice()),
+            ("gpt-5.6-luna", max_only.as_slice()),
+        ] {
+            let fallback_catalog =
+                codex_models_catalog_value_with_templates(vec![model_name.to_string()], &[]);
+            let fallback_efforts = fallback_catalog
+                .pointer("/models/0/supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .expect("fallback reasoning levels")
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(fallback_efforts, expected_efforts);
+        }
+    }
+
+    #[test]
+    fn codex_catalog_removes_stale_ultra_from_luna_profile() {
+        let template = json!({
+            "slug": "gpt-5.6-luna",
+            "supported_reasoning_levels": [
+                { "effort": "low", "description": "low" },
+                { "effort": "max", "description": "max" },
+                { "effort": "ultra", "description": "stale ultra" },
+                { "effort": "future", "description": "future effort" }
+            ],
+            "multi_agent_version": "v2"
+        });
+        let catalog = codex_models_catalog_value_with_templates(
+            vec!["gpt-5.6-luna".to_string()],
+            std::slice::from_ref(&template),
+        );
+        let efforts = catalog
             .pointer("/models/0/supported_reasoning_levels")
             .and_then(Value::as_array)
-            .expect("fallback reasoning levels")
+            .expect("reasoning levels")
             .iter()
             .filter_map(|level| level.get("effort").and_then(Value::as_str))
             .collect::<Vec<_>>();
+
         assert_eq!(
-            fallback_efforts,
-            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+            efforts,
+            vec!["low", "medium", "high", "xhigh", "max", "future"]
         );
+        assert_eq!(
+            catalog
+                .pointer("/models/0/multi_agent_version")
+                .and_then(Value::as_str),
+            Some("v1")
+        );
+    }
+
+    #[test]
+    fn codex_catalog_prefers_bundled_templates_over_cached_templates() {
+        let bundled = vec![
+            json!({
+                "slug": "gpt-5.6-sol",
+                "template_source": "bundled",
+                "multi_agent_version": "v2"
+            }),
+            json!({
+                "slug": "gpt-5.6-terra",
+                "template_source": "bundled"
+            }),
+        ];
+        let cached = vec![
+            json!({
+                "slug": "GPT-5.6-SOL",
+                "template_source": "self-poisoned-cache",
+                "multi_agent_version": null
+            }),
+            json!({
+                "slug": "custom-model",
+                "template_source": "cache"
+            }),
+        ];
+
+        let merged = merge_codex_model_catalog_templates(bundled, cached);
+        assert_eq!(merged.len(), 3);
+        let sol = merged
+            .iter()
+            .find(|entry| {
+                entry
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .is_some_and(|slug| slug.eq_ignore_ascii_case("gpt-5.6-sol"))
+            })
+            .expect("sol template");
+        assert_eq!(
+            sol.get("template_source").and_then(Value::as_str),
+            Some("bundled")
+        );
+        assert!(merged
+            .iter()
+            .any(|entry| { entry.get("slug").and_then(Value::as_str) == Some("custom-model") }));
     }
 
     #[test]
@@ -14467,10 +12938,16 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             .collect::<Vec<_>>();
 
         assert_eq!(efforts, vec!["low", "xhigh"]);
+        assert_eq!(
+            catalog
+                .pointer("/models/0/display_name")
+                .and_then(Value::as_str),
+            Some("GPT-5.5")
+        );
     }
 
     #[test]
-    fn pi_models_config_upserts_only_codex_helper_provider() {
+    fn pi_models_config_migrates_legacy_provider_to_xxswitch() {
         let config = json!({
             "providers": {
                 "other": {
@@ -14507,42 +12984,42 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         );
         assert_eq!(
             patched
-                .pointer("/providers/codex-helper/baseUrl")
+                .pointer("/providers/xxswitch/baseUrl")
                 .and_then(Value::as_str),
             Some("http://127.0.0.1:18080/v1")
         );
         assert_eq!(
             patched
-                .pointer("/providers/codex-helper/api")
+                .pointer("/providers/xxswitch/api")
                 .and_then(Value::as_str),
             Some("openai-responses")
         );
         assert_eq!(
             patched
-                .pointer("/providers/codex-helper/apiKey")
+                .pointer("/providers/xxswitch/apiKey")
                 .and_then(Value::as_str),
             Some("local-token")
         );
         assert_eq!(
             patched
-                .pointer("/providers/codex-helper/models/0/id")
+                .pointer("/providers/xxswitch/models/0/id")
                 .and_then(Value::as_str),
             Some("gpt-5.5")
         );
         assert_eq!(
             patched
-                .pointer("/providers/codex-helper/models/0/contextWindow")
+                .pointer("/providers/xxswitch/models/0/contextWindow")
                 .and_then(Value::as_i64),
             Some(256_000)
         );
         assert_eq!(
             patched
-                .pointer("/providers/codex-helper/models/0/reasoning")
+                .pointer("/providers/xxswitch/models/0/reasoning")
                 .and_then(Value::as_bool),
             Some(true)
         );
         assert_eq!(
-            patched.pointer("/providers/codex-helper/models/0/thinkingLevelMap"),
+            patched.pointer("/providers/xxswitch/models/0/thinkingLevelMap"),
             Some(&json!({
                 "off": null,
                 "minimal": null,
@@ -14555,27 +13032,23 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
 
         let raw = restore_pi_models_config(patched, Some(&backup)).unwrap();
         let restored = serde_json::from_str::<Value>(&raw).unwrap();
-        assert_eq!(
-            restored
-                .pointer("/providers/codex-helper/models/0/id")
-                .and_then(Value::as_str),
-            Some("old-model")
-        );
+        assert!(restored.pointer("/providers/xxswitch").is_none());
+        assert!(restored.pointer("/providers/codex-helper").is_none());
     }
 
     #[test]
-    fn pi_models_config_removes_codex_helper_without_backup() {
+    fn pi_models_config_removes_xxswitch_without_backup() {
         let config = json!({
             "providers": {
                 "other": { "models": [{ "id": "other-model" }] },
-                "codex-helper": { "models": [{ "id": "generated-model" }] }
+                "xxswitch": { "models": [{ "id": "generated-model" }] }
             }
         });
 
         let raw = restore_pi_models_config(config, None).unwrap();
         let restored = serde_json::from_str::<Value>(&raw).unwrap();
 
-        assert!(restored.pointer("/providers/codex-helper").is_none());
+        assert!(restored.pointer("/providers/xxswitch").is_none());
         assert_eq!(
             restored
                 .pointer("/providers/other/models/0/id")
