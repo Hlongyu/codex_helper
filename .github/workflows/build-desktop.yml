@@ -154,6 +154,43 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Configure optional Apple signing credentials
+        if: matrix.label == 'macOS universal'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_SECRET: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD_SECRET: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY_SECRET: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID_SECRET: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD_SECRET: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID_SECRET: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "${APPLE_CERTIFICATE_SECRET:-}" ]; then
+            echo "Apple signing certificate is not configured; using the ad-hoc signing identity from tauri.conf.json."
+            exit 0
+          fi
+
+          append_env() {
+            local name="$1"
+            local value="$2"
+            if [ -z "$value" ]; then
+              return
+            fi
+            local delimiter="CODEX_HELPER_$(uuidgen)"
+            {
+              echo "${name}<<${delimiter}"
+              echo "$value"
+              echo "$delimiter"
+            } >> "$GITHUB_ENV"
+          }
+
+          append_env APPLE_CERTIFICATE "$APPLE_CERTIFICATE_SECRET"
+          append_env APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD_SECRET"
+          append_env APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY_SECRET"
+          append_env APPLE_ID "$APPLE_ID_SECRET"
+          append_env APPLE_PASSWORD "$APPLE_PASSWORD_SECRET"
+          append_env APPLE_TEAM_ID "$APPLE_TEAM_ID_SECRET"
+
       - name: Apply release version
         if: needs.prepare-release.outputs.publish == 'true'
         shell: pwsh
@@ -183,12 +220,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CODEX_HELPER_VERSION: ${{ needs.prepare-release.outputs.tag }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           releaseId: ${{ needs.prepare-release.outputs.release_id }}
           args: ${{ matrix.build_args }}
@@ -199,12 +230,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           args: ${{ matrix.build_args }}
 
