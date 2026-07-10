@@ -1961,6 +1961,52 @@ button.danger {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
+.update-check-row > div,
+.update-result > div {
+  display: grid;
+  gap: 4px;
+}
+
+.update-check-row small,
+.update-result span {
+  color: #8390a4;
+  font-size: 12px;
+}
+
+.update-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 74px;
+  border: 1px solid #24364a;
+  border-radius: 12px;
+  background: #0d1520;
+  margin-top: 12px;
+  padding: 12px 20px;
+}
+
+.update-result.available {
+  border-color: #4c55bd;
+  background: #121836;
+}
+
+.update-result.latest {
+  border-color: #29604b;
+}
+
+.update-result strong {
+  color: #f7f9fd;
+}
+
+.update-message {
+  border: 1px solid #24364a;
+  border-radius: 10px;
+  color: #b9c6da;
+  margin-top: 12px;
+  padding: 10px 12px;
+}
+
 @media (max-width: 1280px) {
   .metric-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));

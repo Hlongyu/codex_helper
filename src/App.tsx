@@ -374,6 +374,20 @@ type RouteUsageStats = {
   available_days: string[];
 };
 
+type UpdateCheckInfo = {
+  current_version: string;
+  latest_version: string;
+  available: boolean;
+  installable: boolean;
+  asset_name?: string | null;
+  release_url: string;
+};
+
+type UpdateInstallResult = {
+  message: string;
+  manual_install: boolean;
+};
+
 type AppState = {
   app_version: string;
   codex_config_path: string;
@@ -1008,6 +1022,9 @@ function App() {
   const [providerKind, setProviderKind] = useState<ProviderKind>("codex");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckInfo | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateMessage, setUpdateMessage] = useState("");
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorKind, setEditorKind] = useState<ProviderKind>("codex");
   const [editorTab, setEditorTab] = useState<EditorTab>("base");
@@ -1080,6 +1097,38 @@ function App() {
     } catch {
       setRouteUsageStats(null);
       setRouteLogs(null);
+    }
+  }
+
+  async function checkForUpdate() {
+    if (updateBusy) return;
+    setUpdateBusy(true);
+    setUpdateMessage("");
+    try {
+      setUpdateCheck(await callCommand<UpdateCheckInfo>("check_for_update"));
+    } catch (err) {
+      setUpdateMessage(`检查更新失败：${String(err)}`);
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
+  async function installUpdate() {
+    if (!updateCheck?.available || !updateCheck.installable || updateBusy) return;
+    const suffix = updateCheck.asset_name?.toLowerCase().endsWith(".dmg")
+      ? "下载完成后会打开 DMG，请按提示替换应用。"
+      : "下载完成后会启动安装程序，当前应用将自动退出。";
+    if (!window.confirm(`更新至 ${updateCheck.latest_version}？\n\n${suffix}`)) return;
+
+    setUpdateBusy(true);
+    setUpdateMessage("");
+    try {
+      const result = await callCommand<UpdateInstallResult>("install_update");
+      setUpdateMessage(result.message);
+    } catch (err) {
+      setUpdateMessage(`更新失败：${String(err)}`);
+    } finally {
+      setUpdateBusy(false);
     }
   }
 
@@ -1889,13 +1938,40 @@ function App() {
                   <span>当前版本</span>
                   <strong>{appState.app_version}</strong>
                 </div>
+                <div className="settings-row update-check-row">
+                  <div>
+                    <span>远端更新</span>
+                    <small>从 GitHub Release 获取最新稳定版本</small>
+                  </div>
+                  <button className="ghost" disabled={updateBusy} onClick={() => void checkForUpdate()} type="button">
+                    {updateBusy ? "正在检查…" : "检查更新"}
+                  </button>
+                </div>
               </div>
-              <div className="settings-placeholder">
-                <span>当前暂无额外偏好设置</span>
-                <button className="ghost" onClick={() => setScreen("route")} type="button">
-                  打开路由配置
-                </button>
-              </div>
+              {updateCheck && (
+                <div className={`update-result ${updateCheck.available ? "available" : "latest"}`}>
+                  <div>
+                    <strong>
+                      {updateCheck.available
+                        ? `发现新版本 ${updateCheck.latest_version}`
+                        : "当前已经是最新版本"}
+                    </strong>
+                    <span>
+                      {updateCheck.available
+                        ? updateCheck.installable
+                          ? `将安装 ${updateCheck.asset_name}`
+                          : "该 Release 的当前系统安装包仍在构建或不可用"
+                        : `远端版本：${updateCheck.latest_version}`}
+                    </span>
+                  </div>
+                  {updateCheck.available && updateCheck.installable && (
+                    <button className="primary" disabled={updateBusy} onClick={() => void installUpdate()} type="button">
+                      {updateBusy ? "正在下载…" : "一键更新"}
+                    </button>
+                  )}
+                </div>
+              )}
+              {updateMessage && <div className="update-message">{updateMessage}</div>}
             </article>
           </section>
         )}

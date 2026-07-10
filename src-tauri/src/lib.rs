@@ -9,8 +9,10 @@ use axum::{
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use futures_util::{stream::BoxStream, StreamExt};
 use reqwest::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE,
+    ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING,
+    UPGRADE,
 };
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +21,7 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -46,6 +49,10 @@ const DEFAULT_NEW_API_QUOTA_PER_USD: f64 = 500_000.0;
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_SHOW_ID: &str = "show";
 const TRAY_QUIT_ID: &str = "quit";
+const GITHUB_RELEASES_LATEST_URL: &str =
+    "https://api.github.com/repos/Hlongyu/codex_helper/releases/latest";
+const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/Hlongyu/codex_helper/releases/download/";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderConfig {
@@ -761,6 +768,43 @@ struct AppState {
     router: RouterConfig,
     clients: ClientConfigs,
     router_status: RouterStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpdateCheckInfo {
+    current_version: String,
+    latest_version: String,
+    available: bool,
+    installable: bool,
+    asset_name: Option<String>,
+    release_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpdateInstallResult {
+    message: String,
+    manual_install: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdatePlatform {
+    Windows,
+    Macos,
+    Unsupported,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3524,6 +3568,127 @@ fn current_epoch_ms() -> Result<i64, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|err| format!("系统时间异常: {err}"))?
         .as_millis() as i64)
+}
+
+fn update_platform() -> UpdatePlatform {
+    if cfg!(target_os = "windows") {
+        UpdatePlatform::Windows
+    } else if cfg!(target_os = "macos") {
+        UpdatePlatform::Macos
+    } else {
+        UpdatePlatform::Unsupported
+    }
+}
+
+fn version_from_update_tag(value: &str) -> Result<Version, String> {
+    Version::parse(value.trim().trim_start_matches('v'))
+        .map_err(|err| format!("无法解析版本号 {value}: {err}"))
+}
+
+fn update_is_available(current_version: &str, latest_version: &str) -> Result<bool, String> {
+    Ok(version_from_update_tag(current_version)? < version_from_update_tag(latest_version)?)
+}
+
+fn update_asset_for_platform<'a>(
+    assets: &'a [GithubReleaseAsset],
+    platform: UpdatePlatform,
+) -> Option<&'a GithubReleaseAsset> {
+    match platform {
+        UpdatePlatform::Windows => assets
+            .iter()
+            .find(|asset| asset.name.to_ascii_lowercase().ends_with("_x64-setup.exe"))
+            .or_else(|| {
+                assets
+                    .iter()
+                    .find(|asset| asset.name.to_ascii_lowercase().ends_with(".exe"))
+            }),
+        UpdatePlatform::Macos => assets
+            .iter()
+            .find(|asset| asset.name.to_ascii_lowercase().ends_with("_universal.dmg"))
+            .or_else(|| {
+                assets
+                    .iter()
+                    .find(|asset| asset.name.to_ascii_lowercase().ends_with(".dmg"))
+            }),
+        UpdatePlatform::Unsupported => None,
+    }
+}
+
+fn github_release_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(format!("Codex Helper/{}", env!("CODEX_HELPER_VERSION")))
+        .build()
+        .map_err(|err| format!("无法创建更新检查客户端: {err}"))
+}
+
+async fn fetch_latest_github_release() -> Result<GithubRelease, String> {
+    github_release_client()?
+        .get(GITHUB_RELEASES_LATEST_URL)
+        .header(ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|err| format!("检查更新时无法连接 GitHub: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("读取 GitHub 最新 Release 失败: {err}"))?
+        .json::<GithubRelease>()
+        .await
+        .map_err(|err| format!("无法解析 GitHub Release 信息: {err}"))
+}
+
+fn update_check_info(release: &GithubRelease) -> Result<UpdateCheckInfo, String> {
+    let current_version = env!("CODEX_HELPER_VERSION").to_string();
+    let latest_version = release.tag_name.trim().to_string();
+    let available = update_is_available(&current_version, &latest_version)?;
+    let asset = available
+        .then(|| update_asset_for_platform(&release.assets, update_platform()))
+        .flatten();
+
+    Ok(UpdateCheckInfo {
+        current_version,
+        latest_version,
+        available,
+        installable: asset.is_some(),
+        asset_name: asset.map(|asset| asset.name.clone()),
+        release_url: release.html_url.clone(),
+    })
+}
+
+fn update_download_path(asset_name: &str) -> Result<PathBuf, String> {
+    let file_name = Path::new(asset_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "更新包文件名无效".to_string())?;
+    let directory = std::env::temp_dir().join("codex-helper-updates");
+    fs::create_dir_all(&directory).map_err(|err| format!("无法创建更新下载目录: {err}"))?;
+    let timestamp = current_epoch_ms().unwrap_or_default();
+    Ok(directory.join(format!("{timestamp}-{file_name}")))
+}
+
+async fn download_update_asset(asset: &GithubReleaseAsset) -> Result<PathBuf, String> {
+    if !asset
+        .browser_download_url
+        .starts_with(GITHUB_RELEASE_DOWNLOAD_PREFIX)
+    {
+        return Err("更新包下载地址不受信任".to_string());
+    }
+    let response = github_release_client()?
+        .get(&asset.browser_download_url)
+        .send()
+        .await
+        .map_err(|err| format!("下载更新包失败: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("下载更新包失败: {err}"))?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("读取更新包失败: {err}"))?;
+    if bytes.is_empty() {
+        return Err("下载的更新包为空".to_string());
+    }
+    let path = update_download_path(&asset.name)?;
+    fs::write(&path, &bytes).map_err(|err| format!("无法保存更新包: {err}"))?;
+    Ok(path)
 }
 
 fn normalize_balance_config(
@@ -10415,6 +10580,59 @@ fn load_app_state(router_runtime: tauri::State<RouterRuntime>) -> Result<AppStat
 }
 
 #[tauri::command]
+async fn check_for_update() -> Result<UpdateCheckInfo, String> {
+    update_check_info(&fetch_latest_github_release().await?)
+}
+
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<UpdateInstallResult, String> {
+    let release = fetch_latest_github_release().await?;
+    let info = update_check_info(&release)?;
+    if !info.available {
+        return Err("当前已经是最新版本".to_string());
+    }
+    let asset = update_asset_for_platform(&release.assets, update_platform())
+        .ok_or_else(|| "该 Release 尚未包含当前系统可用的安装包".to_string())?;
+    let path = download_update_asset(asset).await?;
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new(&path)
+            .spawn()
+            .map_err(|err| format!("无法启动更新安装程序: {err}"))?;
+        let app_for_exit = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            app_for_exit.exit(0);
+        });
+        return Ok(UpdateInstallResult {
+            message: "已启动更新安装程序，Codex Helper 即将退出。".to_string(),
+            manual_install: false,
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|err| format!("无法打开更新 DMG: {err}"))?;
+        return Ok(UpdateInstallResult {
+            message: "更新 DMG 已打开，请将 Codex Helper 拖入 Applications 完成替换。".to_string(),
+            manual_install: true,
+        });
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = app;
+        let _ = path;
+        Err("当前系统暂不支持一键更新".to_string())
+    }
+}
+
+#[tauri::command]
 fn select_provider(
     provider_id: String,
     router_runtime: tauri::State<RouterRuntime>,
@@ -11529,6 +11747,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             load_app_state,
+            check_for_update,
+            install_update,
             select_provider,
             get_provider,
             get_claude_provider,
@@ -11615,6 +11835,40 @@ mod tests {
             provider_pricing: Vec::new(),
             connection_status: None,
         }
+    }
+
+    #[test]
+    fn compares_update_versions_with_v_prefix_and_prereleases() {
+        assert!(update_is_available("v1.1.7", "v1.1.8").unwrap());
+        assert!(update_is_available("v1.1.8-beta.1", "v1.1.8").unwrap());
+        assert!(!update_is_available("v1.1.8", "v1.1.8").unwrap());
+        assert!(!update_is_available("v1.1.9", "v1.1.8").unwrap());
+    }
+
+    #[test]
+    fn selects_release_asset_for_each_supported_update_platform() {
+        let assets = vec![
+            GithubReleaseAsset {
+                name: "Codex.Helper_1.1.8_universal.dmg".to_string(),
+                browser_download_url: format!("{GITHUB_RELEASE_DOWNLOAD_PREFIX}v1.1.8/mac.dmg"),
+            },
+            GithubReleaseAsset {
+                name: "Codex.Helper_1.1.8_x64-setup.exe".to_string(),
+                browser_download_url: format!("{GITHUB_RELEASE_DOWNLOAD_PREFIX}v1.1.8/windows.exe"),
+            },
+        ];
+
+        assert_eq!(
+            update_asset_for_platform(&assets, UpdatePlatform::Windows)
+                .map(|asset| asset.name.as_str()),
+            Some("Codex.Helper_1.1.8_x64-setup.exe")
+        );
+        assert_eq!(
+            update_asset_for_platform(&assets, UpdatePlatform::Macos)
+                .map(|asset| asset.name.as_str()),
+            Some("Codex.Helper_1.1.8_universal.dmg")
+        );
+        assert!(update_asset_for_platform(&assets, UpdatePlatform::Unsupported).is_none());
     }
 
     struct ChatStreamTestState {
