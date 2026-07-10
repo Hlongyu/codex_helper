@@ -5329,18 +5329,93 @@ fn load_codex_model_catalog_templates() -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn is_gpt_5_6_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model == "gpt-5.6" || model.starts_with("gpt-5.6-")
+}
+
+fn codex_reasoning_level_specs(model: &str) -> Vec<(&'static str, &'static str)> {
+    let mut levels = vec![
+        ("low", "Fast responses with lighter reasoning"),
+        ("medium", "Balances speed and reasoning depth"),
+        ("high", "Greater reasoning depth for complex work"),
+        ("xhigh", "Extra high reasoning depth for complex work"),
+    ];
+    if is_gpt_5_6_model(model) {
+        levels.extend([
+            ("max", "Maximum reasoning depth for the hardest tasks"),
+            (
+                "ultra",
+                "Maximum reasoning with parallel agent support for long-running tasks",
+            ),
+        ]);
+    }
+    levels
+}
+
+fn codex_reasoning_level_entry(effort: &str, description: &str) -> Value {
+    json!({ "effort": effort, "description": description })
+}
+
+fn apply_codex_model_reasoning_levels(model: &str, object: &mut Map<String, Value>) {
+    if !is_gpt_5_6_model(model) {
+        return;
+    }
+
+    let existing = object
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let specs = codex_reasoning_level_specs(model);
+    let mut levels = specs
+        .iter()
+        .map(|(effort, description)| {
+            existing
+                .iter()
+                .find(|entry| {
+                    entry
+                        .get("effort")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value.eq_ignore_ascii_case(effort))
+                })
+                .cloned()
+                .unwrap_or_else(|| codex_reasoning_level_entry(effort, description))
+        })
+        .collect::<Vec<_>>();
+
+    for entry in existing {
+        let Some(effort) = entry.get("effort").and_then(Value::as_str) else {
+            continue;
+        };
+        if levels.iter().any(|existing| {
+            existing
+                .get("effort")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(effort))
+        }) {
+            continue;
+        }
+        levels.push(entry);
+    }
+
+    object.insert(
+        "supported_reasoning_levels".to_string(),
+        Value::Array(levels),
+    );
+}
+
 fn fallback_codex_model_catalog_entry(model: &str) -> Value {
+    let supported_reasoning_levels = codex_reasoning_level_specs(model)
+        .into_iter()
+        .map(|(effort, description)| codex_reasoning_level_entry(effort, description))
+        .collect::<Vec<_>>();
     json!({
         "slug": model,
         "display_name": model,
         "description": "Routed by Codex Helper.",
         "default_reasoning_level": "medium",
-        "supported_reasoning_levels": [
-            { "effort": "low", "description": "Fast responses with lighter reasoning" },
-            { "effort": "medium", "description": "Balances speed and reasoning depth" },
-            { "effort": "high", "description": "Greater reasoning depth for complex work" },
-            { "effort": "xhigh", "description": "Extra high reasoning depth for complex work" }
-        ],
+        "supported_reasoning_levels": supported_reasoning_levels,
         "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": true,
@@ -5420,6 +5495,7 @@ fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Value {
     if let Some(object) = entry.as_object_mut() {
         object.insert("slug".to_string(), Value::String(model.to_string()));
         object.insert("display_name".to_string(), Value::String(model.to_string()));
+        apply_codex_model_reasoning_levels(model, object);
         apply_codex_model_context_fields(object);
         object.insert("visibility".to_string(), Value::String("list".to_string()));
         object.insert("supported_in_api".to_string(), Value::Bool(true));
@@ -5489,6 +5565,33 @@ fn model_from_request_body(body: &[u8]) -> String {
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "未知模型".to_string())
+}
+
+fn reasoning_effort_from_request_body(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/reasoning/effort")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .map(|effort| effort.trim().to_ascii_lowercase())
+        .filter(|effort| !effort.is_empty())
+}
+
+fn reasoning_effort_requires_responses(effort: Option<&str>) -> bool {
+    effort.is_some_and(|effort| {
+        effort.eq_ignore_ascii_case("max") || effort.eq_ignore_ascii_case("ultra")
+    })
+}
+
+fn provider_supports_reasoning_effort(
+    provider: &ProviderConfig,
+    reasoning_effort: Option<&str>,
+) -> bool {
+    !reasoning_effort_requires_responses(reasoning_effort)
+        || provider.wire_api == ProviderWireApi::Responses
 }
 
 fn request_has_compaction_trigger(body: &[u8]) -> bool {
@@ -7957,6 +8060,7 @@ async fn proxy_request(
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
     let model = model_from_request_body(&body_bytes);
+    let reasoning_effort = reasoning_effort_from_request_body(&body_bytes);
     let remote_compaction_v2_audit = remote_compaction_v2_audit_from_request_body(&body_bytes);
 
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
@@ -7964,11 +8068,29 @@ async fn proxy_request(
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("请求方法无效: {err}")),
     };
 
-    let candidates = candidates
+    let model_candidates = candidates
         .iter()
         .filter(|candidate| provider_accepts_model(&candidate.provider, &model))
         .collect::<Vec<_>>();
+    let candidates = model_candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            provider_supports_reasoning_effort(&candidate.provider, reasoning_effort.as_deref())
+        })
+        .collect::<Vec<_>>();
     if candidates.is_empty() {
+        if !model_candidates.is_empty()
+            && reasoning_effort_requires_responses(reasoning_effort.as_deref())
+        {
+            return proxy_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "推理强度 {} 需要使用 Responses API 上游",
+                    reasoning_effort.as_deref().unwrap_or_default()
+                ),
+            );
+        }
         let auto_disabled_supports_model = !model.trim().is_empty()
             && model != "未知模型"
             && auto_disabled_codex_provider_supports_model(&model);
@@ -12613,6 +12735,54 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
+    fn preserves_advanced_reasoning_effort_for_responses_providers() {
+        let provider = test_provider_config("provider-a", ProviderStatus::Enabled, true);
+
+        for effort in ["max", "ultra"] {
+            let body = json!({
+                "model": "gpt-5.6-sol",
+                "input": "hello",
+                "reasoning": { "effort": effort }
+            })
+            .to_string();
+            let prepared = prepare_upstream_request(
+                &provider,
+                "responses",
+                "",
+                body.as_bytes(),
+                "gpt-5.6-sol",
+            )
+            .expect("request prepares");
+            let value =
+                serde_json::from_slice::<Value>(&prepared.body).expect("prepared body is json");
+
+            assert_eq!(
+                value.pointer("/reasoning/effort").and_then(Value::as_str),
+                Some(effort)
+            );
+            assert_eq!(
+                reasoning_effort_from_request_body(body.as_bytes()).as_deref(),
+                Some(effort)
+            );
+            assert!(provider_supports_reasoning_effort(&provider, Some(effort)));
+        }
+    }
+
+    #[test]
+    fn advanced_reasoning_requires_responses_provider() {
+        let mut provider = test_provider_config("provider-a", ProviderStatus::Enabled, true);
+        provider.wire_api = ProviderWireApi::ChatCompletions;
+
+        assert!(!provider_supports_reasoning_effort(&provider, Some("max")));
+        assert!(!provider_supports_reasoning_effort(
+            &provider,
+            Some("ultra")
+        ));
+        assert!(provider_supports_reasoning_effort(&provider, Some("xhigh")));
+        assert!(provider_supports_reasoning_effort(&provider, None));
+    }
+
+    #[test]
     fn normalizes_model_mapping_drafts() {
         let mappings = normalize_model_mappings(vec![
             ModelMapping {
@@ -13833,6 +14003,124 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 .and_then(Value::as_i64),
             Some(95)
         );
+    }
+
+    #[test]
+    fn codex_catalog_adds_max_and_ultra_for_gpt_5_6_family() {
+        let template = json!({
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "supported_reasoning_levels": [
+                { "effort": "low", "description": "template low" },
+                { "effort": "medium", "description": "template medium" },
+                { "effort": "high", "description": "template high" },
+                { "effort": "xhigh", "description": "template xhigh" }
+            ]
+        });
+
+        for model_name in ["gpt-5.6", "gpt-5.6-sol", "GPT-5.6-TERRA"] {
+            let catalog = codex_models_catalog_value_with_templates(
+                vec![model_name.to_string()],
+                std::slice::from_ref(&template),
+            );
+            let levels = catalog
+                .pointer("/models/0/supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .expect("reasoning levels");
+            let efforts = levels
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                efforts,
+                vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+            );
+            assert_eq!(
+                levels
+                    .first()
+                    .and_then(|level| level.get("description"))
+                    .and_then(Value::as_str),
+                Some("template low")
+            );
+        }
+
+        let fallback_catalog =
+            codex_models_catalog_value_with_templates(vec!["gpt-5.6-sol".to_string()], &[]);
+        let fallback_efforts = fallback_catalog
+            .pointer("/models/0/supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .expect("fallback reasoning levels")
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fallback_efforts,
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+    }
+
+    #[test]
+    fn codex_catalog_deduplicates_existing_advanced_reasoning_levels() {
+        let template = json!({
+            "slug": "gpt-5.6-sol",
+            "supported_reasoning_levels": [
+                { "effort": "low", "description": "low" },
+                { "effort": "max", "description": "existing max" },
+                { "effort": "MAX", "description": "duplicate max" },
+                { "effort": "ultra", "description": "existing ultra" }
+            ]
+        });
+        let catalog = codex_models_catalog_value_with_templates(
+            vec!["gpt-5.6-sol".to_string()],
+            std::slice::from_ref(&template),
+        );
+        let levels = catalog
+            .pointer("/models/0/supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .expect("reasoning levels");
+        let efforts = levels
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            efforts,
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            levels
+                .iter()
+                .find(|level| level.get("effort").and_then(Value::as_str) == Some("max"))
+                .and_then(|level| level.get("description"))
+                .and_then(Value::as_str),
+            Some("existing max")
+        );
+    }
+
+    #[test]
+    fn codex_catalog_keeps_gpt_5_5_reasoning_levels_unchanged() {
+        let template = json!({
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "supported_reasoning_levels": [
+                { "effort": "low", "description": "low" },
+                { "effort": "xhigh", "description": "xhigh" }
+            ]
+        });
+        let catalog = codex_models_catalog_value_with_templates(
+            vec!["gpt-5.5".to_string()],
+            std::slice::from_ref(&template),
+        );
+        let efforts = catalog
+            .pointer("/models/0/supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .expect("reasoning levels")
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(efforts, vec!["low", "xhigh"]);
     }
 
     #[test]
