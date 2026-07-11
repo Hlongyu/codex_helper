@@ -1,4 +1,5 @@
 stages:
+  - test
   - verify
   - package
   - release
@@ -148,3 +149,20 @@ release:publish:
         --name "Codex Helper $CI_COMMIT_TAG" \
         --notes "Automated release for $CI_COMMIT_TAG." \
         --use-package-registry < release-assets
+include:
+  - project: software_group/ci-templates
+    ref: 2.0.0
+    file: /quality/security-baseline.v2.yml
+  - project: software_group/ci-templates
+    ref: 2.0.0
+    file: /quality/rust.v2.yml
+
+quality:rustfmt:
+  before_script:
+    - cd src-tauri
+    - rustup component add rustfmt
+
+quality:clippy:
+  before_script:
+    - cd src-tauri
+    - rustup component add clippy
