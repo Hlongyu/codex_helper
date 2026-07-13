@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
@@ -39,6 +39,12 @@ const DEFAULT_ROUTER_HOST: &str = "127.0.0.1";
 const DEFAULT_ROUTER_PORT: u16 = 18080;
 const DEFAULT_ROUTER_TOKEN: &str = "xxswitch-local-token";
 const LEGACY_DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+const MAX_CONNECT_TIMEOUT_SECS: u64 = 120;
+const MAX_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 600;
+const MAX_STREAM_IDLE_TIMEOUT_SECS: u64 = 3_600;
 const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
 const CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT: i64 = 243_200;
@@ -256,6 +262,12 @@ struct RouterConfig {
     port: u16,
     #[serde(default = "default_router_token")]
     local_token: String,
+    #[serde(default = "default_connect_timeout_secs")]
+    connect_timeout_secs: u64,
+    #[serde(default = "default_response_header_timeout_secs")]
+    response_header_timeout_secs: u64,
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    stream_idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -423,6 +435,9 @@ impl Default for RouterConfig {
             host: default_router_host(),
             port: default_router_port(),
             local_token: default_router_token(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            response_header_timeout_secs: default_response_header_timeout_secs(),
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
         }
     }
 }
@@ -735,6 +750,12 @@ struct SaveRouterPayload {
     host: String,
     port: u16,
     local_token: String,
+    #[serde(default = "default_connect_timeout_secs")]
+    connect_timeout_secs: u64,
+    #[serde(default = "default_response_header_timeout_secs")]
+    response_header_timeout_secs: u64,
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    stream_idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -806,6 +827,8 @@ struct RouterRuntime {
 
 struct RouterHandle {
     address: String,
+    timeouts: RouterTimeouts,
+    proxy_state: Arc<ProxyState>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -817,9 +840,49 @@ impl Drop for RouterHandle {
     }
 }
 
-#[derive(Clone)]
 struct ProxyState {
+    upstream: RwLock<UpstreamClient>,
+}
+
+#[derive(Clone)]
+struct UpstreamClient {
     client: reqwest::Client,
+    response_header_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RouterTimeouts {
+    connect_secs: u64,
+    response_header_secs: u64,
+    stream_idle_secs: u64,
+}
+
+impl RouterTimeouts {
+    fn from_config(config: &RouterConfig) -> Self {
+        Self {
+            connect_secs: config.connect_timeout_secs,
+            response_header_secs: config.response_header_timeout_secs,
+            stream_idle_secs: config.stream_idle_timeout_secs,
+        }
+    }
+}
+
+impl ProxyState {
+    fn upstream(&self) -> Result<UpstreamClient, String> {
+        self.upstream
+            .read()
+            .map(|upstream| upstream.clone())
+            .map_err(|_| "无法读取上游 HTTP 客户端".to_string())
+    }
+
+    fn replace_upstream(&self, upstream: UpstreamClient) -> Result<(), String> {
+        let mut current = self
+            .upstream
+            .write()
+            .map_err(|_| "无法更新上游 HTTP 客户端".to_string())?;
+        *current = upstream;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1215,6 +1278,50 @@ fn default_router_port() -> u16 {
 
 fn default_router_token() -> String {
     random_router_token()
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT_SECS
+}
+
+fn default_response_header_timeout_secs() -> u64 {
+    DEFAULT_RESPONSE_HEADER_TIMEOUT_SECS
+}
+
+fn default_stream_idle_timeout_secs() -> u64 {
+    DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+}
+
+fn validate_router_timeouts(config: &RouterConfig) -> Result<(), String> {
+    let values = [
+        (
+            "连接超时",
+            config.connect_timeout_secs,
+            MAX_CONNECT_TIMEOUT_SECS,
+        ),
+        (
+            "响应头超时",
+            config.response_header_timeout_secs,
+            MAX_RESPONSE_HEADER_TIMEOUT_SECS,
+        ),
+        (
+            "流式响应空闲超时",
+            config.stream_idle_timeout_secs,
+            MAX_STREAM_IDLE_TIMEOUT_SECS,
+        ),
+    ];
+    for (label, value, maximum) in values {
+        if value == 0 || value > maximum {
+            return Err(format!("{label}必须在 1 到 {maximum} 秒之间"));
+        }
+    }
+    if config.connect_timeout_secs > config.response_header_timeout_secs {
+        return Err("响应头超时不能小于连接超时".to_string());
+    }
+    if config.response_header_timeout_secs > config.stream_idle_timeout_secs {
+        return Err("流式响应空闲超时不能小于响应头超时".to_string());
+    }
+    Ok(())
 }
 
 fn random_router_token() -> String {
@@ -7700,6 +7807,24 @@ fn copy_upstream_headers(builder: &mut axum::http::response::Builder, headers: &
     }
 }
 
+async fn send_upstream_request(
+    request: reqwest::RequestBuilder,
+    response_header_timeout_secs: u64,
+) -> Result<reqwest::Response, String> {
+    match tokio::time::timeout(
+        Duration::from_secs(response_header_timeout_secs),
+        request.send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "等待上游响应头超过 {response_header_timeout_secs} 秒"
+        )),
+    }
+}
+
 async fn proxy_claude_models(proxy_state: Arc<ProxyState>, headers: HeaderMap) -> Response {
     let (router, candidates) = match upstream_claude_candidates() {
         Ok(config) => config,
@@ -7708,6 +7833,10 @@ async fn proxy_claude_models(proxy_state: Arc<ProxyState>, headers: HeaderMap) -
     if local_proxy_token(&headers) != Some(router.local_token.trim()) {
         return proxy_error(StatusCode::UNAUTHORIZED, "本地路由 Token 无效");
     }
+    let upstream_client = match proxy_state.upstream() {
+        Ok(upstream) => upstream,
+        Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
+    };
 
     let mut seen = BTreeSet::new();
     let mut models = Vec::new();
@@ -7715,21 +7844,19 @@ async fn proxy_claude_models(proxy_state: Arc<ProxyState>, headers: HeaderMap) -
     let mut upstream_success = false;
 
     for candidate in candidates {
-        let upstream_models = match fetch_claude_provider_model_values(
-            &proxy_state.client,
-            &candidate.provider,
-        )
-        .await
-        {
-            Ok((models, _)) => {
-                upstream_success = true;
-                models
-            }
-            Err(err) => {
-                last_error = format!("读取 {} 模型失败: {err}", candidate.provider.name);
-                Vec::new()
-            }
-        };
+        let upstream_models =
+            match fetch_claude_provider_model_values(&upstream_client.client, &candidate.provider)
+                .await
+            {
+                Ok((models, _)) => {
+                    upstream_success = true;
+                    models
+                }
+                Err(err) => {
+                    last_error = format!("读取 {} 模型失败: {err}", candidate.provider.name);
+                    Vec::new()
+                }
+            };
 
         for model in claude_route_model_values(&candidate.provider, &upstream_models) {
             push_claude_model_value(&mut models, &mut seen, model);
@@ -7760,6 +7887,10 @@ async fn proxy_claude_request(
     if local_proxy_token(&headers) != Some(router.local_token.trim()) {
         return proxy_error(StatusCode::UNAUTHORIZED, "本地路由 Token 无效");
     }
+    let upstream_client = match proxy_state.upstream() {
+        Ok(upstream) => upstream,
+        Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
+    };
 
     let query = uri
         .query()
@@ -7805,7 +7936,7 @@ async fn proxy_claude_request(
             body_with_provider_overrides(&body_bytes, upstream_model.as_deref(), None);
         let upstream_path = claude_upstream_path(&path);
         let upstream_url = join_url(&candidate.base_url, &upstream_path) + &query;
-        let mut request = proxy_state
+        let mut request = upstream_client
             .client
             .request(reqwest_method.clone(), upstream_url)
             .body(prepared_body);
@@ -7824,7 +7955,12 @@ async fn proxy_claude_request(
         }
         request = request.header("x-api-key", candidate.token.clone());
 
-        let upstream = match request.send().await {
+        let upstream = match send_upstream_request(
+            request,
+            upstream_client.response_header_timeout_secs,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(err) => {
                 last_error = format!("转发到 {} 失败: {err}", candidate.provider.name);
@@ -7976,6 +8112,10 @@ async fn proxy_request(
     if bearer_token(&headers) != Some(router.local_token.trim()) {
         return proxy_error(StatusCode::UNAUTHORIZED, "本地路由 Token 无效");
     }
+    let upstream_client = match proxy_state.upstream() {
+        Ok(upstream) => upstream,
+        Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
+    };
     if method == Method::GET && path.trim_matches('/') == "models" {
         let models = configured_route_models(&candidates);
         if !models.is_empty() {
@@ -8064,7 +8204,7 @@ async fn proxy_request(
                 request_has_compaction_trigger(&prepared.body);
         }
         let upstream_url = join_url(&candidate.base_url, &prepared.path) + &prepared.query;
-        let mut request = proxy_state
+        let mut request = upstream_client
             .client
             .request(reqwest_method.clone(), upstream_url)
             .body(prepared.body.clone());
@@ -8082,7 +8222,12 @@ async fn proxy_request(
         }
         request = request.header(AUTHORIZATION, format!("Bearer {}", candidate.token));
 
-        let upstream = match request.send().await {
+        let upstream = match send_upstream_request(
+            request,
+            upstream_client.response_header_timeout_secs,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(err) => {
                 last_error = format!("转发到 {} 失败: {err}", candidate.provider.name);
@@ -8377,6 +8522,19 @@ fn stop_router(runtime: &RouterRuntime) {
     }
 }
 
+fn build_upstream_client(config: &RouterConfig) -> Result<UpstreamClient, String> {
+    validate_router_timeouts(config)?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+        .read_timeout(Duration::from_secs(config.stream_idle_timeout_secs))
+        .build()
+        .map_err(|err| format!("无法创建上游 HTTP 客户端: {err}"))?;
+    Ok(UpstreamClient {
+        client,
+        response_header_timeout_secs: config.response_header_timeout_secs,
+    })
+}
+
 fn ensure_router(runtime: &RouterRuntime, config: &RouterConfig) -> Result<(), String> {
     if !config.enabled {
         stop_router(runtime);
@@ -8384,11 +8542,15 @@ fn ensure_router(runtime: &RouterRuntime, config: &RouterConfig) -> Result<(), S
     }
 
     let address = router_address(config);
-    if let Ok(handle) = runtime.handle.lock() {
-        if handle
-            .as_ref()
-            .is_some_and(|handle| handle.address == address)
-        {
+    let timeouts = RouterTimeouts::from_config(config);
+    if let Ok(mut handle) = runtime.handle.lock() {
+        if let Some(handle) = handle.as_mut().filter(|handle| handle.address == address) {
+            if handle.timeouts != timeouts {
+                handle
+                    .proxy_state
+                    .replace_upstream(build_upstream_client(config)?)?;
+                handle.timeouts = timeouts;
+            }
             return Ok(());
         }
     }
@@ -8404,12 +8566,12 @@ fn ensure_router(runtime: &RouterRuntime, config: &RouterConfig) -> Result<(), S
         .map_err(|err| format!("无法配置本地路由监听: {err}"))?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let proxy_state = Arc::new(ProxyState {
-        client: reqwest::Client::new(),
+        upstream: RwLock::new(build_upstream_client(config)?),
     });
     let app = Router::new()
         .route("/v1/{*path}", any(proxy_request))
         .fallback(proxy_not_found)
-        .with_state(proxy_state);
+        .with_state(Arc::clone(&proxy_state));
 
     tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(std_listener) {
@@ -8432,6 +8594,8 @@ fn ensure_router(runtime: &RouterRuntime, config: &RouterConfig) -> Result<(), S
         .map_err(|_| "无法锁定本地路由状态".to_string())?;
     *handle = Some(RouterHandle {
         address,
+        timeouts,
+        proxy_state,
         shutdown: Some(shutdown_tx),
     });
     Ok(())
@@ -10040,7 +10204,7 @@ fn save_router_config(
     if payload.enabled && local_token.is_empty() {
         return Err("本地路由 Token 不能为空".to_string());
     }
-    state.router = RouterConfig {
+    let router = RouterConfig {
         enabled: payload.enabled,
         remote_compaction_enabled: payload.remote_compaction_enabled,
         host: if host.is_empty() {
@@ -10054,7 +10218,12 @@ fn save_router_config(
         } else {
             local_token.to_string()
         },
+        connect_timeout_secs: payload.connect_timeout_secs,
+        response_header_timeout_secs: payload.response_header_timeout_secs,
+        stream_idle_timeout_secs: payload.stream_idle_timeout_secs,
     };
+    validate_router_timeouts(&router)?;
+    state.router = router;
     ensure_client_configs_applied(&mut state)?;
     save_state(&state)?;
     ensure_router(&router_runtime, &state.router)?;
@@ -10735,6 +10904,67 @@ mod tests {
     }
 
     #[test]
+    fn legacy_router_config_receives_timeout_defaults() {
+        let router = serde_json::from_value::<RouterConfig>(json!({
+            "enabled": true,
+            "remote_compaction_enabled": false,
+            "host": "127.0.0.1",
+            "port": 18080,
+            "local_token": "local-token"
+        }))
+        .unwrap();
+
+        assert_eq!(router.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
+        assert_eq!(
+            router.response_header_timeout_secs,
+            DEFAULT_RESPONSE_HEADER_TIMEOUT_SECS
+        );
+        assert_eq!(
+            router.stream_idle_timeout_secs,
+            DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn validates_router_timeout_ranges() {
+        let mut router = RouterConfig::default();
+        assert!(validate_router_timeouts(&router).is_ok());
+
+        router.connect_timeout_secs = 0;
+        assert!(validate_router_timeouts(&router)
+            .unwrap_err()
+            .contains("连接超时"));
+
+        router.connect_timeout_secs = DEFAULT_CONNECT_TIMEOUT_SECS;
+        router.response_header_timeout_secs = MAX_RESPONSE_HEADER_TIMEOUT_SECS + 1;
+        assert!(validate_router_timeouts(&router)
+            .unwrap_err()
+            .contains("响应头超时"));
+
+        router.response_header_timeout_secs = DEFAULT_RESPONSE_HEADER_TIMEOUT_SECS;
+        router.stream_idle_timeout_secs = MAX_STREAM_IDLE_TIMEOUT_SECS + 1;
+        assert!(validate_router_timeouts(&router)
+            .unwrap_err()
+            .contains("流式响应空闲超时"));
+
+        router.stream_idle_timeout_secs = DEFAULT_STREAM_IDLE_TIMEOUT_SECS;
+        router.connect_timeout_secs = 31;
+        router.response_header_timeout_secs = 30;
+        assert_eq!(
+            validate_router_timeouts(&router).unwrap_err(),
+            "响应头超时不能小于连接超时"
+        );
+
+        router.connect_timeout_secs = DEFAULT_CONNECT_TIMEOUT_SECS;
+        router.response_header_timeout_secs = 121;
+        router.stream_idle_timeout_secs = 120;
+        assert_eq!(
+            validate_router_timeouts(&router).unwrap_err(),
+            "流式响应空闲超时不能小于响应头超时"
+        );
+    }
+
+    #[test]
     fn compares_update_versions_with_v_prefix_and_prereleases() {
         assert!(update_is_available("v1.1.7", "v1.1.8").unwrap());
         assert!(update_is_available("v1.1.8-beta.1", "v1.1.8").unwrap());
@@ -11044,6 +11274,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 18080,
             local_token: "local-token".to_string(),
+            ..RouterConfig::default()
         };
 
         let patched = render_claude_patch_json(settings, &router).unwrap();
@@ -11116,6 +11347,7 @@ experimental_bearer_token = "example-token"
             host: "127.0.0.1".to_string(),
             port: 18080,
             local_token: "local-token".to_string(),
+            ..RouterConfig::default()
         };
 
         let patched = render_router_patch_toml(doc, false, &enabled_router)
@@ -12971,6 +13203,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             host: "127.0.0.1".to_string(),
             port: 18080,
             local_token: "local-token".to_string(),
+            ..RouterConfig::default()
         };
 
         let raw = render_pi_models_config(config, &router, &["gpt-5.5".to_string()]).unwrap();

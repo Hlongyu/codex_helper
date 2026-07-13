@@ -50,6 +50,9 @@ type RouterConfig = {
   host: string;
   port: number;
   local_token: string;
+  connect_timeout_secs: number;
+  response_header_timeout_secs: number;
+  stream_idle_timeout_secs: number;
 };
 
 type SkillLocationConfig = {
@@ -373,6 +376,11 @@ type TimeRange = "today" | "week" | "month" | "all";
 type TrendMetric = "tokens" | "requests";
 
 const isTauriRuntime = "__TAURI_INTERNALS__" in window;
+const ROUTER_TIMEOUT_LIMITS = {
+  connect_timeout_secs: 120,
+  response_header_timeout_secs: 600,
+  stream_idle_timeout_secs: 3600,
+} as const;
 
 function defaultBalanceQuery(endpoint = ""): BalanceQueryConfig {
   return {
@@ -394,7 +402,33 @@ function defaultRouterConfig(): RouterConfig {
     host: "127.0.0.1",
     port: 18080,
     local_token: "",
+    connect_timeout_secs: 10,
+    response_header_timeout_secs: 30,
+    stream_idle_timeout_secs: 120,
   };
+}
+
+function routerTimeoutError(router: RouterConfig) {
+  if (
+    !Number.isInteger(router.connect_timeout_secs) ||
+    router.connect_timeout_secs < 1 ||
+    router.connect_timeout_secs > ROUTER_TIMEOUT_LIMITS.connect_timeout_secs ||
+    !Number.isInteger(router.response_header_timeout_secs) ||
+    router.response_header_timeout_secs < 1 ||
+    router.response_header_timeout_secs > ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs ||
+    !Number.isInteger(router.stream_idle_timeout_secs) ||
+    router.stream_idle_timeout_secs < 1 ||
+    router.stream_idle_timeout_secs > ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs
+  ) {
+    return "请输入允许范围内的整数秒数。";
+  }
+  if (router.connect_timeout_secs > router.response_header_timeout_secs) {
+    return "响应头超时不能小于连接超时。";
+  }
+  if (router.response_header_timeout_secs > router.stream_idle_timeout_secs) {
+    return "流空闲超时不能小于响应头超时。";
+  }
+  return "";
 }
 
 function defaultClientConfigs(): ClientConfigs {
@@ -2115,6 +2149,19 @@ function RouteScreen({
   routerOn: boolean;
   setRouterDraft: (router: RouterConfig) => void;
 }) {
+  const timeoutError = routerTimeoutError(routerDraft);
+  const timeoutSettingsValid = !timeoutError;
+  const updateTimeout = (
+    field: "connect_timeout_secs" | "response_header_timeout_secs" | "stream_idle_timeout_secs",
+    rawValue: string,
+  ) => {
+    const value = Number(rawValue);
+    setRouterDraft({
+      ...routerDraft,
+      [field]: Number.isInteger(value) && value >= 0 ? value : 0,
+    });
+  };
+
   return (
     <section className="route-page">
       <div className="section-title">
@@ -2265,6 +2312,65 @@ function RouteScreen({
               />
             </label>
           </div>
+          <div className="route-timeout-settings">
+            <div>
+              <strong>上游超时</strong>
+              <p>每个供应商独立计时，超时后继续尝试下一供应商。</p>
+            </div>
+            <div className="route-timeout-grid">
+              <label className="compact-field">
+                <span>连接超时（秒）</span>
+                <input
+                  aria-invalid={
+                    routerDraft.connect_timeout_secs < 1 ||
+                    routerDraft.connect_timeout_secs > ROUTER_TIMEOUT_LIMITS.connect_timeout_secs
+                  }
+                  max={ROUTER_TIMEOUT_LIMITS.connect_timeout_secs}
+                  min={1}
+                  step={1}
+                  type="number"
+                  value={routerDraft.connect_timeout_secs}
+                  onChange={(event) => updateTimeout("connect_timeout_secs", event.currentTarget.value)}
+                />
+              </label>
+              <label className="compact-field">
+                <span>响应头超时（秒）</span>
+                <input
+                  aria-invalid={
+                    routerDraft.response_header_timeout_secs < 1 ||
+                    routerDraft.response_header_timeout_secs >
+                      ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs ||
+                    routerDraft.response_header_timeout_secs < routerDraft.connect_timeout_secs
+                  }
+                  max={ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs}
+                  min={1}
+                  step={1}
+                  type="number"
+                  value={routerDraft.response_header_timeout_secs}
+                  onChange={(event) =>
+                    updateTimeout("response_header_timeout_secs", event.currentTarget.value)
+                  }
+                />
+              </label>
+              <label className="compact-field">
+                <span>流空闲超时（秒）</span>
+                <input
+                  aria-invalid={
+                    routerDraft.stream_idle_timeout_secs < 1 ||
+                    routerDraft.stream_idle_timeout_secs > ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs ||
+                    routerDraft.stream_idle_timeout_secs < routerDraft.response_header_timeout_secs
+                  }
+                  max={ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs}
+                  min={1}
+                  step={1}
+                  type="number"
+                  value={routerDraft.stream_idle_timeout_secs}
+                  onChange={(event) => updateTimeout("stream_idle_timeout_secs", event.currentTarget.value)}
+                />
+              </label>
+            </div>
+            {timeoutError ? <small>{timeoutError}</small> : null}
+          </div>
           <div className="route-toggle-line">
             <div>
               <strong>启动程序后自动运行代理</strong>
@@ -2327,7 +2433,12 @@ function RouteScreen({
         <button className="ghost" onClick={() => setRouterDraft(appState.router)} type="button">
           恢复默认
         </button>
-        <button className="primary" disabled={busy} onClick={() => onSaveRouter(routerDraft, true)} type="button">
+        <button
+          className="primary"
+          disabled={busy || !timeoutSettingsValid}
+          onClick={() => onSaveRouter(routerDraft, true)}
+          type="button"
+        >
           保存修改
         </button>
       </div>

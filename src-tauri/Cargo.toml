@@ -25,7 +25,7 @@ toml_edit = { version = "0.23", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1", features = ["net", "sync"] }
+tokio = { version = "1", features = ["net", "sync", "time"] }
 futures-util = "0.3"
 getrandom = "0.3"
 semver = "1"

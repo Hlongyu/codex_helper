@@ -1513,6 +1513,39 @@ button.danger {
   gap: 16px;
 }
 
+.route-timeout-settings {
+  display: grid;
+  gap: 14px;
+  border-top: 1px solid #202d3d;
+  margin-top: 20px;
+  padding-top: 20px;
+}
+
+.route-timeout-settings p {
+  margin: 5px 0 0;
+  color: #8390a4;
+  font-size: 13px;
+}
+
+.route-timeout-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 12px;
+}
+
+.route-timeout-grid .compact-field {
+  margin-top: 0;
+}
+
+.route-timeout-settings > small {
+  color: #ff8f9f;
+  font-size: 12px;
+}
+
+.route-timeout-grid input[aria-invalid="true"] {
+  border-color: #b64c5f;
+}
+
 .route-toggle-line,
 .route-rule-line {
   border-top: 1px solid #202d3d;
@@ -2624,6 +2657,7 @@ textarea:focus-visible,
 .usage-row,
 .usage-detail-table > div,
 .request-log-table > div,
+.route-timeout-settings,
 .route-toggle-line,
 .route-rule-line,
 .exposure-row,
@@ -3040,12 +3074,21 @@ textarea::placeholder {
 }
 
 .route-toggle-line p,
+.route-timeout-settings p,
 .route-rule-line p,
 .route-rules-card p,
 .mapping-box-head p,
 .switch-row-card p,
 .balance-test-box p {
   color: var(--text-secondary);
+}
+
+.route-timeout-settings > small {
+  color: var(--danger);
+}
+
+.route-timeout-grid input[aria-invalid="true"] {
+  border-color: var(--danger);
 }
 
 .usage-filter-bar,
