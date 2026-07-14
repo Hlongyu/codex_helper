@@ -261,6 +261,9 @@ type RouteRequestLog = {
   reasoning_output_tokens: number;
   total_tokens: number;
   first_byte_ms?: number | null;
+  upstream_started_ms?: number | null;
+  response_header_ms?: number | null;
+  upstream_request_id?: string | null;
   total_ms: number;
 };
 
@@ -403,8 +406,8 @@ function defaultRouterConfig(): RouterConfig {
     port: 18080,
     local_token: "",
     connect_timeout_secs: 10,
-    response_header_timeout_secs: 30,
-    stream_idle_timeout_secs: 120,
+    response_header_timeout_secs: 180,
+    stream_idle_timeout_secs: 180,
   };
 }
 
@@ -654,6 +657,41 @@ function formatMs(value?: number | null) {
 function formatDuration(value: number) {
   if (value >= 1000) return `${(value / 1000).toFixed(1)} s`;
   return `${Math.round(value)} ms`;
+}
+
+function formatTimingDetails(log: RouteRequestLog) {
+  const lines = [
+    `本地请求 ID：${log.id}`,
+    `上游请求 ID：${log.upstream_request_id || "未返回"}`,
+    `总耗时：${formatDuration(log.total_ms)}`,
+    `路由尝试：${log.route_attempts} 次`,
+  ];
+  const upstreamStarted = log.upstream_started_ms;
+  const responseHeader = log.response_header_ms;
+  const firstByte = log.first_byte_ms;
+
+  if (upstreamStarted == null) {
+    lines.push("分段耗时：旧记录未采集");
+    return lines.join("\n");
+  }
+
+  lines.push(
+    `${log.route_attempts > 1 ? "发起最终上游前（含前置重试）" : "发起上游前"}：${formatDuration(upstreamStarted)}`,
+  );
+  if (responseHeader == null) {
+    lines.push(`等待响应头至结束：${formatDuration(Math.max(0, log.total_ms - upstreamStarted))}`);
+    return lines.join("\n");
+  }
+
+  lines.push(`等待响应头：${formatDuration(Math.max(0, responseHeader - upstreamStarted))}`);
+  if (firstByte == null) {
+    lines.push(`响应头后至结束：${formatDuration(Math.max(0, log.total_ms - responseHeader))}`);
+    return lines.join("\n");
+  }
+
+  lines.push(`响应头至首字节：${formatDuration(Math.max(0, firstByte - responseHeader))}`);
+  lines.push(`首字节后至结束：${formatDuration(Math.max(0, log.total_ms - firstByte))}`);
+  return lines.join("\n");
 }
 
 function formatLogTime(value: number) {
@@ -2960,7 +2998,7 @@ function RequestLogsScreen({
                 <strong>{log.provider_name}</strong>
                 <span>{formatTokenTriplet(log)}</span>
                 <b>{formatMs(log.first_byte_ms)}</b>
-                <b>{formatDuration(log.total_ms)}</b>
+                <b title={formatTimingDetails(log)}>{formatDuration(log.total_ms)}</b>
                 <span className={`route-result ${routeResultTone(log.route_result)}`}>
                   {log.route_result}
                 </span>

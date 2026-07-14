@@ -40,8 +40,8 @@ const DEFAULT_ROUTER_PORT: u16 = 18080;
 const DEFAULT_ROUTER_TOKEN: &str = "xxswitch-local-token";
 const LEGACY_DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
-const DEFAULT_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 180;
+const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 const MAX_CONNECT_TIMEOUT_SECS: u64 = 120;
 const MAX_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 600;
 const MAX_STREAM_IDLE_TIMEOUT_SECS: u64 = 3_600;
@@ -1042,6 +1042,12 @@ struct RouteRequestLog {
     reasoning_output_tokens: i64,
     total_tokens: i64,
     first_byte_ms: Option<u64>,
+    #[serde(default)]
+    upstream_started_ms: Option<u64>,
+    #[serde(default)]
+    response_header_ms: Option<u64>,
+    #[serde(default)]
+    upstream_request_id: Option<String>,
     total_ms: u64,
 }
 
@@ -1209,6 +1215,9 @@ struct PendingRouteLog {
     route_result: String,
     route_attempts: usize,
     error: Option<String>,
+    upstream_started_ms: Option<u64>,
+    response_header_ms: Option<u64>,
+    upstream_request_id: Option<String>,
     start: Instant,
 }
 
@@ -7527,6 +7536,9 @@ fn build_finished_route_log(
         reasoning_output_tokens: usage.reasoning_output_tokens,
         total_tokens: usage.total_tokens,
         first_byte_ms,
+        upstream_started_ms: pending.upstream_started_ms,
+        response_header_ms: pending.response_header_ms,
+        upstream_request_id: pending.upstream_request_id,
         total_ms,
     }
 }
@@ -7544,6 +7556,9 @@ fn build_pending_route_log(
     upstream_chain: &[String],
     status_code: Option<u16>,
     route_attempts: usize,
+    upstream_started_ms: Option<u64>,
+    response_header_ms: Option<u64>,
+    upstream_request_id: Option<String>,
     error: Option<String>,
 ) -> PendingRouteLog {
     PendingRouteLog {
@@ -7577,6 +7592,9 @@ fn build_pending_route_log(
         },
         route_attempts,
         error,
+        upstream_started_ms,
+        response_header_ms,
+        upstream_request_id,
         start,
     }
 }
@@ -7944,6 +7962,19 @@ async fn send_upstream_request(
             "等待上游响应头超过 {response_header_timeout_secs} 秒"
         )),
     }
+}
+
+fn upstream_response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    ["x-oneapi-request-id", "x-request-id"]
+        .iter()
+        .find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
 }
 
 async fn proxy_claude_models(proxy_state: Arc<ProxyState>, headers: HeaderMap) -> Response {
@@ -8337,13 +8368,18 @@ async fn proxy_request(
                 || name == HOST
                 || name == CONTENT_ENCODING
                 || name == CONTENT_LENGTH
+                || name.as_str().eq_ignore_ascii_case("x-request-id")
                 || is_hop_by_hop_header(name)
             {
                 continue;
             }
             request = request.header(name.as_str(), value.as_bytes());
         }
-        request = request.header(AUTHORIZATION, format!("Bearer {}", candidate.token));
+        request = request
+            .header(AUTHORIZATION, format!("Bearer {}", candidate.token))
+            .header("x-request-id", &route_request_id);
+
+        let upstream_started_ms = request_started.elapsed().as_millis() as u64;
 
         cancellation_guard.arm(build_pending_route_log(
             route_request_id.clone(),
@@ -8358,6 +8394,9 @@ async fn proxy_request(
             &upstream_chain,
             None,
             attempt_index + 1,
+            Some(upstream_started_ms),
+            None,
+            None,
             None,
         ));
 
@@ -8398,6 +8437,9 @@ async fn proxy_request(
                     &upstream_chain,
                     None,
                     attempt_index + 1,
+                    Some(upstream_started_ms),
+                    None,
+                    None,
                     Some(last_error.clone()),
                 ));
                 let pending = cancellation_guard.take();
@@ -8405,6 +8447,9 @@ async fn proxy_request(
                 return proxy_error(StatusCode::BAD_GATEWAY, last_error);
             }
         };
+
+        let response_header_ms = request_started.elapsed().as_millis() as u64;
+        let upstream_request_id = upstream_response_request_id(upstream.headers());
 
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -8444,6 +8489,9 @@ async fn proxy_request(
             &upstream_chain,
             Some(status.as_u16()),
             attempt_index + 1,
+            Some(upstream_started_ms),
+            Some(response_header_ms),
+            upstream_request_id,
             if status.is_success() {
                 None
             } else {
@@ -11101,8 +11149,8 @@ mod tests {
         );
 
         router.connect_timeout_secs = DEFAULT_CONNECT_TIMEOUT_SECS;
-        router.response_header_timeout_secs = 121;
-        router.stream_idle_timeout_secs = 120;
+        router.response_header_timeout_secs = DEFAULT_STREAM_IDLE_TIMEOUT_SECS + 1;
+        router.stream_idle_timeout_secs = DEFAULT_STREAM_IDLE_TIMEOUT_SECS;
         assert_eq!(
             validate_router_timeouts(&router).unwrap_err(),
             "流式响应空闲超时不能小于响应头超时"
@@ -11736,6 +11784,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             reasoning_output_tokens: 1,
             total_tokens: 10,
             first_byte_ms: Some(100),
+            upstream_started_ms: Some(10),
+            response_header_ms: Some(80),
+            upstream_request_id: Some("upstream-test-id".to_string()),
             total_ms: 200,
         }
     }
@@ -11757,6 +11808,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             route_result: "直连".to_string(),
             route_attempts: 1,
             error: None,
+            upstream_started_ms: Some(10),
+            response_header_ms: status_code.map(|_| 80),
+            upstream_request_id: status_code.map(|_| "upstream-test-id".to_string()),
             start: Instant::now(),
         }
     }
@@ -11774,6 +11828,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             Some("客户端在完整响应前断开：尚未收到远端响应")
         );
         assert_eq!(log.first_byte_ms, None);
+        assert_eq!(log.upstream_started_ms, Some(10));
+        assert_eq!(log.response_header_ms, None);
+        assert_eq!(log.upstream_request_id, None);
         assert_eq!(log.total_tokens, 0);
     }
 
@@ -11800,6 +11857,23 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(log.cached_input_tokens, 3);
         assert_eq!(log.output_tokens, 5);
         assert_eq!(log.total_tokens, 16);
+        assert_eq!(log.response_header_ms, Some(80));
+        assert_eq!(log.upstream_request_id.as_deref(), Some("upstream-test-id"));
+    }
+
+    #[test]
+    fn route_log_timing_fields_are_backward_compatible() {
+        let mut value = serde_json::to_value(route_log_for_stats_test("success", "provider-a"))
+            .expect("serialize route log");
+        let object = value.as_object_mut().expect("route log object");
+        object.remove("upstream_started_ms");
+        object.remove("response_header_ms");
+        object.remove("upstream_request_id");
+
+        let decoded: RouteRequestLog = serde_json::from_value(value).expect("deserialize old log");
+        assert_eq!(decoded.upstream_started_ms, None);
+        assert_eq!(decoded.response_header_ms, None);
+        assert_eq!(decoded.upstream_request_id, None);
     }
 
     #[test]
