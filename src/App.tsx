@@ -674,7 +674,7 @@ function statusMeta(status: string) {
 }
 
 function routeResultTone(result: string) {
-  if (result.includes("切换")) return "amber";
+  if (result.includes("切换") || result.includes("取消")) return "amber";
   if (result.includes("未完成") || result.includes("重试")) return "danger";
   return "ok";
 }
@@ -2909,6 +2909,7 @@ function RequestLogsScreen({
           <option value="">全部状态</option>
           <option value="success">成功</option>
           <option value="failed">失败</option>
+          <option value="cancelled">已取消</option>
         </select>
         <select value={filter.provider_id ?? ""} onChange={(event) => onFilter({ provider_id: event.currentTarget.value })}>
           <option value="">全部供应商</option>

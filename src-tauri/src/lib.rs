@@ -1212,6 +1212,39 @@ struct PendingRouteLog {
     start: Instant,
 }
 
+#[derive(Default)]
+struct PendingRouteLogGuard {
+    pending: Option<PendingRouteLog>,
+}
+
+impl PendingRouteLogGuard {
+    fn arm(&mut self, pending: PendingRouteLog) {
+        self.pending = Some(pending);
+    }
+
+    fn disarm(&mut self) {
+        self.pending = None;
+    }
+
+    fn pending(&self) -> &PendingRouteLog {
+        self.pending
+            .as_ref()
+            .expect("route log guard must be armed")
+    }
+
+    fn take(&mut self) -> PendingRouteLog {
+        self.pending.take().expect("route log guard must be armed")
+    }
+}
+
+impl Drop for PendingRouteLogGuard {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            finish_cancelled_route_log(pending, TokenUsage::default(), None);
+        }
+    }
+}
+
 struct RouteStreamState {
     stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     pending: PendingRouteLog,
@@ -7413,14 +7446,59 @@ fn finish_route_log(
     usage: TokenUsage,
     first_byte_ms: Option<u64>,
 ) {
-    let total_ms = pending.start.elapsed().as_millis() as u64;
-    let (day, hour) = timestamp_to_route_parts(pending.started_at_ms);
     let status = if pending.error.is_some() || !status_success {
         "failed"
     } else {
         "success"
     };
-    let log = RouteRequestLog {
+    persist_route_log(pending, status, usage, first_byte_ms);
+}
+
+fn finish_cancelled_route_log(
+    mut pending: PendingRouteLog,
+    usage: TokenUsage,
+    first_byte_ms: Option<u64>,
+) {
+    mark_pending_route_log_cancelled(&mut pending, first_byte_ms);
+    persist_route_log(pending, "cancelled", usage, first_byte_ms);
+}
+
+fn mark_pending_route_log_cancelled(pending: &mut PendingRouteLog, first_byte_ms: Option<u64>) {
+    let phase = if first_byte_ms.is_some() {
+        "流式响应尚未结束"
+    } else if pending.status_code.is_some() {
+        "已收到响应头但尚未收到响应数据"
+    } else {
+        "尚未收到远端响应"
+    };
+    pending.error = Some(format!("客户端在完整响应前断开：{phase}"));
+    pending.route_result = format!("已取消 · {phase}");
+}
+
+fn persist_route_log(
+    pending: PendingRouteLog,
+    status: &str,
+    usage: TokenUsage,
+    first_byte_ms: Option<u64>,
+) {
+    let log = build_finished_route_log(pending, status, usage, first_byte_ms);
+    if !is_usage_route_log(&log) {
+        return;
+    }
+    if let Err(err) = append_route_log(&log) {
+        eprintln!("{err}");
+    }
+}
+
+fn build_finished_route_log(
+    pending: PendingRouteLog,
+    status: &str,
+    usage: TokenUsage,
+    first_byte_ms: Option<u64>,
+) -> RouteRequestLog {
+    let total_ms = pending.start.elapsed().as_millis() as u64;
+    let (day, hour) = timestamp_to_route_parts(pending.started_at_ms);
+    RouteRequestLog {
         id: pending.id,
         started_at_ms: pending.started_at_ms,
         day,
@@ -7450,12 +7528,6 @@ fn finish_route_log(
         total_tokens: usage.total_tokens,
         first_byte_ms,
         total_ms,
-    };
-    if !is_usage_route_log(&log) {
-        return;
-    }
-    if let Err(err) = append_route_log(&log) {
-        eprintln!("{err}");
     }
 }
 
@@ -7579,6 +7651,17 @@ impl futures_util::Stream for RouteStreamState {
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
+    }
+}
+
+impl Drop for RouteStreamState {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        route_stream_finish_usage(self);
+        finish_cancelled_route_log(self.pending.clone(), self.usage.clone(), self.first_byte_ms);
     }
 }
 
@@ -7728,6 +7811,44 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             }
         }
+    }
+}
+
+impl Drop for ChatToResponsesStreamState {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if self.completed {
+            finish_route_log(
+                self.pending.clone(),
+                self.status_success,
+                self.usage.clone(),
+                self.first_byte_ms,
+            );
+            if self.status_success {
+                record_provider_success(ProviderKind::Codex, &self.pending.provider_id);
+            } else if matches!(self.pending.status_code, Some(401 | 403 | 429 | 500..=599)) {
+                record_provider_failure(
+                    ProviderKind::Codex,
+                    &self.pending.provider_id,
+                    &self.pending.provider_name,
+                    &self.pending.id,
+                    self.pending.started_at_ms,
+                    &self.pending.path,
+                    &self.pending.model,
+                    provider_failure_kind_for_status(self.pending.status_code),
+                    self.pending.status_code,
+                    self.pending
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "上游流式响应失败".to_string()),
+                );
+            }
+            return;
+        }
+        finish_cancelled_route_log(self.pending.clone(), self.usage.clone(), self.first_byte_ms);
     }
 }
 
@@ -8188,7 +8309,9 @@ async fn proxy_request(
 
     let mut upstream_chain = Vec::new();
     let mut last_error = String::new();
+    let mut cancellation_guard = PendingRouteLogGuard::default();
     for (attempt_index, candidate) in candidates.iter().enumerate() {
+        cancellation_guard.disarm();
         upstream_chain.push(candidate.provider.name.clone());
         let prepared =
             match prepare_upstream_request(&candidate.provider, &path, &query, &body_bytes, &model)
@@ -8222,6 +8345,22 @@ async fn proxy_request(
         }
         request = request.header(AUTHORIZATION, format!("Bearer {}", candidate.token));
 
+        cancellation_guard.arm(build_pending_route_log(
+            route_request_id.clone(),
+            request_started_at_ms,
+            request_started,
+            candidate,
+            &method,
+            &path,
+            &model,
+            candidate_compaction_audit.clone(),
+            prepared.upstream_model.as_deref(),
+            &upstream_chain,
+            None,
+            attempt_index + 1,
+            None,
+        ));
+
         let upstream = match send_upstream_request(
             request,
             upstream_client.response_header_timeout_secs,
@@ -8246,7 +8385,7 @@ async fn proxy_request(
                 if attempt_index + 1 < candidates.len() {
                     continue;
                 }
-                let pending = build_pending_route_log(
+                cancellation_guard.arm(build_pending_route_log(
                     route_request_id.clone(),
                     request_started_at_ms,
                     request_started,
@@ -8260,7 +8399,8 @@ async fn proxy_request(
                     None,
                     attempt_index + 1,
                     Some(last_error.clone()),
-                );
+                ));
+                let pending = cancellation_guard.take();
                 finish_route_log(pending, false, TokenUsage::default(), None);
                 return proxy_error(StatusCode::BAD_GATEWAY, last_error);
             }
@@ -8291,7 +8431,7 @@ async fn proxy_request(
             continue;
         }
 
-        let mut pending = build_pending_route_log(
+        cancellation_guard.arm(build_pending_route_log(
             route_request_id.clone(),
             request_started_at_ms,
             request_started,
@@ -8309,7 +8449,7 @@ async fn proxy_request(
             } else {
                 Some(format!("上游返回 {}", status.as_u16()))
             },
-        );
+        ));
         let status_success = status.is_success();
         let content_type = upstream
             .headers()
@@ -8335,25 +8475,29 @@ async fn proxy_request(
                     }
                 }
             }
-            let stream = RouteStreamState {
-                stream: upstream.bytes_stream().boxed(),
-                pending,
-                status_success,
-                first_byte_ms: None,
-                sse_buffer: String::new(),
-                usage: TokenUsage::default(),
-                finished: false,
-            };
+            let stream = upstream.bytes_stream().boxed();
+            let pending = cancellation_guard.take();
             return match prepared.adapter {
-                ResponseAdapter::Passthrough => builder
-                    .body(Body::from_stream(stream))
-                    .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应")),
+                ResponseAdapter::Passthrough => {
+                    let stream = RouteStreamState {
+                        stream,
+                        pending,
+                        status_success,
+                        first_byte_ms: None,
+                        sse_buffer: String::new(),
+                        usage: TokenUsage::default(),
+                        finished: false,
+                    };
+                    builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
+                        proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应")
+                    })
+                }
                 ResponseAdapter::ChatCompletionsToResponses => {
                     let stream = ChatToResponsesStreamState {
-                        stream: stream.stream,
-                        pending: stream.pending,
-                        status_success: stream.status_success,
-                        first_byte_ms: stream.first_byte_ms,
+                        stream,
+                        pending,
+                        status_success,
+                        first_byte_ms: None,
                         sse_buffer: String::new(),
                         response_id: "resp_chatcmpl".to_string(),
                         created_at: 0,
@@ -8383,11 +8527,11 @@ async fn proxy_request(
             };
         }
 
-        let first_byte_ms = Some(pending.start.elapsed().as_millis() as u64);
+        let first_byte_ms = Some(cancellation_guard.pending().start.elapsed().as_millis() as u64);
         let bytes = match upstream.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
-                let mut failed = pending;
+                let mut failed = cancellation_guard.take();
                 failed.error = Some(format!("读取上游响应失败: {err}"));
                 record_provider_failure(
                     ProviderKind::Codex,
@@ -8405,6 +8549,7 @@ async fn proxy_request(
                 return proxy_error(StatusCode::BAD_GATEWAY, format!("读取上游响应失败: {err}"));
             }
         };
+        let mut pending = cancellation_guard.take();
         let response_is_passthrough = matches!(&prepared.adapter, ResponseAdapter::Passthrough);
         let response_bytes = match prepared.adapter {
             ResponseAdapter::Passthrough => bytes,
@@ -11595,6 +11740,68 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         }
     }
 
+    fn pending_route_log_for_test(status_code: Option<u16>) -> PendingRouteLog {
+        PendingRouteLog {
+            id: "test-cancelled-provider-a".to_string(),
+            started_at_ms: 1_782_470_400_000,
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            model: "test-model".to_string(),
+            remote_compaction_v2: RemoteCompactionV2Audit::default(),
+            upstream_model: None,
+            provider_id: "provider-a".to_string(),
+            provider_name: "Provider A".to_string(),
+            provider_order: 1,
+            upstream_chain: vec!["Provider A".to_string()],
+            status_code,
+            route_result: "直连".to_string(),
+            route_attempts: 1,
+            error: None,
+            start: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn cancelled_route_log_describes_waiting_phase() {
+        let mut pending = pending_route_log_for_test(None);
+        mark_pending_route_log_cancelled(&mut pending, None);
+        let log = build_finished_route_log(pending, "cancelled", TokenUsage::default(), None);
+
+        assert_eq!(log.status, "cancelled");
+        assert_eq!(log.route_result, "已取消 · 尚未收到远端响应");
+        assert_eq!(
+            log.error.as_deref(),
+            Some("客户端在完整响应前断开：尚未收到远端响应")
+        );
+        assert_eq!(log.first_byte_ms, None);
+        assert_eq!(log.total_tokens, 0);
+    }
+
+    #[test]
+    fn cancelled_stream_route_log_keeps_partial_usage() {
+        let mut pending = pending_route_log_for_test(Some(200));
+        mark_pending_route_log_cancelled(&mut pending, Some(125));
+        let log = build_finished_route_log(
+            pending,
+            "cancelled",
+            TokenUsage {
+                input_tokens: 11,
+                cached_input_tokens: 3,
+                output_tokens: 5,
+                reasoning_output_tokens: 2,
+                total_tokens: 16,
+            },
+            Some(125),
+        );
+
+        assert_eq!(log.route_result, "已取消 · 流式响应尚未结束");
+        assert_eq!(log.first_byte_ms, Some(125));
+        assert_eq!(log.uncached_input_tokens, 8);
+        assert_eq!(log.cached_input_tokens, 3);
+        assert_eq!(log.output_tokens, 5);
+        assert_eq!(log.total_tokens, 16);
+    }
+
     #[test]
     fn route_usage_counts_tokens_only_for_successful_requests() {
         let stats = build_route_usage_stats(
@@ -11668,6 +11875,26 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(response.logs[0].path, "/v1/responses");
         assert_eq!(response.available_providers.len(), 1);
         assert_eq!(response.available_providers[0].id, "provider-a");
+    }
+
+    #[test]
+    fn route_logs_can_filter_cancelled_requests() {
+        let response = build_route_logs_response(
+            vec![
+                route_log_for_stats_test("success", "provider-a"),
+                route_log_for_stats_test("cancelled", "provider-b"),
+                route_log_for_stats_test("failed", "provider-c"),
+            ],
+            RouteLogFilter {
+                status: Some("cancelled".to_string()),
+                page_size: Some(50),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.logs[0].status, "cancelled");
+        assert_eq!(response.logs[0].provider_id, "provider-b");
     }
 
     #[test]
