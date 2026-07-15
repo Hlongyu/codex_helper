@@ -1261,7 +1261,21 @@ struct RouteStreamState {
     first_byte_ms: Option<u64>,
     sse_buffer: String,
     usage: TokenUsage,
+    terminal: Option<ResponsesStreamTerminal>,
     finished: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesStreamTerminal {
+    Completed,
+    Failed,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SseChunkMetadata {
+    compaction_response_received: bool,
+    terminal: Option<ResponsesStreamTerminal>,
 }
 
 struct ChatToResponsesStreamState {
@@ -4377,20 +4391,31 @@ fn toml_path_value(doc: &DocumentMut, path: &str) -> Option<Value> {
         .map(toml_item_to_json)
 }
 
-fn remove_toml_path(doc: &mut DocumentMut, path: &str) {
-    let parts = path.split('.').collect::<Vec<_>>();
-    let Some((last, parents)) = parts.split_last() else {
+fn remove_toml_path_from_table(table: &mut toml_edit::Table, parts: &[&str]) {
+    let Some((part, remaining)) = parts.split_first() else {
         return;
     };
-
-    let mut table = doc.as_table_mut();
-    for part in parents {
-        let Some(next) = table.get_mut(part).and_then(Item::as_table_mut) else {
-            return;
-        };
-        table = next;
+    if remaining.is_empty() {
+        table.remove(part);
+        return;
     }
-    table.remove(last);
+
+    let remove_child = table
+        .get_mut(part)
+        .and_then(Item::as_table_mut)
+        .map(|child| {
+            remove_toml_path_from_table(child, remaining);
+            child.is_empty()
+        })
+        .unwrap_or(false);
+    if remove_child {
+        table.remove(part);
+    }
+}
+
+fn remove_toml_path(doc: &mut DocumentMut, path: &str) {
+    let parts = path.split('.').collect::<Vec<_>>();
+    remove_toml_path_from_table(doc.as_table_mut(), &parts);
 }
 
 fn capture_toml_field(doc: &DocumentMut, path: &str) -> RouterFieldBackup {
@@ -7320,6 +7345,33 @@ fn usage_from_sse_event(event: &str) -> TokenUsage {
     usage
 }
 
+fn responses_stream_terminal_from_sse_event(event: &str) -> Option<ResponsesStreamTerminal> {
+    let terminal_from_type = |event_type: &str| match event_type {
+        "response.completed" => Some(ResponsesStreamTerminal::Completed),
+        "response.failed" => Some(ResponsesStreamTerminal::Failed),
+        "response.incomplete" => Some(ResponsesStreamTerminal::Incomplete),
+        _ => None,
+    };
+    if let Some(terminal) = event.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("event:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(&terminal_from_type)
+    }) {
+        return Some(terminal);
+    }
+
+    let data = event
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("data:").map(str::trim))
+        .filter(|line| !line.is_empty() && *line != "[DONE]")
+        .collect::<Vec<_>>()
+        .join("\n");
+    let value = serde_json::from_str::<Value>(&data).ok()?;
+    terminal_from_type(value.get("type")?.as_str()?)
+}
+
 fn next_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
     let bytes = buffer.as_bytes();
     let mut index = 0;
@@ -7353,13 +7405,16 @@ fn next_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
     None
 }
 
-fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) -> bool {
+fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) -> SseChunkMetadata {
     buffer.push_str(&String::from_utf8_lossy(bytes));
-    let mut compaction_response_received = false;
+    let mut metadata = SseChunkMetadata::default();
     while let Some((index, delimiter_len)) = next_sse_event_boundary(buffer) {
         let event = buffer[..index].to_string();
         buffer.drain(..index + delimiter_len);
-        compaction_response_received |= sse_event_contains_compaction_item(&event);
+        metadata.compaction_response_received |= sse_event_contains_compaction_item(&event);
+        if let Some(terminal) = responses_stream_terminal_from_sse_event(&event) {
+            metadata.terminal = Some(terminal);
+        }
         let next = usage_from_sse_event(&event);
         if !usage_is_zero(&next) {
             *usage = next;
@@ -7371,7 +7426,7 @@ fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) -
         let tail = buffer[keep_from..].to_string();
         *buffer = tail;
     }
-    compaction_response_received
+    metadata
 }
 
 fn finish_sse_usage(buffer: &mut String, usage: &mut TokenUsage) {
@@ -7387,10 +7442,13 @@ fn finish_sse_usage(buffer: &mut String, usage: &mut TokenUsage) {
 fn route_stream_ingest(state: &mut RouteStreamState, bytes: &[u8]) {
     let mut buffer = std::mem::take(&mut state.sse_buffer);
     let mut usage = std::mem::take(&mut state.usage);
-    let compaction_response_received = ingest_sse_chunk(&mut buffer, &mut usage, bytes);
+    let metadata = ingest_sse_chunk(&mut buffer, &mut usage, bytes);
     state.sse_buffer = buffer;
     state.usage = usage;
-    if compaction_response_received {
+    if metadata.terminal.is_some() {
+        state.terminal = metadata.terminal;
+    }
+    if metadata.compaction_response_received {
         state
             .pending
             .remote_compaction_v2
@@ -7406,9 +7464,13 @@ fn route_stream_finish_usage(state: &mut RouteStreamState) {
     let mut buffer = std::mem::take(&mut state.sse_buffer);
     let mut usage = std::mem::take(&mut state.usage);
     let compaction_response_received = sse_event_contains_compaction_item(&buffer);
+    let terminal = responses_stream_terminal_from_sse_event(&buffer);
     finish_sse_usage(&mut buffer, &mut usage);
     state.sse_buffer = buffer;
     state.usage = usage;
+    if terminal.is_some() {
+        state.terminal = terminal;
+    }
     if compaction_response_received {
         state
             .pending
@@ -7418,6 +7480,70 @@ fn route_stream_finish_usage(state: &mut RouteStreamState) {
             .pending
             .remote_compaction_v2
             .compaction_response_forwarded = true;
+    }
+}
+
+fn route_stream_terminal_success(
+    status_success: bool,
+    terminal: Option<ResponsesStreamTerminal>,
+) -> Option<bool> {
+    terminal
+        .map(|terminal| status_success && matches!(terminal, ResponsesStreamTerminal::Completed))
+}
+
+fn finish_route_stream(state: &mut RouteStreamState, dropped: bool) {
+    route_stream_finish_usage(state);
+    let terminal_success = route_stream_terminal_success(state.status_success, state.terminal);
+    if dropped && terminal_success.is_none() {
+        finish_cancelled_route_log(
+            state.pending.clone(),
+            state.usage.clone(),
+            state.first_byte_ms,
+        );
+        return;
+    }
+
+    let status_success = terminal_success.unwrap_or(state.status_success);
+    if let Some(terminal) = state
+        .terminal
+        .filter(|terminal| !matches!(terminal, ResponsesStreamTerminal::Completed))
+    {
+        let terminal_name = match terminal {
+            ResponsesStreamTerminal::Completed => "response.completed",
+            ResponsesStreamTerminal::Failed => "response.failed",
+            ResponsesStreamTerminal::Incomplete => "response.incomplete",
+        };
+        if state.pending.error.is_none() {
+            state.pending.error = Some(format!("上游流以 {terminal_name} 结束"));
+        }
+        state.pending.route_result = format!("失败 · {terminal_name}");
+    }
+
+    finish_route_log(
+        state.pending.clone(),
+        status_success,
+        state.usage.clone(),
+        state.first_byte_ms,
+    );
+    if status_success {
+        record_provider_success(ProviderKind::Codex, &state.pending.provider_id);
+    } else if matches!(state.pending.status_code, Some(401 | 403 | 429 | 500..=599)) {
+        record_provider_failure(
+            ProviderKind::Codex,
+            &state.pending.provider_id,
+            &state.pending.provider_name,
+            &state.pending.id,
+            state.pending.started_at_ms,
+            &state.pending.path,
+            &state.pending.model,
+            provider_failure_kind_for_status(state.pending.status_code),
+            state.pending.status_code,
+            state
+                .pending
+                .error
+                .clone()
+                .unwrap_or_else(|| "上游流式响应失败".to_string()),
+        );
     }
 }
 
@@ -7640,30 +7766,7 @@ impl futures_util::Stream for RouteStreamState {
             std::task::Poll::Ready(None) => {
                 if !self.finished {
                     self.finished = true;
-                    route_stream_finish_usage(&mut self);
-                    let pending = self.pending.clone();
-                    let usage = self.usage.clone();
-                    finish_route_log(pending, self.status_success, usage, self.first_byte_ms);
-                    if self.status_success {
-                        record_provider_success(ProviderKind::Codex, &self.pending.provider_id);
-                    } else if matches!(self.pending.status_code, Some(401 | 403 | 429 | 500..=599))
-                    {
-                        record_provider_failure(
-                            ProviderKind::Codex,
-                            &self.pending.provider_id,
-                            &self.pending.provider_name,
-                            &self.pending.id,
-                            self.pending.started_at_ms,
-                            &self.pending.path,
-                            &self.pending.model,
-                            provider_failure_kind_for_status(self.pending.status_code),
-                            self.pending.status_code,
-                            self.pending
-                                .error
-                                .clone()
-                                .unwrap_or_else(|| "上游流式响应失败".to_string()),
-                        );
-                    }
+                    finish_route_stream(&mut self, false);
                 }
                 std::task::Poll::Ready(None)
             }
@@ -7678,8 +7781,7 @@ impl Drop for RouteStreamState {
             return;
         }
         self.finished = true;
-        route_stream_finish_usage(self);
-        finish_cancelled_route_log(self.pending.clone(), self.usage.clone(), self.first_byte_ms);
+        finish_route_stream(self, true);
     }
 }
 
@@ -8534,6 +8636,7 @@ async fn proxy_request(
                         first_byte_ms: None,
                         sse_buffer: String::new(),
                         usage: TokenUsage::default(),
+                        terminal: None,
                         finished: false,
                     };
                     builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
@@ -11523,6 +11626,79 @@ mod tests {
     }
 
     #[test]
+    fn restoring_router_removes_tables_created_for_takeover() {
+        let original = r#"model = "gpt-5.6-sol"
+"#;
+        let doc = original.parse::<DocumentMut>().unwrap();
+        let backup = capture_router_backup(&doc);
+        let router = RouterConfig {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 18080,
+            local_token: "local-token".to_string(),
+            ..RouterConfig::default()
+        };
+
+        let patched = render_router_patch_toml(doc, false, &router)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let restored = restore_router_backup(patched, Some(&backup), &router).unwrap();
+        let restored_doc = restored.parse::<DocumentMut>().unwrap();
+
+        assert_eq!(
+            toml_path_value(&restored_doc, "model"),
+            Some(Value::String("gpt-5.6-sol".to_string()))
+        );
+        assert!(restored_doc.get("model_providers").is_none());
+        assert!(restored_doc.get("features").is_none());
+    }
+
+    #[test]
+    fn restoring_router_preserves_nonempty_provider_and_feature_tables() {
+        let doc = r#"[model_providers.other]
+name = "Other"
+base_url = "https://other.example/v1"
+
+[features]
+web_search = true
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let backup = capture_router_backup(&doc);
+        let router = RouterConfig {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 18080,
+            local_token: "local-token".to_string(),
+            ..RouterConfig::default()
+        };
+
+        let patched = render_router_patch_toml(doc, false, &router)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let restored = restore_router_backup(patched, Some(&backup), &router)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        assert!(restored
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get("custom"))
+            .is_none());
+        assert_eq!(
+            toml_path_value(&restored, "model_providers.other.name"),
+            Some(Value::String("Other".to_string()))
+        );
+        assert_eq!(
+            toml_path_value(&restored, "features.web_search"),
+            Some(Value::Bool(true))
+        );
+    }
+
+    #[test]
     fn remote_compaction_switches_custom_provider_name() {
         let doc = r#"
 model_provider = "custom"
@@ -11704,14 +11880,16 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         let mut buffer = String::new();
         let mut usage = TokenUsage::default();
         let first = b"event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\r\n\r\n";
-        ingest_sse_chunk(&mut buffer, &mut usage, first);
+        let first_metadata = ingest_sse_chunk(&mut buffer, &mut usage, first);
         assert!(usage_is_zero(&usage));
+        assert_eq!(first_metadata.terminal, None);
 
         let usage_event = b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":123,\"input_tokens_details\":{\"cached_tokens\":45},\"output_tokens\":67,\"output_tokens_details\":{\"reasoning_tokens\":8},\"total_tokens\":190}}}\r\n\r\n";
         let split = 80;
-        ingest_sse_chunk(&mut buffer, &mut usage, &usage_event[..split]);
+        let partial_metadata = ingest_sse_chunk(&mut buffer, &mut usage, &usage_event[..split]);
         assert!(usage_is_zero(&usage));
-        ingest_sse_chunk(&mut buffer, &mut usage, &usage_event[split..]);
+        assert_eq!(partial_metadata.terminal, None);
+        let completed_metadata = ingest_sse_chunk(&mut buffer, &mut usage, &usage_event[split..]);
 
         assert_eq!(usage.input_tokens, 123);
         assert_eq!(usage.cached_input_tokens, 45);
@@ -11719,6 +11897,43 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(usage.reasoning_output_tokens, 8);
         assert_eq!(usage.total_tokens, 190);
         assert!(buffer.is_empty());
+        assert_eq!(
+            completed_metadata.terminal,
+            Some(ResponsesStreamTerminal::Completed)
+        );
+    }
+
+    #[test]
+    fn classifies_responses_stream_terminal_events_before_eof() {
+        for (event, expected) in [
+            (
+                "event: response.completed\ndata: {}",
+                ResponsesStreamTerminal::Completed,
+            ),
+            (
+                "event: response.failed\ndata: {}",
+                ResponsesStreamTerminal::Failed,
+            ),
+            (
+                "data: {\"type\":\"response.incomplete\"}",
+                ResponsesStreamTerminal::Incomplete,
+            ),
+        ] {
+            assert_eq!(
+                responses_stream_terminal_from_sse_event(event),
+                Some(expected)
+            );
+        }
+
+        assert_eq!(
+            route_stream_terminal_success(true, Some(ResponsesStreamTerminal::Completed)),
+            Some(true)
+        );
+        assert_eq!(
+            route_stream_terminal_success(true, Some(ResponsesStreamTerminal::Failed)),
+            Some(false)
+        );
+        assert_eq!(route_stream_terminal_success(true, None), None);
     }
 
     #[test]
