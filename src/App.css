@@ -1537,12 +1537,14 @@ button.danger {
   margin-top: 0;
 }
 
-.route-timeout-settings > small {
+.route-timeout-settings > small,
+.route-provider-field > small {
   color: #ff8f9f;
   font-size: 12px;
 }
 
-.route-timeout-grid input[aria-invalid="true"] {
+.route-timeout-grid input[aria-invalid="true"],
+.route-provider-field input[aria-invalid="true"] {
   border-color: #b64c5f;
 }
 
@@ -3083,11 +3085,13 @@ textarea::placeholder {
   color: var(--text-secondary);
 }
 
-.route-timeout-settings > small {
+.route-timeout-settings > small,
+.route-provider-field > small {
   color: var(--danger);
 }
 
-.route-timeout-grid input[aria-invalid="true"] {
+.route-timeout-grid input[aria-invalid="true"],
+.route-provider-field input[aria-invalid="true"] {
   border-color: var(--danger);
 }
 

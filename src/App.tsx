@@ -47,6 +47,7 @@ type ModelMapping = {
 type RouterConfig = {
   enabled: boolean;
   remote_compaction_enabled: boolean;
+  model_provider: string;
   host: string;
   port: number;
   local_token: string;
@@ -402,6 +403,7 @@ function defaultRouterConfig(): RouterConfig {
   return {
     enabled: false,
     remote_compaction_enabled: false,
+    model_provider: "custom",
     host: "127.0.0.1",
     port: 18080,
     local_token: "",
@@ -409,6 +411,16 @@ function defaultRouterConfig(): RouterConfig {
     response_header_timeout_secs: 180,
     stream_idle_timeout_secs: 180,
   };
+}
+
+function routerModelProviderError(router: RouterConfig) {
+  const providerName = router.model_provider.trim();
+  if (!providerName) return "Provider 名称不能为空。";
+  if (providerName.length > 64) return "Provider 名称不能超过 64 个字符。";
+  if (!/^[A-Za-z0-9_-]+$/.test(providerName)) {
+    return "Provider 名称只能包含英文字母、数字、下划线和连字符。";
+  }
+  return "";
 }
 
 function routerTimeoutError(router: RouterConfig) {
@@ -2187,8 +2199,9 @@ function RouteScreen({
   routerOn: boolean;
   setRouterDraft: (router: RouterConfig) => void;
 }) {
+  const providerNameError = routerModelProviderError(routerDraft);
   const timeoutError = routerTimeoutError(routerDraft);
-  const timeoutSettingsValid = !timeoutError;
+  const routerSettingsValid = !providerNameError && !timeoutError;
   const updateTimeout = (
     field: "connect_timeout_secs" | "response_header_timeout_secs" | "stream_idle_timeout_secs",
     rawValue: string,
@@ -2230,6 +2243,19 @@ function RouteScreen({
               <button className="ghost small">复制</button>
             </div>
           </label>
+          <label className="compact-field route-provider-field">
+            <span>Provider 名称</span>
+            <input
+              aria-invalid={Boolean(providerNameError)}
+              maxLength={64}
+              spellCheck={false}
+              value={routerDraft.model_provider}
+              onChange={(event) =>
+                setRouterDraft({ ...routerDraft, model_provider: event.currentTarget.value })
+              }
+            />
+            {providerNameError ? <small>{providerNameError}</small> : null}
+          </label>
           <div className="route-diff-row">
             <span>openai_base_url → 本地代理地址</span>
             <button className="ghost small">查看变更</button>
@@ -2242,7 +2268,10 @@ function RouteScreen({
           <div className="route-toggle-line">
             <div>
               <strong>启用远程压缩</strong>
-              <p>开启时将 model_providers.custom.name 设为 OpenAI；关闭时设为 custom。</p>
+              <p>
+                开启时将 model_providers.{routerDraft.model_provider || "custom"}.name 设为
+                OpenAI；关闭时与 Provider 名称一致。
+              </p>
             </div>
             <Toggle
               checked={routerDraft.remote_compaction_enabled}
@@ -2473,7 +2502,7 @@ function RouteScreen({
         </button>
         <button
           className="primary"
-          disabled={busy || !timeoutSettingsValid}
+          disabled={busy || !routerSettingsValid}
           onClick={() => onSaveRouter(routerDraft, true)}
           type="button"
         >

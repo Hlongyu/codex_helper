@@ -37,6 +37,7 @@ const MARKER: &str = "# managed-by: xxswitch";
 const LEGACY_MARKER: &str = "# managed-by: codex-config-manager";
 const DEFAULT_ROUTER_HOST: &str = "127.0.0.1";
 const DEFAULT_ROUTER_PORT: u16 = 18080;
+const DEFAULT_ROUTER_MODEL_PROVIDER: &str = "custom";
 const DEFAULT_ROUTER_TOKEN: &str = "xxswitch-local-token";
 const LEGACY_DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -256,6 +257,8 @@ struct RouterConfig {
     enabled: bool,
     #[serde(default)]
     remote_compaction_enabled: bool,
+    #[serde(default = "default_router_model_provider")]
+    model_provider: String,
     #[serde(default = "default_router_host")]
     host: String,
     #[serde(default = "default_router_port")]
@@ -432,6 +435,7 @@ impl Default for RouterConfig {
         Self {
             enabled: false,
             remote_compaction_enabled: false,
+            model_provider: default_router_model_provider(),
             host: default_router_host(),
             port: default_router_port(),
             local_token: default_router_token(),
@@ -480,6 +484,8 @@ struct ManagerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RouterApplyBackup {
+    #[serde(default = "default_router_model_provider")]
+    provider_name: String,
     #[serde(default)]
     model_provider: RouterFieldBackup,
     #[serde(default)]
@@ -747,6 +753,8 @@ struct SaveRouterPayload {
     enabled: bool,
     #[serde(default)]
     remote_compaction_enabled: bool,
+    #[serde(default = "default_router_model_provider")]
+    model_provider: String,
     host: String,
     port: u16,
     local_token: String,
@@ -1332,6 +1340,10 @@ fn default_router_port() -> u16 {
     DEFAULT_ROUTER_PORT
 }
 
+fn default_router_model_provider() -> String {
+    DEFAULT_ROUTER_MODEL_PROVIDER.to_string()
+}
+
 fn default_router_token() -> String {
     random_router_token()
 }
@@ -1346,6 +1358,23 @@ fn default_response_header_timeout_secs() -> u64 {
 
 fn default_stream_idle_timeout_secs() -> u64 {
     DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+}
+
+fn normalize_router_model_provider(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Codex Provider 名称不能为空".to_string());
+    }
+    if value.len() > 64 {
+        return Err("Codex Provider 名称不能超过 64 个字符".to_string());
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err("Codex Provider 名称只能包含英文字母、数字、下划线和连字符".to_string());
+    }
+    Ok(value.to_string())
 }
 
 fn validate_router_timeouts(config: &RouterConfig) -> Result<(), String> {
@@ -2489,6 +2518,8 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
     {
         state.router.local_token = random_router_token();
     }
+    state.router.model_provider = normalize_router_model_provider(&state.router.model_provider)
+        .unwrap_or_else(|_| default_router_model_provider());
     if state.clients.codex.enabled || state.clients.claude.enabled || state.clients.pi.enabled {
         state.router.enabled = true;
     }
@@ -2845,14 +2876,25 @@ fn mapped_model_for_claude_provider(
         .filter(|target| !target.is_empty() && target != requested)
 }
 
-fn redacted_provider(mut provider: ProviderConfig) -> ProviderConfig {
-    if let Err(err) = set_json_path(
-        &mut provider.config,
-        &["model_providers", "custom", "experimental_bearer_token"],
-        Value::String(String::new()),
-    ) {
-        eprintln!("无法脱敏供应商 Token: {err}");
+fn redact_model_provider_tokens(value: &mut Value) {
+    let Some(providers) = value
+        .get_mut("model_providers")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for provider in providers.values_mut().filter_map(Value::as_object_mut) {
+        if provider.contains_key("experimental_bearer_token") {
+            provider.insert(
+                "experimental_bearer_token".to_string(),
+                Value::String(String::new()),
+            );
+        }
     }
+}
+
+fn redacted_provider(mut provider: ProviderConfig) -> ProviderConfig {
+    redact_model_provider_tokens(&mut provider.config);
     provider.balance_query.query_token.clear();
     provider
 }
@@ -2863,18 +2905,7 @@ fn redacted_claude_provider(mut provider: ClaudeProviderConfig) -> ClaudeProvide
 }
 
 fn redacted_config_value(mut value: Value) -> Value {
-    if value
-        .pointer("/model_providers/custom/experimental_bearer_token")
-        .is_some()
-    {
-        if let Err(err) = set_json_path(
-            &mut value,
-            &["model_providers", "custom", "experimental_bearer_token"],
-            Value::String(String::new()),
-        ) {
-            eprintln!("无法脱敏配置 Token: {err}");
-        }
-    }
+    redact_model_provider_tokens(&mut value);
     value
 }
 
@@ -2885,20 +2916,29 @@ fn redacted_toml_text(raw: &str) -> String {
     let Ok(mut doc) = raw.parse::<DocumentMut>() else {
         return raw.to_string();
     };
-    if toml_path_value(&doc, "model_providers.custom.experimental_bearer_token").is_some() {
-        if let Err(err) = set_toml_path(
-            &mut doc,
-            "model_providers.custom.experimental_bearer_token",
-            &Value::String(String::new()),
-        ) {
-            eprintln!("无法脱敏 TOML Token: {err}");
+    if let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
+        for provider in providers
+            .iter_mut()
+            .filter_map(|(_, item)| item.as_table_mut())
+        {
+            if provider.contains_key("experimental_bearer_token") {
+                provider.insert(
+                    "experimental_bearer_token",
+                    Item::Value(TomlValue::from("")),
+                );
+            }
         }
     }
     doc.to_string()
 }
 
+fn is_model_provider_token_path(path: &str) -> bool {
+    let parts = path.split('.').collect::<Vec<_>>();
+    parts.len() == 3 && parts[0] == "model_providers" && parts[2] == "experimental_bearer_token"
+}
+
 fn redacted_path_value(path: &str, value: &Value) -> Value {
-    if path == "model_providers.custom.experimental_bearer_token" {
+    if is_model_provider_token_path(path) {
         Value::String(String::new())
     } else {
         value.clone()
@@ -2906,7 +2946,7 @@ fn redacted_path_value(path: &str, value: &Value) -> Value {
 }
 
 fn redacted_diff(mut diff: DiffEntry) -> DiffEntry {
-    if diff.path == "model_providers.custom.experimental_bearer_token" {
+    if is_model_provider_token_path(&diff.path) {
         diff.current = diff.current.map(|_| Value::String(String::new()));
         diff.desired = diff.desired.map(|_| Value::String(String::new()));
     }
@@ -4209,16 +4249,7 @@ fn flatten_into(prefix: Option<String>, value: &Value, out: &mut BTreeMap<String
 }
 
 fn source_for_path(state: &ManagerState, provider: Option<&ProviderConfig>, path: &str) -> String {
-    if state.router.enabled
-        && matches!(
-            path,
-            "model_provider"
-                | "model_providers.custom.name"
-                | "model_providers.custom.base_url"
-                | "model_providers.custom.experimental_bearer_token"
-                | "features.remote_compaction_v2"
-        )
-    {
+    if state.router.enabled && is_router_managed_path(&state.router, path) {
         return "本地路由".to_string();
     }
 
@@ -4426,13 +4457,44 @@ fn capture_toml_field(doc: &DocumentMut, path: &str) -> RouterFieldBackup {
     }
 }
 
-fn capture_router_backup(doc: &DocumentMut) -> RouterApplyBackup {
+fn router_provider_path(provider_name: &str, field: &str) -> String {
+    format!("model_providers.{provider_name}.{field}")
+}
+
+fn router_managed_paths(router: &RouterConfig) -> [String; 5] {
+    let provider_name = normalize_router_model_provider(&router.model_provider)
+        .unwrap_or_else(|_| default_router_model_provider());
+    [
+        "model_provider".to_string(),
+        router_provider_path(&provider_name, "name"),
+        router_provider_path(&provider_name, "base_url"),
+        router_provider_path(&provider_name, "experimental_bearer_token"),
+        "features.remote_compaction_v2".to_string(),
+    ]
+}
+
+fn is_router_managed_path(router: &RouterConfig, path: &str) -> bool {
+    router_managed_paths(router)
+        .iter()
+        .any(|managed_path| managed_path == path)
+}
+
+fn router_backup_provider_name(backup: &RouterApplyBackup) -> String {
+    normalize_router_model_provider(&backup.provider_name)
+        .unwrap_or_else(|_| default_router_model_provider())
+}
+
+fn capture_router_backup(doc: &DocumentMut, provider_name: &str) -> RouterApplyBackup {
     RouterApplyBackup {
+        provider_name: provider_name.to_string(),
         model_provider: capture_toml_field(doc, "model_provider"),
-        custom_name: capture_toml_field(doc, "model_providers.custom.name"),
+        custom_name: capture_toml_field(doc, &router_provider_path(provider_name, "name")),
         remote_compaction_v2: capture_toml_field(doc, "features.remote_compaction_v2"),
-        custom_base_url: capture_toml_field(doc, "model_providers.custom.base_url"),
-        custom_token: capture_toml_field(doc, "model_providers.custom.experimental_bearer_token"),
+        custom_base_url: capture_toml_field(doc, &router_provider_path(provider_name, "base_url")),
+        custom_token: capture_toml_field(
+            doc,
+            &router_provider_path(provider_name, "experimental_bearer_token"),
+        ),
     }
 }
 
@@ -4459,8 +4521,13 @@ fn restore_router_backup(
     router: &RouterConfig,
 ) -> Result<String, String> {
     if let Some(backup) = backup {
+        let provider_name = router_backup_provider_name(backup);
         restore_toml_field(&mut doc, "model_provider", &backup.model_provider)?;
-        restore_toml_field(&mut doc, "model_providers.custom.name", &backup.custom_name)?;
+        restore_toml_field(
+            &mut doc,
+            &router_provider_path(&provider_name, "name"),
+            &backup.custom_name,
+        )?;
         restore_toml_field(
             &mut doc,
             "features.remote_compaction_v2",
@@ -4468,12 +4535,12 @@ fn restore_router_backup(
         )?;
         restore_toml_field(
             &mut doc,
-            "model_providers.custom.base_url",
+            &router_provider_path(&provider_name, "base_url"),
             &backup.custom_base_url,
         )?;
         restore_toml_field(
             &mut doc,
-            "model_providers.custom.experimental_bearer_token",
+            &router_provider_path(&provider_name, "experimental_bearer_token"),
             &backup.custom_token,
         )?;
     } else {
@@ -4481,19 +4548,33 @@ fn restore_router_backup(
         let desired_flat = flatten(&desired);
         let current = toml_doc_to_json(&doc);
         let current_flat = flatten(&current);
-        for path in [
-            "model_provider",
-            "model_providers.custom.name",
-            "model_providers.custom.base_url",
-            "model_providers.custom.experimental_bearer_token",
-            "features.remote_compaction_v2",
-        ] {
-            if desired_flat.get(path) == current_flat.get(path) {
-                remove_toml_path(&mut doc, path);
+        for path in router_managed_paths(router) {
+            if desired_flat.get(&path) == current_flat.get(&path) {
+                remove_toml_path(&mut doc, &path);
             }
         }
     }
     Ok(doc.to_string())
+}
+
+fn prepare_router_patch(
+    doc: DocumentMut,
+    backup: Option<&RouterApplyBackup>,
+    router: &RouterConfig,
+) -> Result<(DocumentMut, RouterApplyBackup), String> {
+    let provider_name = normalize_router_model_provider(&router.model_provider)?;
+    if let Some(backup) = backup {
+        if router_backup_provider_name(backup) == provider_name {
+            return Ok((doc, backup.clone()));
+        }
+        let restored = restore_router_backup(doc, Some(backup), router)?
+            .parse::<DocumentMut>()
+            .map_err(|err| format!("无法解析恢复后的 Codex 配置: {err}"))?;
+        let next_backup = capture_router_backup(&restored, &provider_name);
+        return Ok((restored, next_backup));
+    }
+    let backup = capture_router_backup(&doc, &provider_name);
+    Ok((doc, backup))
 }
 
 fn render_router_patch_toml(
@@ -4501,30 +4582,31 @@ fn render_router_patch_toml(
     marker_present: bool,
     router: &RouterConfig,
 ) -> Result<String, String> {
+    let provider_name = normalize_router_model_provider(&router.model_provider)?;
     set_toml_path(
         &mut doc,
         "model_provider",
-        &Value::String("custom".to_string()),
+        &Value::String(provider_name.clone()),
     )?;
     set_toml_path(
         &mut doc,
-        "model_providers.custom.base_url",
+        &router_provider_path(&provider_name, "base_url"),
         &Value::String(router_base_url(router)),
     )?;
     set_toml_path(
         &mut doc,
-        "model_providers.custom.experimental_bearer_token",
+        &router_provider_path(&provider_name, "experimental_bearer_token"),
         &Value::String(router.local_token.clone()),
     )?;
-    let custom_name = if router.remote_compaction_enabled {
-        "OpenAI"
+    let configured_name = if router.remote_compaction_enabled {
+        "OpenAI".to_string()
     } else {
-        "custom"
+        provider_name.clone()
     };
     set_toml_path(
         &mut doc,
-        "model_providers.custom.name",
-        &Value::String(custom_name.to_string()),
+        &router_provider_path(&provider_name, "name"),
+        &Value::String(configured_name),
     )?;
     set_toml_path(
         &mut doc,
@@ -4541,35 +4623,38 @@ fn render_router_patch_toml(
 }
 
 fn router_patch_desired(router: &RouterConfig) -> Value {
-    let mut custom = Map::new();
-    custom.insert(
+    let provider_name = normalize_router_model_provider(&router.model_provider)
+        .unwrap_or_else(|_| default_router_model_provider());
+    let mut managed_provider = Map::new();
+    managed_provider.insert(
         "base_url".to_string(),
         Value::String(router_base_url(router)),
     );
-    custom.insert(
+    managed_provider.insert(
         "experimental_bearer_token".to_string(),
         Value::String(router.local_token.clone()),
     );
-    custom.insert(
+    managed_provider.insert(
         "name".to_string(),
-        Value::String(
-            if router.remote_compaction_enabled {
-                "OpenAI"
-            } else {
-                "custom"
-            }
-            .to_string(),
-        ),
+        Value::String(if router.remote_compaction_enabled {
+            "OpenAI".to_string()
+        } else {
+            provider_name.clone()
+        }),
     );
-    json!({
-        "model_provider": "custom",
-        "model_providers": {
-            "custom": custom,
-        },
-        "features": {
-            "remote_compaction_v2": router.remote_compaction_enabled,
-        },
-    })
+    let mut model_providers = Map::new();
+    model_providers.insert(provider_name.clone(), Value::Object(managed_provider));
+    let mut root = Map::new();
+    root.insert("model_provider".to_string(), Value::String(provider_name));
+    root.insert(
+        "model_providers".to_string(),
+        Value::Object(model_providers),
+    );
+    root.insert(
+        "features".to_string(),
+        json!({ "remote_compaction_v2": router.remote_compaction_enabled }),
+    );
+    Value::Object(root)
 }
 
 fn router_patch_matches_current(current_json: &Value, router: &RouterConfig) -> bool {
@@ -4928,9 +5013,8 @@ fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String
         return Ok(false);
     }
 
-    if state.router_backup.is_none() {
-        state.router_backup = Some(capture_router_backup(&doc));
-    }
+    let (doc, backup) = prepare_router_patch(doc, state.router_backup.as_ref(), &state.router)?;
+    state.router_backup = Some(backup);
     let raw = render_router_patch_toml(doc, marker_present, &state.router)?;
     fs::write(codex_config_path()?, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
     state.last_applied = Some(desired);
@@ -10500,9 +10584,11 @@ fn save_router_config(
     if payload.enabled && local_token.is_empty() {
         return Err("本地路由 Token 不能为空".to_string());
     }
+    let model_provider = normalize_router_model_provider(&payload.model_provider)?;
     let router = RouterConfig {
         enabled: payload.enabled,
         remote_compaction_enabled: payload.remote_compaction_enabled,
+        model_provider,
         host: if host.is_empty() {
             default_router_host()
         } else {
@@ -10676,9 +10762,8 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
         }
 
         let (doc, marker_present, _, _) = read_current_toml()?;
-        if state.router_backup.is_none() {
-            state.router_backup = Some(capture_router_backup(&doc));
-        }
+        let (doc, backup) = prepare_router_patch(doc, state.router_backup.as_ref(), &state.router)?;
+        state.router_backup = Some(backup);
         let raw = render_router_patch_toml(doc, marker_present, &state.router)?;
 
         fs::write(&config_path, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
@@ -11210,6 +11295,7 @@ mod tests {
         }))
         .unwrap();
 
+        assert_eq!(router.model_provider, DEFAULT_ROUTER_MODEL_PROVIDER);
         assert_eq!(router.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
         assert_eq!(
             router.response_header_timeout_secs,
@@ -11630,7 +11716,6 @@ mod tests {
         let original = r#"model = "gpt-5.6-sol"
 "#;
         let doc = original.parse::<DocumentMut>().unwrap();
-        let backup = capture_router_backup(&doc);
         let router = RouterConfig {
             enabled: true,
             host: "127.0.0.1".to_string(),
@@ -11638,6 +11723,7 @@ mod tests {
             local_token: "local-token".to_string(),
             ..RouterConfig::default()
         };
+        let backup = capture_router_backup(&doc, &router.model_provider);
 
         let patched = render_router_patch_toml(doc, false, &router)
             .unwrap()
@@ -11665,7 +11751,6 @@ web_search = true
 "#
         .parse::<DocumentMut>()
         .unwrap();
-        let backup = capture_router_backup(&doc);
         let router = RouterConfig {
             enabled: true,
             host: "127.0.0.1".to_string(),
@@ -11673,6 +11758,7 @@ web_search = true
             local_token: "local-token".to_string(),
             ..RouterConfig::default()
         };
+        let backup = capture_router_backup(&doc, &router.model_provider);
 
         let patched = render_router_patch_toml(doc, false, &router)
             .unwrap()
@@ -11699,20 +11785,12 @@ web_search = true
     }
 
     #[test]
-    fn remote_compaction_switches_custom_provider_name() {
-        let doc = r#"
-model_provider = "custom"
-
-[model_providers.custom]
-name = "Example Provider"
-base_url = "https://example.com/v1"
-experimental_bearer_token = "example-token"
-"#
-        .parse::<DocumentMut>()
-        .unwrap();
+    fn remote_compaction_switches_configured_provider_name() {
+        let doc = DocumentMut::new();
         let enabled_router = RouterConfig {
             enabled: true,
             remote_compaction_enabled: true,
+            model_provider: "team4".to_string(),
             host: "127.0.0.1".to_string(),
             port: 18080,
             local_token: "local-token".to_string(),
@@ -11724,15 +11802,24 @@ experimental_bearer_token = "example-token"
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(
-            toml_path_value(&patched, "model_providers.custom.name"),
+            toml_path_value(&patched, "model_provider"),
+            Some(Value::String("team4".to_string()))
+        );
+        assert_eq!(
+            toml_path_value(&patched, "model_providers.team4.name"),
             Some(Value::String("OpenAI".to_string()))
         );
         assert_eq!(
             router_patch_desired(&enabled_router)
-                .pointer("/model_providers/custom/name")
+                .pointer("/model_providers/team4/name")
                 .and_then(Value::as_str),
             Some("OpenAI")
         );
+        assert!(patched
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get("custom"))
+            .is_none());
         assert_eq!(
             toml_path_value(&patched, "features.remote_compaction_v2"),
             Some(Value::Bool(true))
@@ -11751,19 +11838,104 @@ experimental_bearer_token = "example-token"
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(
-            toml_path_value(&restored, "model_providers.custom.name"),
-            Some(Value::String("custom".to_string()))
+            toml_path_value(&restored, "model_providers.team4.name"),
+            Some(Value::String("team4".to_string()))
         );
         assert_eq!(
             router_patch_desired(&disabled_router)
-                .pointer("/model_providers/custom/name")
+                .pointer("/model_providers/team4/name")
                 .and_then(Value::as_str),
-            Some("custom")
+            Some("team4")
         );
         assert_eq!(
             toml_path_value(&restored, "features.remote_compaction_v2"),
             Some(Value::Bool(false))
         );
+    }
+
+    #[test]
+    fn switching_router_provider_removes_the_previous_managed_table() {
+        let original = r#"model = "gpt-5.6-sol"
+"#;
+        let doc = original.parse::<DocumentMut>().unwrap();
+        let custom_router = RouterConfig {
+            enabled: true,
+            local_token: "local-token".to_string(),
+            ..RouterConfig::default()
+        };
+        let custom_backup = capture_router_backup(&doc, &custom_router.model_provider);
+        let custom_patched = render_router_patch_toml(doc, false, &custom_router)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        let team_router = RouterConfig {
+            model_provider: "team4".to_string(),
+            ..custom_router
+        };
+        let (restored_doc, team_backup) =
+            prepare_router_patch(custom_patched, Some(&custom_backup), &team_router).unwrap();
+        let team_patched = render_router_patch_toml(restored_doc, true, &team_router)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        assert!(team_patched
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get("custom"))
+            .is_none());
+        assert_eq!(
+            toml_path_value(&team_patched, "model_providers.team4.name"),
+            Some(Value::String("team4".to_string()))
+        );
+
+        let restored = restore_router_backup(team_patched, Some(&team_backup), &team_router)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(restored.get("model_providers").is_none());
+        assert_eq!(
+            toml_path_value(&restored, "model"),
+            Some(Value::String("gpt-5.6-sol".to_string()))
+        );
+    }
+
+    #[test]
+    fn validates_router_provider_name_for_toml_paths() {
+        assert_eq!(normalize_router_model_provider(" team4 ").unwrap(), "team4");
+        assert!(normalize_router_model_provider("").is_err());
+        assert!(normalize_router_model_provider("provider.custom").is_err());
+        assert!(normalize_router_model_provider("provider custom").is_err());
+    }
+
+    #[test]
+    fn redacts_tokens_for_configured_model_provider_names() {
+        let config = json!({
+            "model_providers": {
+                "team4": {
+                    "base_url": "https://example.com/v1",
+                    "experimental_bearer_token": "secret-token"
+                }
+            }
+        });
+        let redacted = redacted_config_value(config);
+        assert_eq!(
+            redacted
+                .pointer("/model_providers/team4/experimental_bearer_token")
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert!(is_model_provider_token_path(
+            "model_providers.team4.experimental_bearer_token"
+        ));
+
+        let redacted_toml = redacted_toml_text(
+            r#"[model_providers.team4]
+experimental_bearer_token = "secret-token"
+"#,
+        );
+        assert!(!redacted_toml.contains("secret-token"));
     }
 
     #[test]
