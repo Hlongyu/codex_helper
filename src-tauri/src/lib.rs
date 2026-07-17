@@ -4992,6 +4992,32 @@ fn pi_patch_matches_current(config: &Value, router: &RouterConfig, models: &[Str
         == Some(&pi_provider_value(router, models))
 }
 
+fn disable_pi_takeover_if_unroutable(state: &mut ManagerState, models: &[String]) -> bool {
+    if state.clients.pi.enabled && models.is_empty() {
+        state.clients.pi.enabled = false;
+        return true;
+    }
+    false
+}
+
+fn restore_pi_config_after_takeover(state: &mut ManagerState) -> Result<(), String> {
+    let path = pi_models_path()?;
+    if !path.exists() && state.pi_backup.is_none() {
+        return Ok(());
+    }
+
+    let (config, _, _) = read_pi_models_config()?;
+    let raw = restore_pi_models_config(config, state.pi_backup.as_ref())?;
+    fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| "无法定位 Pi 模型配置目录".to_string())?,
+    )
+    .map_err(|err| format!("无法创建 Pi 模型配置目录: {err}"))?;
+    fs::write(path, raw).map_err(|err| format!("无法写入 Pi 模型配置: {err}"))?;
+    state.pi_backup = None;
+    Ok(())
+}
+
 fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String> {
     if !state.clients.codex.enabled {
         return Ok(false);
@@ -5048,8 +5074,9 @@ fn ensure_pi_config_applied(state: &mut ManagerState) -> Result<bool, String> {
     }
 
     let models = route_models_for_pi(state);
-    if models.is_empty() {
-        return Err("Pi 接管需要至少一个已启用且配置完整的 Codex 供应商路由模型".to_string());
+    if disable_pi_takeover_if_unroutable(state, &models) {
+        restore_pi_config_after_takeover(state)?;
+        return Ok(true);
     }
 
     let (config, _, _) = read_pi_models_config()?;
@@ -13976,5 +14003,14 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 .and_then(Value::as_str),
             Some("other-model")
         );
+    }
+
+    #[test]
+    fn pi_takeover_is_disabled_when_no_route_models_remain() {
+        let mut state = default_state();
+        state.clients.pi.enabled = true;
+
+        assert!(disable_pi_takeover_if_unroutable(&mut state, &[]));
+        assert!(!state.clients.pi.enabled);
     }
 }
