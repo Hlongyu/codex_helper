@@ -369,6 +369,7 @@ type AppState = {
   diffs: Array<{ path: string; action: string }>;
   router: RouterConfig;
   clients: ClientConfigs;
+  multi_agent_enabled: boolean;
   router_status: RouterStatus;
 };
 
@@ -1707,6 +1708,16 @@ function App() {
     });
   }
 
+  async function saveMultiAgentEnabled(enabled: boolean) {
+    await run(async () => {
+      const state = await callCommand<AppState>("save_multi_agent_enabled", {
+        payload: { enabled },
+      });
+      setAppState(state);
+      setRouterDraft(state.router);
+    });
+  }
+
   async function saveSkillClientConfig(
     client: AgentClientKind,
     skillLocations: SkillLocationConfig[],
@@ -1979,6 +1990,7 @@ function App() {
             appState={appState}
             busy={busy}
             onSaveClientConfig={saveClientConfig}
+            onSaveMultiAgentEnabled={saveMultiAgentEnabled}
             routerDraft={routerDraft}
             routerOn={routerOn}
             setRouterDraft={setRouterDraft}
@@ -2220,6 +2232,7 @@ function RouteScreen({
   appState,
   busy,
   onSaveClientConfig,
+  onSaveMultiAgentEnabled,
   onSaveRouter,
   routerDraft,
   routerOn,
@@ -2228,6 +2241,7 @@ function RouteScreen({
   appState: AppState;
   busy: boolean;
   onSaveClientConfig: (kind: AgentClientKind, enabled: boolean) => Promise<void>;
+  onSaveMultiAgentEnabled: (enabled: boolean) => Promise<void>;
   onSaveRouter: (nextRouter: RouterConfig, apply?: boolean) => Promise<void>;
   routerDraft: RouterConfig;
   routerOn: boolean;
@@ -2313,6 +2327,18 @@ function RouteScreen({
               onChange={(remote_compaction_enabled) =>
                 setRouterDraft({ ...routerDraft, remote_compaction_enabled })
               }
+            />
+          </div>
+          <div className="route-toggle-line">
+            <div>
+              <strong>启用子代理</strong>
+              <p>控制 Codex 的 multi_agent 功能；切换后新建任务生效。</p>
+            </div>
+            <Toggle
+              checked={appState.multi_agent_enabled}
+              disabled={busy}
+              label="启用 Codex 子代理"
+              onChange={(enabled) => void onSaveMultiAgentEnabled(enabled)}
             />
           </div>
         </article>

@@ -624,6 +624,7 @@ struct AppState {
     marker_present: bool,
     router: RouterConfig,
     clients: ClientConfigs,
+    multi_agent_enabled: bool,
     router_status: RouterStatus,
 }
 
@@ -709,6 +710,11 @@ struct SaveClientConfigsPayload {
     codex_enabled: bool,
     claude_enabled: bool,
     pi_enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveMultiAgentEnabledPayload {
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4420,6 +4426,12 @@ fn toml_path_value(doc: &DocumentMut, path: &str) -> Option<Value> {
         .get(last)
         .filter(|item| !item.is_none())
         .map(toml_item_to_json)
+}
+
+fn multi_agent_enabled(doc: &DocumentMut) -> bool {
+    toml_path_value(doc, "features.multi_agent")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
 }
 
 fn remove_toml_path_from_table(table: &mut toml_edit::Table, parts: &[&str]) {
@@ -10242,6 +10254,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
             .unwrap_or_else(|| json!({}))
     };
     let (doc, marker_present, current_config_raw, current_config_exists) = read_current_toml()?;
+    let multi_agent_enabled = multi_agent_enabled(&doc);
     let current_json = toml_doc_to_json(&doc);
     let final_preview_toml = if state.clients.codex.enabled {
         render_router_patch_toml(doc, marker_present, &state.router)?
@@ -10363,6 +10376,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
         marker_present,
         router: state.router.clone(),
         clients: state.clients.clone(),
+        multi_agent_enabled,
         router_status: router_status(runtime, &state.router),
     })
 }
@@ -10930,6 +10944,25 @@ fn save_client_configs(
     }
     save_state(&state)?;
     apply_config(router_runtime)
+}
+
+#[tauri::command]
+fn save_multi_agent_enabled(
+    payload: SaveMultiAgentEnabledPayload,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
+    let (mut doc, _, _, _) = read_current_toml()?;
+    set_toml_path(
+        &mut doc,
+        "features.multi_agent",
+        &Value::Bool(payload.enabled),
+    )?;
+    fs::create_dir_all(codex_home()?).map_err(|err| format!("无法创建 Codex 目录: {err}"))?;
+    fs::write(codex_config_path()?, doc.to_string())
+        .map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
+
+    let state = load_state_file()?;
+    build_app_state(state, &router_runtime)
 }
 
 #[tauri::command]
@@ -11516,6 +11549,7 @@ pub fn run() {
             save_base_template,
             save_router_config,
             save_client_configs,
+            save_multi_agent_enabled,
             load_skill_management,
             save_skill_client_config,
             promote_client_skill,
@@ -11606,6 +11640,30 @@ mod tests {
             router.stream_idle_timeout_secs,
             DEFAULT_STREAM_IDLE_TIMEOUT_SECS
         );
+    }
+
+    #[test]
+    fn reads_and_writes_multi_agent_feature_without_changing_other_features() {
+        let mut doc = r#"[features]
+web_search = true
+multi_agent = false
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        assert!(!multi_agent_enabled(&doc));
+        set_toml_path(&mut doc, "features.multi_agent", &Value::Bool(true)).unwrap();
+
+        assert!(multi_agent_enabled(&doc));
+        assert_eq!(
+            toml_path_value(&doc, "features.web_search"),
+            Some(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn multi_agent_feature_defaults_to_enabled() {
+        assert!(multi_agent_enabled(&DocumentMut::new()));
     }
 
     #[test]
