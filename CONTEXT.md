@@ -1,6 +1,6 @@
 # XXSwitch
 
-XXSwitch manages local routing and provider configuration for Codex-compatible and Claude-compatible upstream services.
+XXSwitch is a local routing and management context for connecting known Agent Clients to user-configured model Providers. It keeps routing, observability, and Skill sharing under local control for Codex-compatible and Claude-compatible upstream services.
 
 ## Language
 
@@ -41,12 +41,44 @@ A Provider Status entered after a Provider reaches the automatic disablement thr
 _Avoid_: Temporary disable, cooldown
 
 **Route Eligibility**:
-Whether a Provider may be selected as an upstream candidate for routed model requests. Route Eligibility is affected by Provider Status and model support, but not by maintenance actions such as connection tests, balance checks, or pricing sync.
+Whether a Provider may be selected as an upstream candidate for routed model requests. Route Eligibility is affected by Provider Status and model support, but not by maintenance actions such as balance queries or Model Tests.
 _Avoid_: Availability
 
 **Route Model**:
 A model name XXSwitch exposes to Agent Clients and can route to an eligible Provider. Route Models are distinct from Provider-specific upstream model names, which may be reached through model mappings.
 _Avoid_: Provider model, upstream model
+
+**Provider Model**:
+A model offered by one Provider and eligible to be selected or mapped for routing through that Provider.
+_Avoid_: Route Model, client model
+
+**Enabled Provider Model**:
+A Provider Model selected to participate in routing for its Provider. An empty selection means the Provider accepts any requested model rather than no models.
+_Avoid_: Active model, discovered model
+
+**Model Test**:
+An explicit generation request sent to one Provider with a selected Provider Model, prompt, and delivery mode to inspect latency and the upstream reply. A Model Test is maintenance activity and does not make a model routable by itself.
+_Avoid_: Connection test, speed test
+
+**Fast Mode**:
+A Codex Provider setting that forces routed requests to use the priority service tier. Fast Mode is not available to Claude Providers.
+_Avoid_: service_tier setting, priority mode
+
+**Routed Call**:
+A model generation call accepted by the local router and forwarded to a Provider. Maintenance and discovery requests are not Routed Calls.
+_Avoid_: Request, session, connection test
+
+**Route Request Log**:
+A diagnostic record of one Routed Call, including its routing outcome, attempts, token usage, timing, and request identities. Route Request Logs are the source records from which Route Usage may be aggregated.
+_Avoid_: Route Usage, session log, connection test result
+
+**Route Timing**:
+The measured progression of a Routed Call through local routing, upstream response headers, first output, and completion. Missing Route Timing phases mean they were not captured, not that their duration was zero.
+_Avoid_: Latency, total duration
+
+**Route Usage**:
+Token, timing, status, and routing facts derived from Routed Calls. Route Usage does not include price, cost, or monetary estimates.
+_Avoid_: Cost, spend, billing usage
 
 **Skill**:
 A reusable capability directory containing `SKILL.md` that an Agent Client can discover and apply while working. A Skill is treated as user-authored working knowledge rather than as a model-routing Provider or runtime plugin, and XXSwitch manages the whole Skill directory rather than only its `SKILL.md`.

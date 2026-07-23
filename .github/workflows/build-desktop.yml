@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Optional tag name to publish a GitHub Release, for example v0.1.0"
+        description: "Optional tag name to publish a GitHub Release, for example v1.2.6"
         required: false
         type: string
   push:

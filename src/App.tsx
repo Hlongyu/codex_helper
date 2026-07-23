@@ -671,6 +671,54 @@ function formatDuration(value: number) {
   return `${Math.round(value)} ms`;
 }
 
+type RouteTimingPhase = {
+  label: string;
+  durationMs: number;
+};
+
+function routeTimingPhases(log: RouteRequestLog): RouteTimingPhase[] {
+  const upstreamStarted = log.upstream_started_ms;
+  const responseHeader = log.response_header_ms;
+  const firstByte = log.first_byte_ms;
+  if (upstreamStarted == null) return [];
+
+  const phases: RouteTimingPhase[] = [
+    {
+      label: log.route_attempts > 1 ? "发起最终上游前（含前置重试）" : "发起上游前",
+      durationMs: upstreamStarted,
+    },
+  ];
+  if (responseHeader == null) {
+    phases.push({
+      label: "等待响应头至结束",
+      durationMs: Math.max(0, log.total_ms - upstreamStarted),
+    });
+    return phases;
+  }
+
+  phases.push({
+    label: "等待响应头",
+    durationMs: Math.max(0, responseHeader - upstreamStarted),
+  });
+  if (firstByte == null) {
+    phases.push({
+      label: "响应头后至结束",
+      durationMs: Math.max(0, log.total_ms - responseHeader),
+    });
+    return phases;
+  }
+
+  phases.push({
+    label: "响应头至首字节",
+    durationMs: Math.max(0, firstByte - responseHeader),
+  });
+  phases.push({
+    label: "首字节后至结束",
+    durationMs: Math.max(0, log.total_ms - firstByte),
+  });
+  return phases;
+}
+
 function formatTimingDetails(log: RouteRequestLog) {
   const lines = [
     `本地请求 ID：${log.id}`,
@@ -678,32 +726,18 @@ function formatTimingDetails(log: RouteRequestLog) {
     `总耗时：${formatDuration(log.total_ms)}`,
     `路由尝试：${log.route_attempts} 次`,
   ];
-  const upstreamStarted = log.upstream_started_ms;
-  const responseHeader = log.response_header_ms;
-  const firstByte = log.first_byte_ms;
-
-  if (upstreamStarted == null) {
+  const phases = routeTimingPhases(log);
+  if (phases.length === 0) {
     lines.push("分段耗时：旧记录未采集");
     return lines.join("\n");
   }
-
-  lines.push(
-    `${log.route_attempts > 1 ? "发起最终上游前（含前置重试）" : "发起上游前"}：${formatDuration(upstreamStarted)}`,
-  );
-  if (responseHeader == null) {
-    lines.push(`等待响应头至结束：${formatDuration(Math.max(0, log.total_ms - upstreamStarted))}`);
-    return lines.join("\n");
-  }
-
-  lines.push(`等待响应头：${formatDuration(Math.max(0, responseHeader - upstreamStarted))}`);
-  if (firstByte == null) {
-    lines.push(`响应头后至结束：${formatDuration(Math.max(0, log.total_ms - responseHeader))}`);
-    return lines.join("\n");
-  }
-
-  lines.push(`响应头至首字节：${formatDuration(Math.max(0, firstByte - responseHeader))}`);
-  lines.push(`首字节后至结束：${formatDuration(Math.max(0, log.total_ms - firstByte))}`);
+  phases.forEach((phase) => lines.push(`${phase.label}：${formatDuration(phase.durationMs)}`));
   return lines.join("\n");
+}
+
+function formatLogDateTime(value: number) {
+  if (!value) return "-";
+  return new Date(value).toLocaleString("zh-CN", { hour12: false });
 }
 
 function formatLogTime(value: number) {
@@ -2954,6 +2988,7 @@ function RequestLogsScreen({
   onToday: () => Promise<void>;
 }) {
   const rows = logs?.logs ?? [];
+  const [selectedLog, setSelectedLog] = useState<RouteRequestLog | null>(null);
 
   return (
     <section className="requests-page">
@@ -3017,7 +3052,23 @@ function RequestLogsScreen({
           {rows.map((log) => {
             const status = statusMeta(log.status);
             return (
-              <div className={log.route_attempts > 1 ? "selected" : ""} key={log.id}>
+              <div
+                aria-label={`查看请求 ${log.id} 详情`}
+                className={[
+                  log.route_attempts > 1 ? "selected" : "",
+                  selectedLog?.id === log.id ? "active" : "",
+                ].filter(Boolean).join(" ")}
+                key={log.id}
+                onClick={() => setSelectedLog(log)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setSelectedLog(log);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+              >
                 <div className="status-cell">
                   <span className={`dot ${status.tone}`} />
                   <b className={`${status.tone}-text`}>{status.label}</b>
@@ -3044,7 +3095,128 @@ function RequestLogsScreen({
           </div>
         </footer>
       </article>
+      {selectedLog ? <RequestLogDialog log={selectedLog} onClose={() => setSelectedLog(null)} /> : null}
     </section>
+  );
+}
+
+function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () => void }) {
+  const status = statusMeta(log.status);
+  const phases = routeTimingPhases(log);
+  const compactionAudit = remoteCompactionV2AuditLabel(log);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div
+      className="latency-dialog-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section
+        aria-labelledby="request-log-dialog-title"
+        aria-modal="true"
+        className="latency-dialog request-log-dialog"
+        role="dialog"
+      >
+        <header>
+          <div className="request-log-dialog-heading">
+            <div>
+              <h2 id="request-log-dialog-title">请求详情</h2>
+              <p title={log.id}>{log.id}</p>
+            </div>
+            <span className={`request-detail-status ${status.tone}`}>
+              <span className={`dot ${status.tone}`} />
+              {status.label}
+            </span>
+          </div>
+          <button aria-label="关闭" className="close" onClick={onClose} title="关闭" type="button">×</button>
+        </header>
+
+        <div className="latency-dialog-body request-log-dialog-body">
+          <section className="request-detail-section">
+            <header>
+              <h3>请求概况</h3>
+              <span>{formatLogDateTime(log.started_at_ms)}</span>
+            </header>
+            <div className="request-detail-grid">
+              <div><span>请求</span><strong>{log.method} {log.path}</strong></div>
+              <div><span>状态码</span><strong>{log.status_code ?? "-"}</strong></div>
+              <div><span>模型</span><strong>{log.model || "-"}</strong></div>
+              <div><span>上游模型</span><strong>{log.upstream_model || log.model || "-"}</strong></div>
+              <div><span>供应商</span><strong>{log.provider_name}</strong></div>
+              <div><span>路由尝试</span><strong>{log.route_attempts} 次</strong></div>
+            </div>
+          </section>
+
+          <section className="request-detail-section">
+            <header>
+              <h3>耗时阶段</h3>
+              <strong>{formatDuration(log.total_ms)}</strong>
+            </header>
+            {phases.length > 0 ? (
+              <div className="request-timing-list">
+                {phases.map((phase) => {
+                  const width = log.total_ms > 0
+                    ? Math.max(phase.durationMs > 0 ? 2 : 0, (phase.durationMs / log.total_ms) * 100)
+                    : 0;
+                  return (
+                    <div className="request-timing-row" key={phase.label}>
+                      <span>{phase.label}</span>
+                      <div><i style={{ width: `${Math.min(100, width)}%` }} /></div>
+                      <strong>{formatDuration(phase.durationMs)}</strong>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="request-detail-empty">该记录创建时尚未采集分段耗时。</p>
+            )}
+          </section>
+
+          <section className="request-detail-section">
+            <header><h3>Token 明细</h3></header>
+            <div className="request-token-grid">
+              <div><span>输入</span><strong>{formatTokenCount(log.input_tokens)}</strong></div>
+              <div><span>非缓存</span><strong>{formatTokenCount(log.uncached_input_tokens)}</strong></div>
+              <div><span>缓存</span><strong>{formatTokenCount(log.cached_input_tokens)}</strong></div>
+              <div><span>输出</span><strong>{formatTokenCount(log.output_tokens)}</strong></div>
+              <div><span>推理输出</span><strong>{formatTokenCount(log.reasoning_output_tokens)}</strong></div>
+              <div><span>总计</span><strong>{formatTokenCount(log.total_tokens)}</strong></div>
+            </div>
+          </section>
+
+          <section className="request-detail-section">
+            <header><h3>路由详情</h3></header>
+            <dl className="request-route-details">
+              <div><dt>路由结果</dt><dd>{log.route_result}</dd></div>
+              <div><dt>上游链路</dt><dd>{log.upstream_chain.join(" → ") || "-"}</dd></div>
+              <div><dt>本地请求 ID</dt><dd><code>{log.id}</code></dd></div>
+              <div><dt>上游请求 ID</dt><dd><code>{log.upstream_request_id || "未返回"}</code></dd></div>
+              {compactionAudit ? <div><dt>远程压缩</dt><dd>{compactionAudit}</dd></div> : null}
+            </dl>
+          </section>
+
+          {log.error ? (
+            <section className="request-detail-section request-error-detail">
+              <header><h3>错误详情</h3></header>
+              <pre>{log.error}</pre>
+            </section>
+          ) : null}
+        </div>
+
+        <footer>
+          <button className="primary" onClick={onClose} type="button">关闭</button>
+        </footer>
+      </section>
+    </div>
   );
 }
 
