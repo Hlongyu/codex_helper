@@ -1019,6 +1019,7 @@ struct ClaudeUpstreamCandidate {
     provider: ClaudeProviderConfig,
     base_url: String,
     token: String,
+    route_order: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1284,6 +1285,7 @@ enum ResponsesStreamTerminal {
 struct SseChunkMetadata {
     compaction_response_received: bool,
     terminal: Option<ResponsesStreamTerminal>,
+    claude_message_stop: bool,
 }
 
 struct ChatToResponsesStreamState {
@@ -1313,14 +1315,12 @@ struct ChatToResponsesStreamState {
 
 struct ClaudeStreamState {
     stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
-    provider_id: String,
-    provider_name: String,
-    request_id: String,
-    started_at_ms: i64,
-    path: String,
-    model: String,
+    pending: PendingRouteLog,
     status_success: bool,
-    status_code: Option<u16>,
+    first_byte_ms: Option<u64>,
+    sse_buffer: String,
+    usage: TokenUsage,
+    completed: bool,
     finished: bool,
 }
 
@@ -5243,8 +5243,9 @@ fn upstream_claude_candidates() -> Result<(RouterConfig, Vec<ClaudeUpstreamCandi
     let candidates = state
         .claude_providers
         .iter()
-        .filter(|provider| provider.status == ProviderStatus::Enabled)
-        .filter_map(|provider| {
+        .enumerate()
+        .filter(|(_, provider)| provider.status == ProviderStatus::Enabled)
+        .filter_map(|(index, provider)| {
             let base_url = provider.base_url.trim().trim_end_matches('/');
             let token = provider.api_key.trim();
             if base_url.is_empty() || token.is_empty() {
@@ -5254,6 +5255,7 @@ fn upstream_claude_candidates() -> Result<(RouterConfig, Vec<ClaudeUpstreamCandi
                 provider: provider.clone(),
                 base_url: base_url.to_string(),
                 token: token.to_string(),
+                route_order: index + 1,
             })
         })
         .collect::<Vec<_>>();
@@ -7423,8 +7425,22 @@ fn usage_from_response_value(value: &Value) -> TokenUsage {
     value
         .get("usage")
         .or_else(|| value.pointer("/response/usage"))
+        .or_else(|| value.pointer("/message/usage"))
         .map(usage_from_value)
         .unwrap_or_default()
+}
+
+fn merge_token_usage(usage: &mut TokenUsage, next: TokenUsage) {
+    usage.input_tokens = usage.input_tokens.max(next.input_tokens);
+    usage.cached_input_tokens = usage.cached_input_tokens.max(next.cached_input_tokens);
+    usage.output_tokens = usage.output_tokens.max(next.output_tokens);
+    usage.reasoning_output_tokens = usage
+        .reasoning_output_tokens
+        .max(next.reasoning_output_tokens);
+    usage.total_tokens = usage
+        .total_tokens
+        .max(next.total_tokens)
+        .max(usage.input_tokens.saturating_add(usage.output_tokens));
 }
 
 fn usage_from_sse_event(event: &str) -> TokenUsage {
@@ -7483,6 +7499,32 @@ fn responses_stream_terminal_from_sse_event(event: &str) -> Option<ResponsesStre
     terminal_from_type(value.get("type")?.as_str()?)
 }
 
+fn sse_event_has_type(event: &str, expected: &str) -> bool {
+    if event.lines().any(|line| {
+        line.trim()
+            .strip_prefix("event:")
+            .is_some_and(|value| value.trim() == expected)
+    }) {
+        return true;
+    }
+
+    let data = event
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("data:").map(str::trim))
+        .filter(|line| !line.is_empty() && *line != "[DONE]")
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str::<Value>(&data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|event_type| event_type == expected)
+}
+
 fn next_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
     let bytes = buffer.as_bytes();
     let mut index = 0;
@@ -7526,9 +7568,10 @@ fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) -
         if let Some(terminal) = responses_stream_terminal_from_sse_event(&event) {
             metadata.terminal = Some(terminal);
         }
+        metadata.claude_message_stop |= sse_event_has_type(&event, "message_stop");
         let next = usage_from_sse_event(&event);
         if !usage_is_zero(&next) {
-            *usage = next;
+            merge_token_usage(usage, next);
         }
     }
 
@@ -7544,7 +7587,7 @@ fn finish_sse_usage(buffer: &mut String, usage: &mut TokenUsage) {
     if !buffer.trim().is_empty() {
         let next = usage_from_sse_event(buffer);
         if !usage_is_zero(&next) {
-            *usage = next;
+            merge_token_usage(usage, next);
         }
     }
     buffer.clear();
@@ -7679,7 +7722,7 @@ fn usage_from_response_text(text: &str) -> TokenUsage {
         if let Ok(value) = serde_json::from_str::<Value>(data) {
             let next = usage_from_response_value(&value);
             if !usage_is_zero(&next) {
-                usage = next;
+                merge_token_usage(&mut usage, next);
             }
         }
     }
@@ -7827,6 +7870,64 @@ fn build_pending_route_log(
         } else {
             "直连".to_string()
         },
+        route_attempts,
+        error,
+        upstream_started_ms,
+        response_header_ms,
+        upstream_request_id,
+        start,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_pending_claude_route_log(
+    id: String,
+    started_at_ms: i64,
+    start: Instant,
+    candidate: &ClaudeUpstreamCandidate,
+    method: &Method,
+    path: &str,
+    model: &str,
+    upstream_model: Option<&str>,
+    upstream_chain: &[String],
+    status_code: Option<u16>,
+    route_attempts: usize,
+    upstream_started_ms: Option<u64>,
+    response_header_ms: Option<u64>,
+    upstream_request_id: Option<String>,
+    error: Option<String>,
+) -> PendingRouteLog {
+    let route_result = if let Some(upstream_model) = upstream_model {
+        let prefix = if route_attempts > 1 {
+            format!("切换 {} 次", route_attempts - 1)
+        } else if error.is_some() {
+            "未完成".to_string()
+        } else {
+            "直连".to_string()
+        };
+        format!("{prefix} · {model} → {upstream_model}")
+    } else if route_attempts > 1 {
+        format!("切换 {} 次", route_attempts - 1)
+    } else if error.is_some() {
+        "未完成".to_string()
+    } else {
+        "直连".to_string()
+    };
+
+    PendingRouteLog {
+        id,
+        started_at_ms,
+        method: method.as_str().to_string(),
+        path: format!("/v1/{}", path.trim_start_matches('/')),
+        model: model.to_string(),
+        remote_compaction_v2: RemoteCompactionV2Audit::default(),
+        upstream_model: upstream_model.map(str::to_string),
+        provider_id: candidate.provider.id.clone(),
+        provider_name: candidate.provider.name.clone(),
+        provider_order: candidate.route_order,
+        upstream_chain: upstream_chain.to_vec(),
+        status_code,
+        route_result,
         route_attempts,
         error,
         upstream_started_ms,
@@ -8091,21 +8192,44 @@ impl futures_util::Stream for ClaudeStreamState {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         match self.stream.poll_next_unpin(cx) {
-            std::task::Poll::Ready(Some(Ok(bytes))) => std::task::Poll::Ready(Some(Ok(bytes))),
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                if self.first_byte_ms.is_none() {
+                    self.first_byte_ms = Some(self.pending.start.elapsed().as_millis() as u64);
+                }
+                let mut buffer = std::mem::take(&mut self.sse_buffer);
+                let mut usage = std::mem::take(&mut self.usage);
+                let metadata = ingest_sse_chunk(&mut buffer, &mut usage, bytes.as_ref());
+                self.sse_buffer = buffer;
+                self.usage = usage;
+                self.completed |= metadata.claude_message_stop;
+                std::task::Poll::Ready(Some(Ok(bytes)))
+            }
             std::task::Poll::Ready(Some(Err(err))) => {
                 if !self.finished {
                     self.finished = true;
+                    self.pending.error = Some(format!("读取上游流失败: {err}"));
                     record_provider_failure(
                         ProviderKind::Claude,
-                        &self.provider_id,
-                        &self.provider_name,
-                        &self.request_id,
-                        self.started_at_ms,
-                        &self.path,
-                        &self.model,
+                        &self.pending.provider_id,
+                        &self.pending.provider_name,
+                        &self.pending.id,
+                        self.pending.started_at_ms,
+                        &self.pending.path,
+                        &self.pending.model,
                         ProviderFailureKind::Stream,
-                        self.status_code,
+                        self.pending.status_code,
                         format!("读取上游流失败: {err}"),
+                    );
+                    let mut buffer = std::mem::take(&mut self.sse_buffer);
+                    let mut usage = std::mem::take(&mut self.usage);
+                    finish_sse_usage(&mut buffer, &mut usage);
+                    self.sse_buffer = buffer;
+                    self.usage = usage;
+                    finish_route_log(
+                        self.pending.clone(),
+                        false,
+                        self.usage.clone(),
+                        self.first_byte_ms,
                     );
                 }
                 std::task::Poll::Ready(Some(Err(std::io::Error::other(err))))
@@ -8113,21 +8237,37 @@ impl futures_util::Stream for ClaudeStreamState {
             std::task::Poll::Ready(None) => {
                 if !self.finished {
                     self.finished = true;
+                    let mut buffer = std::mem::take(&mut self.sse_buffer);
+                    let mut usage = std::mem::take(&mut self.usage);
+                    self.completed |= sse_event_has_type(&buffer, "message_stop");
+                    finish_sse_usage(&mut buffer, &mut usage);
+                    self.sse_buffer = buffer;
+                    self.usage = usage;
+                    finish_route_log(
+                        self.pending.clone(),
+                        self.status_success,
+                        self.usage.clone(),
+                        self.first_byte_ms,
+                    );
                     if self.status_success {
-                        record_provider_success(ProviderKind::Claude, &self.provider_id);
-                    } else if matches!(self.status_code, Some(401 | 403 | 429 | 500..=599)) {
+                        record_provider_success(ProviderKind::Claude, &self.pending.provider_id);
+                    } else if matches!(self.pending.status_code, Some(401 | 403 | 429 | 500..=599))
+                    {
                         record_provider_failure(
                             ProviderKind::Claude,
-                            &self.provider_id,
-                            &self.provider_name,
-                            &self.request_id,
-                            self.started_at_ms,
-                            &self.path,
-                            &self.model,
-                            provider_failure_kind_for_status(self.status_code),
-                            self.status_code,
-                            self.status_code
-                                .map(|status| format!("{} 返回 {}", self.provider_name, status))
+                            &self.pending.provider_id,
+                            &self.pending.provider_name,
+                            &self.pending.id,
+                            self.pending.started_at_ms,
+                            &self.pending.path,
+                            &self.pending.model,
+                            provider_failure_kind_for_status(self.pending.status_code),
+                            self.pending.status_code,
+                            self.pending
+                                .status_code
+                                .map(|status| {
+                                    format!("{} 返回 {}", self.pending.provider_name, status)
+                                })
                                 .unwrap_or_else(|| "上游流式响应失败".to_string()),
                         );
                     }
@@ -8135,6 +8275,56 @@ impl futures_util::Stream for ClaudeStreamState {
                 std::task::Poll::Ready(None)
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ClaudeStreamState {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let mut buffer = std::mem::take(&mut self.sse_buffer);
+        let mut usage = std::mem::take(&mut self.usage);
+        self.completed |= sse_event_has_type(&buffer, "message_stop");
+        finish_sse_usage(&mut buffer, &mut usage);
+        self.sse_buffer = buffer;
+        self.usage = usage;
+
+        if !self.completed {
+            finish_cancelled_route_log(
+                self.pending.clone(),
+                self.usage.clone(),
+                self.first_byte_ms,
+            );
+            return;
+        }
+
+        finish_route_log(
+            self.pending.clone(),
+            self.status_success,
+            self.usage.clone(),
+            self.first_byte_ms,
+        );
+        if self.status_success {
+            record_provider_success(ProviderKind::Claude, &self.pending.provider_id);
+        } else if matches!(self.pending.status_code, Some(401 | 403 | 429 | 500..=599)) {
+            record_provider_failure(
+                ProviderKind::Claude,
+                &self.pending.provider_id,
+                &self.pending.provider_name,
+                &self.pending.id,
+                self.pending.started_at_ms,
+                &self.pending.path,
+                &self.pending.model,
+                provider_failure_kind_for_status(self.pending.status_code),
+                self.pending.status_code,
+                self.pending
+                    .status_code
+                    .map(|status| format!("{} 返回 {}", self.pending.provider_name, status))
+                    .unwrap_or_else(|| "上游流式响应失败".to_string()),
+            );
         }
     }
 }
@@ -8243,6 +8433,7 @@ async fn proxy_claude_request(
     path: String,
     body: Body,
 ) -> Response {
+    let request_started = Instant::now();
     let request_started_at_ms = current_epoch_ms().unwrap_or_default();
     let route_request_id = request_id(request_started_at_ms);
     let (router, candidates) = match upstream_claude_candidates() {
@@ -8294,8 +8485,12 @@ async fn proxy_claude_request(
         );
     }
 
+    let mut upstream_chain = Vec::new();
     let mut last_error = String::new();
+    let mut cancellation_guard = PendingRouteLogGuard::default();
     for (attempt_index, candidate) in candidates.iter().enumerate() {
+        cancellation_guard.disarm();
+        upstream_chain.push(candidate.provider.name.clone());
         let upstream_model = mapped_model_for_claude_provider(&candidate.provider, &model);
         let prepared_body =
             body_with_provider_overrides(&body_bytes, upstream_model.as_deref(), None);
@@ -8319,6 +8514,25 @@ async fn proxy_claude_request(
             request = request.header(name.as_str(), value.as_bytes());
         }
         request = request.header("x-api-key", candidate.token.clone());
+
+        let upstream_started_ms = request_started.elapsed().as_millis() as u64;
+        cancellation_guard.arm(build_pending_claude_route_log(
+            route_request_id.clone(),
+            request_started_at_ms,
+            request_started,
+            candidate,
+            &method,
+            &path,
+            &model,
+            upstream_model.as_deref(),
+            &upstream_chain,
+            None,
+            attempt_index + 1,
+            Some(upstream_started_ms),
+            None,
+            None,
+            None,
+        ));
 
         let upstream = match send_upstream_request(
             request,
@@ -8344,9 +8558,31 @@ async fn proxy_claude_request(
                 if attempt_index + 1 < candidates.len() {
                     continue;
                 }
+                cancellation_guard.arm(build_pending_claude_route_log(
+                    route_request_id.clone(),
+                    request_started_at_ms,
+                    request_started,
+                    candidate,
+                    &method,
+                    &path,
+                    &model,
+                    upstream_model.as_deref(),
+                    &upstream_chain,
+                    None,
+                    attempt_index + 1,
+                    Some(upstream_started_ms),
+                    None,
+                    None,
+                    Some(last_error.clone()),
+                ));
+                let pending = cancellation_guard.take();
+                finish_route_log(pending, false, TokenUsage::default(), None);
                 return proxy_error(StatusCode::BAD_GATEWAY, last_error);
             }
         };
+
+        let response_header_ms = request_started.elapsed().as_millis() as u64;
+        let upstream_request_id = upstream_response_request_id(upstream.headers());
 
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -8373,6 +8609,28 @@ async fn proxy_claude_request(
             continue;
         }
 
+        cancellation_guard.arm(build_pending_claude_route_log(
+            route_request_id.clone(),
+            request_started_at_ms,
+            request_started,
+            candidate,
+            &method,
+            &path,
+            &model,
+            upstream_model.as_deref(),
+            &upstream_chain,
+            Some(status.as_u16()),
+            attempt_index + 1,
+            Some(upstream_started_ms),
+            Some(response_header_ms),
+            upstream_request_id,
+            if status.is_success() {
+                None
+            } else {
+                Some(format!("上游返回 {}", status.as_u16()))
+            },
+        ));
+
         let content_type = upstream
             .headers()
             .get("content-type")
@@ -8385,14 +8643,12 @@ async fn proxy_claude_request(
         if content_type.contains("text/event-stream") {
             let stream = ClaudeStreamState {
                 stream: upstream.bytes_stream().boxed(),
-                provider_id: candidate.provider.id.clone(),
-                provider_name: candidate.provider.name.clone(),
-                request_id: route_request_id.clone(),
-                started_at_ms: request_started_at_ms,
-                path: format!("/{path}"),
-                model: model.clone(),
+                pending: cancellation_guard.take(),
                 status_success: status.is_success(),
-                status_code: Some(status.as_u16()),
+                first_byte_ms: None,
+                sse_buffer: String::new(),
+                usage: TokenUsage::default(),
+                completed: false,
                 finished: false,
             };
             return builder
@@ -8400,9 +8656,12 @@ async fn proxy_claude_request(
                 .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建上游响应"));
         }
 
+        let first_byte_ms = Some(cancellation_guard.pending().start.elapsed().as_millis() as u64);
         let bytes = match upstream.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
+                let mut failed = cancellation_guard.take();
+                failed.error = Some(format!("读取上游响应失败: {err}"));
                 record_provider_failure(
                     ProviderKind::Claude,
                     &candidate.provider.id,
@@ -8415,9 +8674,13 @@ async fn proxy_claude_request(
                     Some(status.as_u16()),
                     format!("读取上游响应失败: {err}"),
                 );
+                finish_route_log(failed, false, TokenUsage::default(), first_byte_ms);
                 return proxy_error(StatusCode::BAD_GATEWAY, format!("读取上游响应失败: {err}"));
             }
         };
+        let pending = cancellation_guard.take();
+        let usage = usage_from_response_text(&String::from_utf8_lossy(&bytes));
+        finish_route_log(pending, status.is_success(), usage, first_byte_ms);
         if status.is_success() {
             record_provider_success(ProviderKind::Claude, &candidate.provider.id);
         } else if matches!(status.as_u16(), 401 | 403 | 429 | 500..=599) {
@@ -9639,7 +9902,10 @@ fn is_success_route_log(log: &RouteRequestLog) -> bool {
 fn is_usage_route_log(log: &RouteRequestLog) -> bool {
     matches!(
         (log.method.as_str(), log.path.as_str()),
-        ("POST", "/v1/responses") | ("POST", "/v1/chat/completions") | ("POST", "/v1/completions")
+        ("POST", "/v1/responses")
+            | ("POST", "/v1/chat/completions")
+            | ("POST", "/v1/completions")
+            | ("POST", "/v1/messages")
     )
 }
 
@@ -9904,12 +10170,20 @@ fn build_route_usage_stats(
 }
 
 fn usage_from_value(value: &Value) -> TokenUsage {
-    let input_tokens = scalar_number_at_path(value, &["input_tokens"])
+    let direct_input_tokens = scalar_number_at_path(value, &["input_tokens"])
         .or_else(|| scalar_number_at_path(value, &["prompt_tokens"]))
         .unwrap_or_default() as i64;
+    let cache_creation_input_tokens =
+        scalar_number_at_path(value, &["cache_creation_input_tokens"]).unwrap_or_default() as i64;
+    let cache_read_input_tokens =
+        scalar_number_at_path(value, &["cache_read_input_tokens"]).unwrap_or_default() as i64;
+    let input_tokens = direct_input_tokens
+        .saturating_add(cache_creation_input_tokens)
+        .saturating_add(cache_read_input_tokens);
     let cached_input_tokens = scalar_number_at_path(value, &["cached_input_tokens"])
         .or_else(|| scalar_number_at_path(value, &["input_tokens_details", "cached_tokens"]))
         .or_else(|| scalar_number_at_path(value, &["prompt_tokens_details", "cached_tokens"]))
+        .or_else(|| scalar_number_at_path(value, &["cache_read_input_tokens"]))
         .unwrap_or_default() as i64;
     let output_tokens = scalar_number_at_path(value, &["output_tokens"])
         .or_else(|| scalar_number_at_path(value, &["completion_tokens"]))
@@ -12155,6 +12429,39 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(usage.total_tokens, 50);
     }
 
+    #[test]
+    fn parses_claude_usage_and_cache_tokens() {
+        let value = json!({
+            "usage": {
+                "input_tokens": 30,
+                "cache_creation_input_tokens": 12,
+                "cache_read_input_tokens": 8,
+                "output_tokens": 20
+            }
+        });
+
+        let usage = usage_from_response_value(&value);
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.cached_input_tokens, 8);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.total_tokens, 70);
+    }
+
+    #[test]
+    fn merges_claude_stream_usage_across_events() {
+        let mut buffer = String::new();
+        let mut usage = TokenUsage::default();
+        let events = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30,\"cache_creation_input_tokens\":12,\"cache_read_input_tokens\":8,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+        let metadata = ingest_sse_chunk(&mut buffer, &mut usage, events);
+
+        assert!(metadata.claude_message_stop);
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.cached_input_tokens, 8);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.total_tokens, 70);
+    }
+
     fn route_log_for_stats_test(status: &str, provider_id: &str) -> RouteRequestLog {
         route_log_with_path_for_stats_test(status, provider_id, "/v1/responses")
     }
@@ -12343,6 +12650,30 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(stats.buckets[0].request_count, 1);
         assert_eq!(stats.providers[0].request_count, 1);
         assert_eq!(stats.models[0].request_count, 1);
+    }
+
+    #[test]
+    fn route_usage_includes_claude_messages_requests() {
+        let stats = build_route_usage_stats(
+            vec![route_log_with_path_for_stats_test(
+                "success",
+                "claude-provider",
+                "/v1/messages",
+            )],
+            RouteLogFilter {
+                start_day: Some("2026-06-27".to_string()),
+                end_day: Some("2026-06-27".to_string()),
+                page_size: Some(50),
+                ..Default::default()
+            },
+        )
+        .expect("Claude route usage stats should build");
+
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.summary.request_count, 1);
+        assert_eq!(stats.summary.total_tokens, 10);
+        assert_eq!(stats.providers[0].key, "claude-provider");
+        assert_eq!(stats.details[0].path, "/v1/messages");
     }
 
     #[test]
