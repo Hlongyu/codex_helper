@@ -92,6 +92,17 @@ New API 支持：
 - 普通 `sk-` 密钥查询令牌额度：`GET /api/usage/token/`
 - 用户访问令牌查询账户余额：`GET /api/user/self`，需要填写用户 ID
 
+AI Gate：
+
+```text
+GET /api/me/upstreams/usage
+Authorization: Bearer <分配的 Key>
+```
+
+查询地址默认使用 Codex 供应商 Base URL 去掉末尾 `/v1` 后的结果，因此当 Base URL 为
+`http://host:6789/ai-gate/v1` 时，实际请求为
+`http://host:6789/ai-gate/api/me/upstreams/usage`。多账号余额仅在单位相同时汇总；不同单位会分别显示。
+
 为避免泄露密钥，不支持把 Key 放进 URL 查询参数。
 
 ## 数据位置

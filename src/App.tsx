@@ -11,7 +11,7 @@ type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-type BalanceQueryType = "disabled" | "new_api" | "sub2_api";
+type BalanceQueryType = "disabled" | "new_api" | "sub2_api" | "ai_gate";
 type NewApiBalanceTarget = "token_quota" | "account_balance";
 type BalanceAuthMode = "provider_token" | "separate_token";
 type ProviderWireApi = "responses" | "chat_completions";
@@ -476,6 +476,7 @@ function endpointFromBaseUrl(baseUrl: string) {
 
 function defaultBalancePath(queryType: BalanceQueryType, target: NewApiBalanceTarget) {
   if (queryType === "sub2_api") return "/v1/usage";
+  if (queryType === "ai_gate") return "/api/me/upstreams/usage";
   if (queryType === "new_api" && target === "account_balance") return "/api/user/self";
   return "/api/usage/token/";
 }
@@ -491,6 +492,8 @@ function normalizeBalanceQuery(config?: BalanceQueryConfig | null, endpoint = ""
   };
   if (next.query_type === "new_api" && next.new_api_target === "account_balance") {
     next.auth_mode = "separate_token";
+  } else if (next.query_type === "ai_gate") {
+    next.auth_mode = "provider_token";
   }
   return next;
 }
@@ -1850,6 +1853,8 @@ function App() {
       }
       if (next.query_type === "new_api" && next.new_api_target === "account_balance") {
         next.auth_mode = "separate_token";
+      } else if (next.query_type === "ai_gate") {
+        next.auth_mode = "provider_token";
       }
       return next;
     });
@@ -4320,6 +4325,7 @@ function ProviderEditor(props: {
                 >
                   <option value="new_api">New API</option>
                   <option value="sub2_api">Sub2API</option>
+                  <option value="ai_gate">AI Gate</option>
                   <option value="disabled">不查询</option>
                 </select>
               </label>
@@ -4344,7 +4350,11 @@ function ProviderEditor(props: {
                   onChange={(event) => onUpdateBalance({ endpoint: event.currentTarget.value })}
                   placeholder={endpointFromBaseUrl(providerBaseUrl)}
                 />
-                <small>默认使用供应商 Base URL，并自动移除末尾的 /v1</small>
+                <small>
+                  {balanceQuery.query_type === "ai_gate"
+                    ? "默认复用供应商 Base URL 和 Key；Base URL 中的服务前缀会保留，仅移除末尾的 /v1"
+                    : "默认使用供应商 Base URL，并自动移除末尾的 /v1"}
+                </small>
               </label>
               <label className="field">
                 <span>访问令牌</span>
@@ -4372,13 +4382,15 @@ function ProviderEditor(props: {
                   />
                 </label>
               )}
-              <div className="quota-box">
-                <strong>余额换算</strong>
-                <span>500000 quota</span>
-                <em>=</em>
-                <b>1 USD</b>
-                <button>编辑比例</button>
-              </div>
+              {balanceQuery.query_type === "new_api" && (
+                <div className="quota-box">
+                  <strong>余额换算</strong>
+                  <span>500000 quota</span>
+                  <em>=</em>
+                  <b>1 USD</b>
+                  <button>编辑比例</button>
+                </div>
+              )}
               <div className={`balance-test-box ${balanceTestStatus?.error ? "failed" : balanceTestStatus ? "ok" : ""}`}>
                 <div>
                   <strong>
