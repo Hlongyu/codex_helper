@@ -101,7 +101,9 @@ Authorization: Bearer <分配的 Key>
 
 查询地址默认使用 Codex 供应商 Base URL 去掉末尾 `/v1` 后的结果，因此当 Base URL 为
 `http://host:6789/ai-gate/v1` 时，实际请求为
-`http://host:6789/ai-gate/api/me/upstreams/usage`。多账号余额仅在单位相同时汇总；不同单位会分别显示。
+`http://host:6789/ai-gate/api/me/upstreams/usage`。首次使用“聚合全部账号”测试查询后，
+可在账号下拉框中选择具体上游账号，也可以继续聚合全部账号。多账号余额仅在单位相同时汇总；
+不同单位会分别显示。
 
 为避免泄露密钥，不支持把 Key 放进 URL 查询参数。
 

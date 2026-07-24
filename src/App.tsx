@@ -26,6 +26,14 @@ type BalanceQueryConfig = {
   auth_mode: BalanceAuthMode;
   query_token: string;
   new_api_user_id: string;
+  ai_gate_account_id?: number | null;
+};
+
+type AiGateBalanceAccount = {
+  account_id: number;
+  account_name: string;
+  available_balance?: number | null;
+  unit: string;
 };
 
 type BalanceStatus = {
@@ -33,6 +41,7 @@ type BalanceStatus = {
   label: string;
   checked_at?: number | null;
   error?: string | null;
+  accounts?: AiGateBalanceAccount[];
 };
 
 type ProviderModelsResponse = {
@@ -397,6 +406,7 @@ function defaultBalanceQuery(endpoint = ""): BalanceQueryConfig {
     auth_mode: "provider_token",
     query_token: "",
     new_api_user_id: "",
+    ai_gate_account_id: null,
   };
 }
 
@@ -1136,6 +1146,7 @@ function App() {
     defaultBalanceQuery(),
   );
   const [balanceTestStatus, setBalanceTestStatus] = useState<BalanceStatus | null>(null);
+  const [balanceAccountOptions, setBalanceAccountOptions] = useState<AiGateBalanceAccount[]>([]);
   const [routerDraft, setRouterDraft] = useState<RouterConfig>(() => defaultRouterConfig());
   const [secretVisible, setSecretVisible] = useState(false);
   const [balanceTokenVisible, setBalanceTokenVisible] = useState(false);
@@ -1319,6 +1330,7 @@ function App() {
     setSecretVisible(false);
     setBalanceTokenVisible(false);
     setBalanceTestStatus(targetFull.balance_status ?? null);
+    setBalanceAccountOptions(targetFull.balance_status?.accounts ?? []);
     setEditorOpen(true);
   }
 
@@ -1496,19 +1508,12 @@ function App() {
         payload,
       });
       setAppState(state);
-      if (state.active_provider?.id === editingId) {
-        setBalanceTestStatus(state.active_provider.balance_status ?? null);
-      } else {
-        const summary = state.providers.find((provider) => provider.id === editingId);
-        setBalanceTestStatus(summary
-          ? {
-              amount: null,
-              label: summary.balance_label,
-              checked_at: null,
-              error: summary.balance_error ?? null,
-            }
-          : null);
-      }
+      const queriedProvider = await callCommand<ProviderConfig>("get_provider", {
+        providerId: editingId,
+      });
+      const status = queriedProvider.balance_status ?? null;
+      setBalanceTestStatus(status);
+      setBalanceAccountOptions(status?.accounts ?? []);
     });
   }
 
@@ -2184,6 +2189,7 @@ function App() {
 
       {editorOpen && editorKind === "codex" && (
         <ProviderEditor
+          balanceAccountOptions={balanceAccountOptions}
           balanceQuery={balanceQuery}
           balanceTestStatus={balanceTestStatus}
           balanceTokenVisible={balanceTokenVisible}
@@ -2208,6 +2214,7 @@ function App() {
           setProviderApiKey={(value) => {
             setProviderApiKey(value);
             setBalanceTestStatus(null);
+            setBalanceAccountOptions([]);
             setProviderModels([]);
             setProviderTestModel("");
           }}
@@ -2215,6 +2222,7 @@ function App() {
           setProviderBaseUrl={(value) => {
             setProviderBaseUrl(value);
             setBalanceTestStatus(null);
+            setBalanceAccountOptions([]);
             setProviderModels([]);
             setProviderTestModel("");
           }}
@@ -3986,6 +3994,7 @@ function ProvidersScreen({
 
 function ProviderEditor(props: {
   allowedModels: string[];
+  balanceAccountOptions: AiGateBalanceAccount[];
   balanceQuery: BalanceQueryConfig;
   balanceTestStatus: BalanceStatus | null;
   balanceTokenVisible: boolean;
@@ -4019,6 +4028,7 @@ function ProviderEditor(props: {
 }) {
   const {
     allowedModels,
+    balanceAccountOptions,
     balanceQuery,
     balanceTestStatus,
     balanceTokenVisible,
@@ -4058,6 +4068,9 @@ function ProviderEditor(props: {
     model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
   );
   const allModelsAllowed = allowedModels.length === 0;
+  const selectedAiGateAccountId = balanceQuery.ai_gate_account_id ?? null;
+  const selectedAiGateAccountMissing = selectedAiGateAccountId !== null
+    && !balanceAccountOptions.some((account) => account.account_id === selectedAiGateAccountId);
   const upstreamPath = providerWireApi === "chat_completions" ? "chat/completions" : "responses";
   const updateAllowedModels = (models: string[]) => setAllowedModels(normalizeModelNames(models));
   const toggleAllowedModel = (model: string, checked: boolean) => {
@@ -4341,6 +4354,38 @@ function ProviderEditor(props: {
                     <option value="token_quota">API Key 额度</option>
                     <option value="account_balance">账户余额</option>
                   </select>
+                </label>
+              )}
+              {balanceQuery.query_type === "ai_gate" && (
+                <label className="field">
+                  <span>查询账号</span>
+                  <select
+                    value={selectedAiGateAccountId === null ? "" : String(selectedAiGateAccountId)}
+                    onChange={(event) =>
+                      onUpdateBalance({
+                        ai_gate_account_id: event.currentTarget.value
+                          ? Number(event.currentTarget.value)
+                          : null,
+                      })
+                    }
+                  >
+                    <option value="">聚合全部账号</option>
+                    {selectedAiGateAccountMissing && (
+                      <option value={selectedAiGateAccountId ?? ""}>
+                        账号 #{selectedAiGateAccountId}（等待查询确认）
+                      </option>
+                    )}
+                    {balanceAccountOptions.map((account) => (
+                      <option key={account.account_id} value={account.account_id}>
+                        {account.account_name || `账号 #${account.account_id}`}
+                      </option>
+                    ))}
+                  </select>
+                  <small>
+                    {balanceAccountOptions.length
+                      ? "可选择单个上游账号，或聚合全部账号；账号列表来自最近一次测试查询。"
+                      : "先保持“聚合全部账号”并测试查询，成功后即可选择具体账号。"}
+                  </small>
                 </label>
               )}
               <label className="field">

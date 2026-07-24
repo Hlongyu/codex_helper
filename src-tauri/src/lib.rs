@@ -200,6 +200,8 @@ struct BalanceQueryConfig {
     query_token: String,
     #[serde(default)]
     new_api_user_id: String,
+    #[serde(default)]
+    ai_gate_account_id: Option<i64>,
 }
 
 impl Default for BalanceQueryConfig {
@@ -213,8 +215,17 @@ impl Default for BalanceQueryConfig {
             auth_mode: BalanceAuthMode::ProviderToken,
             query_token: String::new(),
             new_api_user_id: String::new(),
+            ai_gate_account_id: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct AiGateBalanceAccount {
+    account_id: i64,
+    account_name: String,
+    available_balance: Option<f64>,
+    unit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +234,8 @@ struct BalanceStatus {
     label: String,
     checked_at: Option<u64>,
     error: Option<String>,
+    #[serde(default)]
+    accounts: Vec<AiGateBalanceAccount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9399,21 +9412,74 @@ fn balance_display(amount: f64, unit: &str) -> String {
     }
 }
 
-fn parse_ai_gate_balance(value: &Value) -> Option<(String, String)> {
-    let accounts = value.get("accounts")?.as_array()?;
+fn parse_ai_gate_accounts(value: &Value) -> Option<Vec<AiGateBalanceAccount>> {
+    value.get("accounts")?.as_array().map(|accounts| {
+        accounts
+            .iter()
+            .filter_map(|account| {
+                Some(AiGateBalanceAccount {
+                    account_id: account.get("account_id")?.as_i64()?,
+                    account_name: account
+                        .get("account_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                    available_balance: scalar_number_at_path(account, &["available_balance"]),
+                    unit: string_at_path(account, &["unit"])
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+            })
+            .collect()
+    })
+}
+
+fn format_ai_gate_balance(
+    accounts: &[AiGateBalanceAccount],
+    selected_account_id: Option<i64>,
+) -> Result<(String, String), String> {
     if accounts.is_empty() {
-        return Some(("0".to_string(), "余额 无已分配账号".to_string()));
+        return selected_account_id.map_or_else(
+            || Ok(("0".to_string(), "余额 无已分配账号".to_string())),
+            |account_id| Err(format!("未找到指定上游账号 #{account_id}")),
+        );
+    }
+
+    if let Some(account_id) = selected_account_id {
+        let account = accounts
+            .iter()
+            .find(|account| account.account_id == account_id)
+            .ok_or_else(|| format!("未找到指定上游账号 #{account_id}"))?;
+        let amount = account.available_balance.ok_or_else(|| {
+            format!(
+                "上游账号 {} 未返回可用余额",
+                if account.account_name.is_empty() {
+                    format!("#{account_id}")
+                } else {
+                    account.account_name.clone()
+                }
+            )
+        })?;
+        let name = if account.account_name.is_empty() {
+            format!("账号 #{account_id}")
+        } else {
+            account.account_name.clone()
+        };
+        return Ok((
+            format_balance_amount(amount),
+            format!("{name} 余额 {}", balance_display(amount, &account.unit)),
+        ));
     }
 
     let mut totals = BTreeMap::<String, (String, f64)>::new();
     let mut account_count = 0_usize;
     for account in accounts {
-        let Some(amount) = scalar_number_at_path(account, &["available_balance"]) else {
+        let Some(amount) = account.available_balance else {
             continue;
         };
-        let unit = string_at_path(account, &["unit"])
-            .map(str::trim)
-            .unwrap_or_default();
+        let unit = account.unit.trim();
         let key = unit.to_ascii_lowercase();
         let entry = totals.entry(key).or_insert_with(|| (unit.to_string(), 0.0));
         entry.1 += amount;
@@ -9421,11 +9487,14 @@ fn parse_ai_gate_balance(value: &Value) -> Option<(String, String)> {
     }
 
     if totals.is_empty() {
-        return None;
+        return Err("上游账号未返回可用余额".to_string());
     }
 
     if totals.len() == 1 {
-        let (_, (unit, total)) = totals.into_iter().next()?;
+        let (_, (unit, total)) = totals
+            .into_iter()
+            .next()
+            .ok_or_else(|| "上游账号未返回可用余额".to_string())?;
         let amount = format_balance_amount(total);
         let kind = if account_count > 1 {
             "总余额"
@@ -9436,7 +9505,7 @@ fn parse_ai_gate_balance(value: &Value) -> Option<(String, String)> {
         if account_count > 1 {
             label.push_str(&format!("（{account_count} 个账号）"));
         }
-        return Some((amount, label));
+        return Ok((amount, label));
     }
 
     let displays = totals
@@ -9444,7 +9513,7 @@ fn parse_ai_gate_balance(value: &Value) -> Option<(String, String)> {
         .map(|(unit, total)| balance_display(*total, unit))
         .collect::<Vec<_>>();
     let amount = displays.join(" + ");
-    Some((
+    Ok((
         amount.clone(),
         format!("余额 {amount}（{account_count} 个账号）"),
     ))
@@ -9506,6 +9575,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
             label: "未配置".to_string(),
             checked_at,
             error: Some("未启用余额查询".to_string()),
+            accounts: Vec::new(),
         };
     }
 
@@ -9515,6 +9585,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
             label: "未配置".to_string(),
             checked_at,
             error: Some("查询地址为空".to_string()),
+            accounts: Vec::new(),
         };
     }
 
@@ -9534,6 +9605,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
                 label: "未配置".to_string(),
                 checked_at,
                 error: Some("New-Api-User 为空".to_string()),
+                accounts: Vec::new(),
             };
         }
         if !new_api_user_id.chars().all(|ch| ch.is_ascii_digit()) {
@@ -9542,6 +9614,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
                 label: "未配置".to_string(),
                 checked_at,
                 error: Some("New-Api-User 必须是数字用户 ID".to_string()),
+                accounts: Vec::new(),
             };
         }
     }
@@ -9560,6 +9633,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
             label: "未配置".to_string(),
             checked_at,
             error: Some("查询 token 为空".to_string()),
+            accounts: Vec::new(),
         };
     }
 
@@ -9576,6 +9650,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
                 label: "查询失败".to_string(),
                 checked_at,
                 error: Some(format!("创建 HTTP 客户端失败: {err}")),
+                accounts: Vec::new(),
             };
         }
     };
@@ -9606,6 +9681,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
                 label: "查询失败".to_string(),
                 checked_at,
                 error: Some(format!("请求失败: {err}")),
+                accounts: Vec::new(),
             };
         }
     };
@@ -9617,6 +9693,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
             label: "查询失败".to_string(),
             checked_at,
             error: Some(format!("接口返回 HTTP {status}")),
+            accounts: Vec::new(),
         };
     }
 
@@ -9628,6 +9705,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
                 label: "查询失败".to_string(),
                 checked_at,
                 error: Some(format!("响应不是有效 JSON: {err}")),
+                accounts: Vec::new(),
             };
         }
     };
@@ -9645,6 +9723,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
                 label,
                 checked_at,
                 error: None,
+                accounts: Vec::new(),
             };
         }
     } else if matches!(config.query_type, BalanceQueryType::Sub2Api) {
@@ -9654,17 +9733,35 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
                 label,
                 checked_at,
                 error: None,
+                accounts: Vec::new(),
             };
         }
     } else if matches!(config.query_type, BalanceQueryType::AiGate) {
-        if let Some((amount, label)) = parse_ai_gate_balance(&body) {
+        let Some(accounts) = parse_ai_gate_accounts(&body) else {
             return BalanceStatus {
+                amount: None,
+                label: "查询失败".to_string(),
+                checked_at,
+                error: Some("响应缺少 accounts 字段".to_string()),
+                accounts: Vec::new(),
+            };
+        };
+        return match format_ai_gate_balance(&accounts, config.ai_gate_account_id) {
+            Ok((amount, label)) => BalanceStatus {
                 amount: Some(amount),
                 label,
                 checked_at,
                 error: None,
-            };
-        }
+                accounts,
+            },
+            Err(error) => BalanceStatus {
+                amount: None,
+                label: "查询失败".to_string(),
+                checked_at,
+                error: Some(error),
+                accounts,
+            },
+        };
     } else if let Some(amount) = find_balance_value(&body) {
         let (amount, label) = format_balance_label("余额", amount, None);
         return BalanceStatus {
@@ -9672,6 +9769,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
             label,
             checked_at,
             error: None,
+            accounts: Vec::new(),
         };
     }
 
@@ -9680,6 +9778,7 @@ async fn fetch_balance(provider: &ProviderConfig) -> BalanceStatus {
         label: "查询失败".to_string(),
         checked_at,
         error: Some("未识别余额字段".to_string()),
+        accounts: Vec::new(),
     }
 }
 
@@ -12884,6 +12983,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 auth_mode: BalanceAuthMode::SeparateToken,
                 query_token: "saved-balance-token".to_string(),
                 new_api_user_id: String::new(),
+                ai_gate_account_id: None,
             },
             balance_status: None,
             connection_status: None,
@@ -12916,6 +13016,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             auth_mode: BalanceAuthMode::SeparateToken,
             query_token: "unused-token".to_string(),
             new_api_user_id: String::new(),
+            ai_gate_account_id: None,
         };
 
         let normalized = normalize_balance_config(config, &provider);
@@ -12938,8 +13039,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         });
 
         assert_eq!(
-            parse_ai_gate_balance(&body),
-            Some(("87.50".to_string(), "余额 $87.50".to_string()))
+            format_ai_gate_balance(&parse_ai_gate_accounts(&body).unwrap(), None),
+            Ok(("87.50".to_string(), "余额 $87.50".to_string()))
         );
     }
 
@@ -12947,14 +13048,14 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     fn parses_ai_gate_same_unit_accounts_as_total_balance() {
         let body = json!({
             "accounts": [
-                { "available_balance": 12.5, "unit": "USD" },
-                { "available_balance": "7.5", "unit": "usd" }
+                { "account_id": 1, "available_balance": 12.5, "unit": "USD" },
+                { "account_id": 2, "available_balance": "7.5", "unit": "usd" }
             ]
         });
 
         assert_eq!(
-            parse_ai_gate_balance(&body),
-            Some(("20.00".to_string(), "总余额 $20.00（2 个账号）".to_string()))
+            format_ai_gate_balance(&parse_ai_gate_accounts(&body).unwrap(), None),
+            Ok(("20.00".to_string(), "总余额 $20.00（2 个账号）".to_string()))
         );
     }
 
@@ -12962,14 +13063,14 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     fn parses_ai_gate_mixed_units_without_combining_them() {
         let body = json!({
             "accounts": [
-                { "available_balance": 87.5, "unit": "USD" },
-                { "available_balance": 120, "unit": "quota" }
+                { "account_id": 1, "available_balance": 87.5, "unit": "USD" },
+                { "account_id": 2, "available_balance": 120, "unit": "quota" }
             ]
         });
 
         assert_eq!(
-            parse_ai_gate_balance(&body),
-            Some((
+            format_ai_gate_balance(&parse_ai_gate_accounts(&body).unwrap(), None),
+            Ok((
                 "120 quota + $87.50".to_string(),
                 "余额 120 quota + $87.50（2 个账号）".to_string()
             ))
@@ -12977,10 +13078,58 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
+    fn parses_ai_gate_selected_account_balance() {
+        let body = json!({
+            "accounts": [
+                {
+                    "account_id": 7,
+                    "account_name": "lumaview",
+                    "available_balance": 7,
+                    "unit": "quota"
+                },
+                {
+                    "account_id": 1,
+                    "account_name": "team2",
+                    "available_balance": 80.79,
+                    "unit": "USD"
+                }
+            ]
+        });
+        let accounts = parse_ai_gate_accounts(&body).unwrap();
+
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(
+            format_ai_gate_balance(&accounts, Some(1)),
+            Ok(("80.79".to_string(), "team2 余额 $80.79".to_string()))
+        );
+    }
+
+    #[test]
+    fn reports_missing_ai_gate_selected_account() {
+        let accounts = parse_ai_gate_accounts(&json!({
+            "accounts": [{
+                "account_id": 1,
+                "account_name": "team2",
+                "available_balance": 80.79,
+                "unit": "USD"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            format_ai_gate_balance(&accounts, Some(99)),
+            Err("未找到指定上游账号 #99".to_string())
+        );
+    }
+
+    #[test]
     fn parses_ai_gate_empty_account_list_as_zero_accounts() {
         assert_eq!(
-            parse_ai_gate_balance(&json!({ "accounts": [] })),
-            Some(("0".to_string(), "余额 无已分配账号".to_string()))
+            format_ai_gate_balance(
+                &parse_ai_gate_accounts(&json!({ "accounts": [] })).unwrap(),
+                None
+            ),
+            Ok(("0".to_string(), "余额 无已分配账号".to_string()))
         );
     }
 
