@@ -849,6 +849,35 @@ function providerStatus(provider: ProviderSummary) {
   return { label: "可用", tone: "ok" };
 }
 
+function usageProviderOptions(
+  loggedProviders: RouteLogFilterOption[],
+  configuredProviders: ProviderSummary[],
+) {
+  const configuredNames = new Map(
+    configuredProviders.map((provider) => [provider.id, provider.name]),
+  );
+  const seen = new Set<string>();
+  const options = loggedProviders.map((provider) => {
+    seen.add(provider.id);
+    return {
+      ...provider,
+      name: configuredNames.get(provider.id) ?? provider.name,
+    };
+  });
+
+  for (const provider of configuredProviders) {
+    if (seen.has(provider.id)) continue;
+    seen.add(provider.id);
+    options.push({
+      id: provider.id,
+      name: provider.name,
+      request_count: 0,
+    });
+  }
+
+  return options;
+}
+
 function routeBaseUrl(router: RouterConfig | RouterStatus) {
   if ("address" in router) return `http://${router.address}/v1`;
   return `http://${router.host || "127.0.0.1"}:${router.port || 18080}/v1`;
@@ -2034,6 +2063,7 @@ function App() {
 
         {screen === "usage" && (
           <UsageScreen
+            configuredProviders={[...appState.providers, ...appState.claude_providers]}
             filter={usageFilter}
             onFilter={applyUsageFilter}
             onRangeChange={applyUsageRange}
@@ -2831,6 +2861,7 @@ function SkillManagementScreen({
 }
 
 function UsageScreen({
+  configuredProviders,
   filter,
   onFilter,
   onRangeChange,
@@ -2840,6 +2871,7 @@ function UsageScreen({
   timeRange,
   trendMetric,
 }: {
+  configuredProviders: ProviderSummary[];
   filter: RouteLogFilter;
   onFilter: (patch: Partial<RouteLogFilter>) => Promise<void>;
   onRangeChange: (range: TimeRange) => Promise<void>;
@@ -2862,6 +2894,10 @@ function UsageScreen({
     ? stats.buckets
     : [emptyTrendBucket("00:00")];
   const totalCalls = (stats?.models ?? []).reduce((total, row) => total + row.request_count, 0) || 1;
+  const availableProviders = usageProviderOptions(
+    stats?.available_providers ?? [],
+    configuredProviders,
+  );
 
   return (
     <section className="usage-page">
@@ -2887,7 +2923,7 @@ function UsageScreen({
         </div>
         <select value={filter.provider_id ?? ""} onChange={(event) => onFilter({ provider_id: event.currentTarget.value })}>
           <option value="">全部供应商</option>
-          {(stats?.available_providers ?? []).map((provider) => (
+          {availableProviders.map((provider) => (
             <option key={provider.id} value={provider.id}>{provider.name}</option>
           ))}
         </select>
