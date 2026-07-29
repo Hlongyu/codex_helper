@@ -4177,14 +4177,19 @@ async fn fetch_claude_provider_model_values(
     let upstream_path = claude_upstream_path("models");
     let models_url = join_url(base_url, &upstream_path);
     let started = Instant::now();
-    let response = client
-        .get(&models_url)
-        .header("x-api-key", token)
-        .header("anthropic-version", "2023-06-01")
-        .header("accept", "application/json")
+    let mut response = claude_models_upstream_request(client, &models_url, token, false)
         .send()
         .await
         .map_err(|err| format!("请求 Claude 模型列表失败: {err}"))?;
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        response = claude_models_upstream_request(client, &models_url, token, true)
+            .send()
+            .await
+            .map_err(|err| format!("使用 Bearer Token 重试 Claude 模型列表失败: {err}"))?;
+    }
     let latency_ms = started.elapsed().as_millis() as u64;
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -4194,11 +4199,51 @@ async fn fetch_claude_provider_model_values(
         return Err(format!("Claude 模型列表返回 HTTP {}", status.as_u16()));
     }
 
-    let value = response
-        .json::<Value>()
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = response
+        .bytes()
         .await
-        .map_err(|err| format!("Claude 模型列表响应不是有效 JSON: {err}"))?;
+        .map_err(|err| format!("读取 Claude 模型列表响应失败: {err}"))?;
+    let value = decode_claude_json_response(&body, &content_type, "Claude 模型列表响应")?;
     Ok((claude_model_values_from_response_value(&value), latency_ms))
+}
+
+fn claude_models_upstream_request(
+    client: &reqwest::Client,
+    models_url: &str,
+    token: &str,
+    bearer_auth: bool,
+) -> reqwest::RequestBuilder {
+    let request = client
+        .get(models_url)
+        .header("anthropic-version", "2023-06-01")
+        .header("accept", "application/json");
+    if bearer_auth {
+        request.bearer_auth(token)
+    } else {
+        request.header("x-api-key", token)
+    }
+}
+
+fn decode_claude_json_response(
+    body: &[u8],
+    content_type: &str,
+    response_name: &str,
+) -> Result<Value, String> {
+    serde_json::from_slice(body).map_err(|err| {
+        let content_type = content_type.trim();
+        let content_type = if content_type.is_empty() {
+            "未提供"
+        } else {
+            content_type
+        };
+        format!("{response_name}不是有效 JSON（Content-Type: {content_type}）: {err}")
+    })
 }
 
 async fn fetch_claude_provider_models(
@@ -8708,6 +8753,31 @@ async fn proxy_claude_request(
                 return proxy_error(StatusCode::BAD_GATEWAY, format!("读取上游响应失败: {err}"));
             }
         };
+        if status.is_success() {
+            if let Err(err) = decode_claude_json_response(&bytes, &content_type, "Claude 上游响应")
+            {
+                last_error = format!("{} 返回无效响应: {err}", candidate.provider.name);
+                let mut failed = cancellation_guard.take();
+                failed.error = Some(last_error.clone());
+                record_provider_failure(
+                    ProviderKind::Claude,
+                    &candidate.provider.id,
+                    &candidate.provider.name,
+                    &route_request_id,
+                    request_started_at_ms,
+                    &format!("/{path}"),
+                    &model,
+                    ProviderFailureKind::Protocol,
+                    Some(status.as_u16()),
+                    last_error.clone(),
+                );
+                finish_route_log(failed, false, TokenUsage::default(), first_byte_ms);
+                if attempt_index + 1 < candidates.len() {
+                    continue;
+                }
+                return proxy_error(StatusCode::BAD_GATEWAY, last_error);
+            }
+        }
         let pending = cancellation_guard.take();
         let usage = usage_from_response_text(&String::from_utf8_lossy(&bytes));
         finish_route_log(pending, status.is_success(), usage, first_byte_ms);
@@ -12579,6 +12649,58 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             ),
             "https://provider.example/v1/messages"
         );
+    }
+
+    #[test]
+    fn claude_model_list_requests_support_api_key_and_bearer_auth() {
+        let client = reqwest::Client::new();
+        let api_key_request = claude_models_upstream_request(
+            &client,
+            "https://provider.example/v1/models",
+            "secret",
+            false,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            api_key_request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("secret")
+        );
+        assert!(api_key_request.headers().get(AUTHORIZATION).is_none());
+
+        let bearer_request = claude_models_upstream_request(
+            &client,
+            "https://provider.example/v1/models",
+            "secret",
+            true,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            bearer_request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer secret")
+        );
+        assert!(bearer_request.headers().get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn rejects_html_success_as_invalid_claude_json() {
+        let error = decode_claude_json_response(
+            b"<html>proxy challenge</html>",
+            "text/html; charset=utf-8",
+            "Claude 上游响应",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Claude 上游响应不是有效 JSON"));
+        assert!(error.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(!error.contains("proxy challenge"));
     }
 
     #[test]
