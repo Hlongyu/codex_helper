@@ -7,7 +7,11 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
-use futures_util::{stream::BoxStream, StreamExt};
+use futures_util::{
+    future::BoxFuture,
+    stream::{self, BoxStream},
+    FutureExt, StreamExt,
+};
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING,
     UPGRADE,
@@ -46,6 +50,9 @@ const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 const MAX_CONNECT_TIMEOUT_SECS: u64 = 120;
 const MAX_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 600;
 const MAX_STREAM_IDLE_TIMEOUT_SECS: u64 = 3_600;
+const MAX_SLOW_DELAY_SECS: u64 = 3_600;
+const SLOW_HEARTBEAT_INTERVAL_SECS: u64 = 5;
+const SLOW_HEARTBEAT: &[u8] = b": slow-mode keep-alive\n\n";
 const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
 const CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT: i64 = 243_200;
@@ -251,6 +258,15 @@ enum ProviderWireApi {
     ChatCompletions,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum SlowMode {
+    #[default]
+    Off,
+    Fixed,
+    Random,
+}
+
 impl Default for ProviderWireApi {
     fn default() -> Self {
         Self::Responses
@@ -285,6 +301,12 @@ struct RouterConfig {
     response_header_timeout_secs: u64,
     #[serde(default = "default_stream_idle_timeout_secs")]
     stream_idle_timeout_secs: u64,
+    #[serde(default)]
+    slow_mode: SlowMode,
+    #[serde(default)]
+    slow_delay_secs: u64,
+    #[serde(default)]
+    slow_delay_max_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -456,6 +478,9 @@ impl Default for RouterConfig {
             connect_timeout_secs: default_connect_timeout_secs(),
             response_header_timeout_secs: default_response_header_timeout_secs(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            slow_mode: SlowMode::Off,
+            slow_delay_secs: 0,
+            slow_delay_max_secs: 0,
         }
     }
 }
@@ -784,6 +809,12 @@ struct SaveRouterPayload {
     response_header_timeout_secs: u64,
     #[serde(default = "default_stream_idle_timeout_secs")]
     stream_idle_timeout_secs: u64,
+    #[serde(default)]
+    slow_mode: SlowMode,
+    #[serde(default)]
+    slow_delay_secs: u64,
+    #[serde(default)]
+    slow_delay_max_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1072,6 +1103,8 @@ struct RouteRequestLog {
     total_tokens: i64,
     first_byte_ms: Option<u64>,
     #[serde(default)]
+    slow_delay_ms: Option<u64>,
+    #[serde(default)]
     upstream_started_ms: Option<u64>,
     #[serde(default)]
     response_header_ms: Option<u64>,
@@ -1244,10 +1277,28 @@ struct PendingRouteLog {
     route_result: String,
     route_attempts: usize,
     error: Option<String>,
+    slow_delay_ms: Option<u64>,
     upstream_started_ms: Option<u64>,
     response_header_ms: Option<u64>,
     upstream_request_id: Option<String>,
     start: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestTiming {
+    start: Instant,
+    started_at_ms: i64,
+    slow_delay_ms: Option<u64>,
+}
+
+impl RequestTiming {
+    fn now() -> Self {
+        Self {
+            start: Instant::now(),
+            started_at_ms: current_epoch_ms().unwrap_or_default(),
+            slow_delay_ms: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1427,6 +1478,53 @@ fn validate_router_timeouts(config: &RouterConfig) -> Result<(), String> {
         return Err("流式响应空闲超时不能小于响应头超时".to_string());
     }
     Ok(())
+}
+
+fn validate_router_slow_mode(config: &RouterConfig) -> Result<(), String> {
+    match config.slow_mode {
+        SlowMode::Off => Ok(()),
+        SlowMode::Fixed => {
+            if config.slow_delay_secs == 0 || config.slow_delay_secs > MAX_SLOW_DELAY_SECS {
+                return Err(format!("固定延迟必须在 1 到 {MAX_SLOW_DELAY_SECS} 秒之间"));
+            }
+            Ok(())
+        }
+        SlowMode::Random => {
+            if config.slow_delay_secs == 0
+                || config.slow_delay_secs > MAX_SLOW_DELAY_SECS
+                || config.slow_delay_max_secs == 0
+                || config.slow_delay_max_secs > MAX_SLOW_DELAY_SECS
+            {
+                return Err(format!(
+                    "随机延迟范围必须在 1 到 {MAX_SLOW_DELAY_SECS} 秒之间"
+                ));
+            }
+            if config.slow_delay_secs > config.slow_delay_max_secs {
+                return Err("随机延迟上限不能小于下限".to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn selected_slow_delay_secs(config: &RouterConfig) -> u64 {
+    match config.slow_mode {
+        SlowMode::Off => 0,
+        SlowMode::Fixed => config.slow_delay_secs,
+        SlowMode::Random => {
+            let span = config
+                .slow_delay_max_secs
+                .saturating_sub(config.slow_delay_secs)
+                .saturating_add(1);
+            let mut bytes = [0_u8; 8];
+            let sample = if getrandom::fill(&mut bytes).is_ok() {
+                u64::from_le_bytes(bytes)
+            } else {
+                current_epoch_ms().unwrap_or_default() as u64
+            };
+            config.slow_delay_secs + sample % span.max(1)
+        }
+    }
 }
 
 fn random_router_token() -> String {
@@ -7891,6 +7989,7 @@ fn build_finished_route_log(
         reasoning_output_tokens: usage.reasoning_output_tokens,
         total_tokens: usage.total_tokens,
         first_byte_ms,
+        slow_delay_ms: pending.slow_delay_ms,
         upstream_started_ms: pending.upstream_started_ms,
         response_header_ms: pending.response_header_ms,
         upstream_request_id: pending.upstream_request_id,
@@ -7900,8 +7999,7 @@ fn build_finished_route_log(
 
 fn build_pending_route_log(
     id: String,
-    started_at_ms: i64,
-    start: Instant,
+    timing: RequestTiming,
     candidate: &UpstreamCandidate,
     method: &Method,
     path: &str,
@@ -7918,7 +8016,7 @@ fn build_pending_route_log(
 ) -> PendingRouteLog {
     PendingRouteLog {
         id,
-        started_at_ms,
+        started_at_ms: timing.started_at_ms,
         method: method.as_str().to_string(),
         path: format!("/v1/{path}"),
         model: model.to_string(),
@@ -7947,18 +8045,18 @@ fn build_pending_route_log(
         },
         route_attempts,
         error,
+        slow_delay_ms: timing.slow_delay_ms,
         upstream_started_ms,
         response_header_ms,
         upstream_request_id,
-        start,
+        start: timing.start,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_pending_claude_route_log(
     id: String,
-    started_at_ms: i64,
-    start: Instant,
+    timing: RequestTiming,
     candidate: &ClaudeUpstreamCandidate,
     method: &Method,
     path: &str,
@@ -7991,7 +8089,7 @@ fn build_pending_claude_route_log(
 
     PendingRouteLog {
         id,
-        started_at_ms,
+        started_at_ms: timing.started_at_ms,
         method: method.as_str().to_string(),
         path: format!("/v1/{}", path.trim_start_matches('/')),
         model: model.to_string(),
@@ -8005,10 +8103,11 @@ fn build_pending_claude_route_log(
         route_result,
         route_attempts,
         error,
+        slow_delay_ms: timing.slow_delay_ms,
         upstream_started_ms,
         response_header_ms,
         upstream_request_id,
-        start,
+        start: timing.start,
     }
 }
 
@@ -8442,6 +8541,135 @@ async fn send_upstream_request(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SlowStreamProtocol {
+    Codex,
+    Claude,
+}
+
+enum SlowResponseStreamState {
+    Waiting {
+        response: BoxFuture<'static, Response>,
+        heartbeat: tokio::time::Interval,
+        protocol: SlowStreamProtocol,
+    },
+    Forwarding {
+        stream: BoxStream<'static, Result<Bytes, axum::Error>>,
+    },
+    Done,
+}
+
+fn request_body_streams(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn slow_stream_error_chunk(protocol: SlowStreamProtocol, status: StatusCode, body: &[u8]) -> Bytes {
+    let message = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| {
+            let fallback = String::from_utf8_lossy(body).trim().to_string();
+            if fallback.is_empty() {
+                format!("代理返回 HTTP {}", status.as_u16())
+            } else {
+                fallback
+            }
+        });
+    let payload = match protocol {
+        SlowStreamProtocol::Codex => json!({
+            "type": "error",
+            "code": "slow_proxy_error",
+            "message": message,
+            "param": null
+        }),
+        SlowStreamProtocol::Claude => json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message
+            }
+        }),
+    };
+    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+}
+
+fn slow_stream_response(
+    protocol: SlowStreamProtocol,
+    response: BoxFuture<'static, Response>,
+) -> Response {
+    let heartbeat = tokio::time::interval(Duration::from_secs(SLOW_HEARTBEAT_INTERVAL_SECS));
+    let stream = stream::unfold(
+        SlowResponseStreamState::Waiting {
+            response,
+            heartbeat,
+            protocol,
+        },
+        |state| async move {
+            match state {
+                SlowResponseStreamState::Waiting {
+                    mut response,
+                    mut heartbeat,
+                    protocol,
+                } => {
+                    tokio::select! {
+                        response = response.as_mut() => {
+                            let status = response.status();
+                            if !status.is_success() {
+                                let body = axum::body::to_bytes(
+                                    response.into_body(),
+                                    MAX_PROXY_BODY_BYTES,
+                                )
+                                .await
+                                .unwrap_or_default();
+                                return Some((
+                                    Ok(slow_stream_error_chunk(protocol, status, &body)),
+                                    SlowResponseStreamState::Done,
+                                ));
+                            }
+                            Some((
+                                Ok(Bytes::from_static(SLOW_HEARTBEAT)),
+                                SlowResponseStreamState::Forwarding {
+                                    stream: response.into_body().into_data_stream().boxed(),
+                                },
+                            ))
+                        }
+                        _ = heartbeat.tick() => Some((
+                            Ok(Bytes::from_static(SLOW_HEARTBEAT)),
+                            SlowResponseStreamState::Waiting {
+                                response,
+                                heartbeat,
+                                protocol,
+                            },
+                        )),
+                    }
+                }
+                SlowResponseStreamState::Forwarding { mut stream } => stream
+                    .next()
+                    .await
+                    .map(|item| (item, SlowResponseStreamState::Forwarding { stream })),
+                SlowResponseStreamState::Done => None,
+            }
+        },
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| proxy_error(StatusCode::BAD_GATEWAY, "无法创建 slow 模式响应"))
+}
+
 fn upstream_response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
     ["x-oneapi-request-id", "x-request-id"]
         .iter()
@@ -8507,9 +8735,11 @@ async fn proxy_claude_request(
     headers: HeaderMap,
     path: String,
     body: Body,
+    timing: Option<RequestTiming>,
 ) -> Response {
-    let request_started = Instant::now();
-    let request_started_at_ms = current_epoch_ms().unwrap_or_default();
+    let timing = timing.unwrap_or_else(RequestTiming::now);
+    let request_started = timing.start;
+    let request_started_at_ms = timing.started_at_ms;
     let route_request_id = request_id(request_started_at_ms);
     let (router, candidates) = match upstream_claude_candidates() {
         Ok(config) => config,
@@ -8593,8 +8823,7 @@ async fn proxy_claude_request(
         let upstream_started_ms = request_started.elapsed().as_millis() as u64;
         cancellation_guard.arm(build_pending_claude_route_log(
             route_request_id.clone(),
-            request_started_at_ms,
-            request_started,
+            timing,
             candidate,
             &method,
             &path,
@@ -8635,8 +8864,7 @@ async fn proxy_claude_request(
                 }
                 cancellation_guard.arm(build_pending_claude_route_log(
                     route_request_id.clone(),
-                    request_started_at_ms,
-                    request_started,
+                    timing,
                     candidate,
                     &method,
                     &path,
@@ -8686,8 +8914,7 @@ async fn proxy_claude_request(
 
         cancellation_guard.arm(build_pending_claude_route_log(
             route_request_id.clone(),
-            request_started_at_ms,
-            request_started,
+            timing,
             candidate,
             &method,
             &path,
@@ -8820,6 +9047,129 @@ async fn proxy_request(
     AxumPath(path): AxumPath<String>,
     body: Body,
 ) -> Response {
+    let received_timing = RequestTiming::now();
+    if method == Method::GET {
+        return proxy_request_now(
+            AxumState(proxy_state),
+            method,
+            uri,
+            headers,
+            AxumPath(path),
+            body,
+            None,
+        )
+        .await;
+    }
+
+    let state = match load_state_file() {
+        Ok(state) => state,
+        Err(_) => {
+            return proxy_request_now(
+                AxumState(proxy_state),
+                method,
+                uri,
+                headers,
+                AxumPath(path),
+                body,
+                None,
+            )
+            .await;
+        }
+    };
+    if state.router.slow_mode == SlowMode::Off {
+        return proxy_request_now(
+            AxumState(proxy_state),
+            method,
+            uri,
+            headers,
+            AxumPath(path),
+            body,
+            None,
+        )
+        .await;
+    }
+    if let Err(err) = validate_router_slow_mode(&state.router) {
+        return proxy_error(StatusCode::BAD_GATEWAY, err);
+    }
+
+    let is_claude = path.trim_matches('/') == "messages";
+    let authorized = if is_claude {
+        local_proxy_token(&headers) == Some(state.router.local_token.trim())
+    } else {
+        bearer_token(&headers) == Some(state.router.local_token.trim())
+    };
+    if !authorized {
+        return proxy_request_now(
+            AxumState(proxy_state),
+            method,
+            uri,
+            headers,
+            AxumPath(path),
+            body,
+            None,
+        )
+        .await;
+    }
+
+    let body_bytes = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
+    };
+    let streams = decoded_proxy_request_body(&headers, &body_bytes)
+        .ok()
+        .is_some_and(|decoded| request_body_streams(&decoded));
+    let delay_secs = selected_slow_delay_secs(&state.router);
+    let slow_timing = RequestTiming {
+        slow_delay_ms: Some(delay_secs.saturating_mul(1_000)),
+        ..received_timing
+    };
+    let delayed_body = Body::from(body_bytes);
+
+    if !streams {
+        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        return proxy_request_now(
+            AxumState(proxy_state),
+            method,
+            uri,
+            headers,
+            AxumPath(path),
+            delayed_body,
+            Some(slow_timing),
+        )
+        .await;
+    }
+
+    let protocol = if is_claude {
+        SlowStreamProtocol::Claude
+    } else {
+        SlowStreamProtocol::Codex
+    };
+    let response = async move {
+        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        proxy_request_now(
+            AxumState(proxy_state),
+            method,
+            uri,
+            headers,
+            AxumPath(path),
+            delayed_body,
+            Some(slow_timing),
+        )
+        .await
+    }
+    .boxed();
+    slow_stream_response(protocol, response)
+}
+
+async fn proxy_request_now(
+    AxumState(proxy_state): AxumState<Arc<ProxyState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    AxumPath(path): AxumPath<String>,
+    body: Body,
+    timing: Option<RequestTiming>,
+) -> Response {
     if method == Method::GET
         && path.trim_matches('/') == "models"
         && claude_models_request(&headers)
@@ -8827,11 +9177,12 @@ async fn proxy_request(
         return proxy_claude_models(proxy_state, headers).await;
     }
     if path.trim_matches('/') == "messages" {
-        return proxy_claude_request(proxy_state, method, uri, headers, path, body).await;
+        return proxy_claude_request(proxy_state, method, uri, headers, path, body, timing).await;
     }
 
-    let request_started = Instant::now();
-    let request_started_at_ms = current_epoch_ms().unwrap_or_default();
+    let timing = timing.unwrap_or_else(RequestTiming::now);
+    let request_started = timing.start;
+    let request_started_at_ms = timing.started_at_ms;
     let route_request_id = request_id(request_started_at_ms);
     let (router, candidates) = match upstream_candidates() {
         Ok(config) => config,
@@ -8959,8 +9310,7 @@ async fn proxy_request(
 
         cancellation_guard.arm(build_pending_route_log(
             route_request_id.clone(),
-            request_started_at_ms,
-            request_started,
+            timing,
             candidate,
             &method,
             &path,
@@ -9002,8 +9352,7 @@ async fn proxy_request(
                 }
                 cancellation_guard.arm(build_pending_route_log(
                     route_request_id.clone(),
-                    request_started_at_ms,
-                    request_started,
+                    timing,
                     candidate,
                     &method,
                     &path,
@@ -9054,8 +9403,7 @@ async fn proxy_request(
 
         cancellation_guard.arm(build_pending_route_log(
             route_request_id.clone(),
-            request_started_at_ms,
-            request_started,
+            timing,
             candidate,
             &method,
             &path,
@@ -9294,6 +9642,7 @@ fn stop_router(runtime: &RouterRuntime) {
 
 fn build_upstream_client(config: &RouterConfig) -> Result<UpstreamClient, String> {
     validate_router_timeouts(config)?;
+    validate_router_slow_mode(config)?;
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
         .read_timeout(Duration::from_secs(config.stream_idle_timeout_secs))
@@ -11163,8 +11512,12 @@ fn save_router_config(
         connect_timeout_secs: payload.connect_timeout_secs,
         response_header_timeout_secs: payload.response_header_timeout_secs,
         stream_idle_timeout_secs: payload.stream_idle_timeout_secs,
+        slow_mode: payload.slow_mode,
+        slow_delay_secs: payload.slow_delay_secs,
+        slow_delay_max_secs: payload.slow_delay_max_secs,
     };
     validate_router_timeouts(&router)?;
+    validate_router_slow_mode(&router)?;
     state.router = router;
     ensure_client_configs_applied(&mut state)?;
     save_state(&state)?;
@@ -11885,6 +12238,9 @@ mod tests {
             router.stream_idle_timeout_secs,
             DEFAULT_STREAM_IDLE_TIMEOUT_SECS
         );
+        assert_eq!(router.slow_mode, SlowMode::Off);
+        assert_eq!(router.slow_delay_secs, 0);
+        assert_eq!(router.slow_delay_max_secs, 0);
     }
 
     #[test]
@@ -11948,6 +12304,89 @@ multi_agent = false
             validate_router_timeouts(&router).unwrap_err(),
             "流式响应空闲超时不能小于响应头超时"
         );
+    }
+
+    #[test]
+    fn validates_router_slow_mode_ranges() {
+        let mut router = RouterConfig::default();
+        assert!(validate_router_slow_mode(&router).is_ok());
+
+        router.slow_mode = SlowMode::Fixed;
+        assert!(validate_router_slow_mode(&router)
+            .unwrap_err()
+            .contains("固定延迟"));
+
+        router.slow_delay_secs = 15;
+        assert!(validate_router_slow_mode(&router).is_ok());
+        assert_eq!(selected_slow_delay_secs(&router), 15);
+
+        router.slow_mode = SlowMode::Random;
+        router.slow_delay_max_secs = 10;
+        assert_eq!(
+            validate_router_slow_mode(&router).unwrap_err(),
+            "随机延迟上限不能小于下限"
+        );
+
+        router.slow_delay_secs = 5;
+        router.slow_delay_max_secs = 10;
+        assert!(validate_router_slow_mode(&router).is_ok());
+        for _ in 0..32 {
+            assert!((5..=10).contains(&selected_slow_delay_secs(&router)));
+        }
+    }
+
+    #[test]
+    fn detects_streaming_proxy_requests() {
+        assert!(request_body_streams(br#"{"stream":true}"#));
+        assert!(!request_body_streams(br#"{"stream":false}"#));
+        assert!(!request_body_streams(br#"{"model":"gpt-5"}"#));
+        assert!(!request_body_streams(b"not-json"));
+    }
+
+    #[test]
+    fn slow_stream_wrapper_prefixes_heartbeat_without_changing_upstream_events() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let upstream_event =
+                "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+            let upstream = async move { Response::new(Body::from(upstream_event)) }.boxed();
+            let response = slow_stream_response(SlowStreamProtocol::Codex, upstream);
+            let body = axum::body::to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+                .await
+                .unwrap();
+            let expected = format!(
+                "{}{}",
+                String::from_utf8_lossy(SLOW_HEARTBEAT),
+                upstream_event
+            );
+            assert_eq!(String::from_utf8_lossy(&body), expected);
+        });
+    }
+
+    #[test]
+    fn slow_stream_wrapper_converts_pre_header_errors_to_protocol_events() {
+        let codex = String::from_utf8_lossy(&slow_stream_error_chunk(
+            SlowStreamProtocol::Codex,
+            StatusCode::BAD_GATEWAY,
+            br#"{"error":{"message":"upstream unavailable"}}"#,
+        ))
+        .to_string();
+        assert!(codex.starts_with("event: error\n"));
+        assert!(codex.contains("upstream unavailable"));
+        assert!(codex.contains("slow_proxy_error"));
+
+        let claude = String::from_utf8_lossy(&slow_stream_error_chunk(
+            SlowStreamProtocol::Claude,
+            StatusCode::BAD_GATEWAY,
+            br#"{"error":{"message":"upstream unavailable"}}"#,
+        ))
+        .to_string();
+        assert!(claude.starts_with("event: error\n"));
+        assert!(claude.contains("api_error"));
+        assert!(claude.contains("upstream unavailable"));
     }
 
     #[test]
@@ -12860,6 +13299,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             reasoning_output_tokens: 1,
             total_tokens: 10,
             first_byte_ms: Some(100),
+            slow_delay_ms: None,
             upstream_started_ms: Some(10),
             response_header_ms: Some(80),
             upstream_request_id: Some("upstream-test-id".to_string()),
@@ -12884,6 +13324,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             route_result: "直连".to_string(),
             route_attempts: 1,
             error: None,
+            slow_delay_ms: None,
             upstream_started_ms: Some(10),
             response_header_ms: status_code.map(|_| 80),
             upstream_request_id: status_code.map(|_| "upstream-test-id".to_string()),
@@ -12945,11 +13386,31 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         object.remove("upstream_started_ms");
         object.remove("response_header_ms");
         object.remove("upstream_request_id");
+        object.remove("slow_delay_ms");
 
         let decoded: RouteRequestLog = serde_json::from_value(value).expect("deserialize old log");
         assert_eq!(decoded.upstream_started_ms, None);
         assert_eq!(decoded.response_header_ms, None);
         assert_eq!(decoded.upstream_request_id, None);
+        assert_eq!(decoded.slow_delay_ms, None);
+    }
+
+    #[test]
+    fn finished_route_log_includes_selected_slow_delay_in_total_timing() {
+        let mut pending = pending_route_log_for_test(Some(200));
+        pending.started_at_ms = 1_782_470_400_123;
+        pending.slow_delay_ms = Some(5_000);
+        pending.upstream_started_ms = Some(5_025);
+        pending.response_header_ms = Some(5_080);
+        pending.start = Instant::now() - Duration::from_millis(5_100);
+
+        let log = build_finished_route_log(pending, "success", TokenUsage::default(), Some(5_090));
+
+        assert_eq!(log.started_at_ms, 1_782_470_400_123);
+        assert_eq!(log.slow_delay_ms, Some(5_000));
+        assert_eq!(log.upstream_started_ms, Some(5_025));
+        assert_eq!(log.first_byte_ms, Some(5_090));
+        assert!(log.total_ms >= 5_100);
     }
 
     #[test]

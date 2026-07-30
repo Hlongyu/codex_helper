@@ -16,6 +16,7 @@ type NewApiBalanceTarget = "token_quota" | "account_balance";
 type BalanceAuthMode = "provider_token" | "separate_token";
 type ProviderWireApi = "responses" | "chat_completions";
 type ProviderStatus = "enabled" | "disabled" | "auto_disabled";
+type SlowMode = "off" | "fixed" | "random";
 
 type BalanceQueryConfig = {
   enabled: boolean;
@@ -63,6 +64,9 @@ type RouterConfig = {
   connect_timeout_secs: number;
   response_header_timeout_secs: number;
   stream_idle_timeout_secs: number;
+  slow_mode: SlowMode;
+  slow_delay_secs: number;
+  slow_delay_max_secs: number;
 };
 
 type SkillLocationConfig = {
@@ -271,6 +275,7 @@ type RouteRequestLog = {
   reasoning_output_tokens: number;
   total_tokens: number;
   first_byte_ms?: number | null;
+  slow_delay_ms?: number | null;
   upstream_started_ms?: number | null;
   response_header_ms?: number | null;
   upstream_request_id?: string | null;
@@ -395,6 +400,7 @@ const ROUTER_TIMEOUT_LIMITS = {
   response_header_timeout_secs: 600,
   stream_idle_timeout_secs: 3600,
 } as const;
+const MAX_SLOW_DELAY_SECS = 3600;
 
 function defaultBalanceQuery(endpoint = ""): BalanceQueryConfig {
   return {
@@ -421,6 +427,9 @@ function defaultRouterConfig(): RouterConfig {
     connect_timeout_secs: 10,
     response_header_timeout_secs: 180,
     stream_idle_timeout_secs: 180,
+    slow_mode: "off",
+    slow_delay_secs: 0,
+    slow_delay_max_secs: 0,
   };
 }
 
@@ -453,6 +462,30 @@ function routerTimeoutError(router: RouterConfig) {
   }
   if (router.response_header_timeout_secs > router.stream_idle_timeout_secs) {
     return "流空闲超时不能小于响应头超时。";
+  }
+  return "";
+}
+
+function routerSlowModeError(router: RouterConfig) {
+  if (router.slow_mode === "off") return "";
+  if (
+    !Number.isInteger(router.slow_delay_secs) ||
+    router.slow_delay_secs < 1 ||
+    router.slow_delay_secs > MAX_SLOW_DELAY_SECS
+  ) {
+    return `延迟必须是 1 到 ${MAX_SLOW_DELAY_SECS} 秒之间的整数。`;
+  }
+  if (router.slow_mode === "random") {
+    if (
+      !Number.isInteger(router.slow_delay_max_secs) ||
+      router.slow_delay_max_secs < 1 ||
+      router.slow_delay_max_secs > MAX_SLOW_DELAY_SECS
+    ) {
+      return `随机延迟上限必须是 1 到 ${MAX_SLOW_DELAY_SECS} 秒之间的整数。`;
+    }
+    if (router.slow_delay_max_secs < router.slow_delay_secs) {
+      return "随机延迟上限不能小于下限。";
+    }
   }
   return "";
 }
@@ -694,14 +727,22 @@ function routeTimingPhases(log: RouteRequestLog): RouteTimingPhase[] {
   const upstreamStarted = log.upstream_started_ms;
   const responseHeader = log.response_header_ms;
   const firstByte = log.first_byte_ms;
-  if (upstreamStarted == null) return [];
+  const slowDelay = log.slow_delay_ms;
+  if (upstreamStarted == null) {
+    return slowDelay == null ? [] : [{ label: "Slow 模式延迟", durationMs: slowDelay }];
+  }
 
-  const phases: RouteTimingPhase[] = [
-    {
+  const phases: RouteTimingPhase[] = [];
+  if (slowDelay != null) {
+    phases.push({ label: "Slow 模式延迟", durationMs: slowDelay });
+  }
+  const beforeUpstream = Math.max(0, upstreamStarted - (slowDelay ?? 0));
+  if (slowDelay == null || beforeUpstream > 0) {
+    phases.push({
       label: log.route_attempts > 1 ? "发起最终上游前（含前置重试）" : "发起上游前",
-      durationMs: upstreamStarted,
-    },
-  ];
+      durationMs: beforeUpstream,
+    });
+  }
   if (responseHeader == null) {
     phases.push({
       label: "等待响应头至结束",
@@ -1148,6 +1189,7 @@ function App() {
   const [balanceTestStatus, setBalanceTestStatus] = useState<BalanceStatus | null>(null);
   const [balanceAccountOptions, setBalanceAccountOptions] = useState<AiGateBalanceAccount[]>([]);
   const [routerDraft, setRouterDraft] = useState<RouterConfig>(() => defaultRouterConfig());
+  const [proxyDraft, setProxyDraft] = useState<RouterConfig>(() => defaultRouterConfig());
   const [secretVisible, setSecretVisible] = useState(false);
   const [balanceTokenVisible, setBalanceTokenVisible] = useState(false);
   const [latencyDialog, setLatencyDialog] = useState<ProviderLatencyDialogState | null>(null);
@@ -1185,6 +1227,7 @@ function App() {
     const state = await callCommand<AppState>("load_app_state");
     setAppState(state);
     setRouterDraft(state.router ?? defaultRouterConfig());
+    setProxyDraft(state.router ?? defaultRouterConfig());
   }
 
   async function refreshSkillManagement() {
@@ -1723,9 +1766,11 @@ function App() {
         const applied = await callCommand<AppState>("apply_config");
         setAppState(applied);
         setRouterDraft(applied.router);
+        setProxyDraft(applied.router);
       } else {
         setAppState(saved);
         setRouterDraft(saved.router);
+        setProxyDraft(saved.router);
       }
     });
   }
@@ -1962,7 +2007,7 @@ function App() {
               {screen === "dashboard"
                 ? "用量、供应商与请求质量"
                 : screen === "route"
-                  ? "管理 Codex、Claude 接管与本地代理"
+                  ? "管理 Codex、Claude 与 Pi 的本地接管"
                 : screen === "providers"
                   ? "管理上游连接、余额监控与路由顺序"
                   : screen === "skills"
@@ -2031,7 +2076,6 @@ function App() {
             onSaveClientConfig={saveClientConfig}
             onSaveMultiAgentEnabled={saveMultiAgentEnabled}
             routerDraft={routerDraft}
-            routerOn={routerOn}
             setRouterDraft={setRouterDraft}
             onSaveRouter={saveRouter}
           />
@@ -2099,11 +2143,19 @@ function App() {
 
         {screen === "settings" && (
           <section className="settings-grid">
+            <LocalProxySettings
+              appState={appState}
+              busy={busy}
+              onSaveRouter={saveRouter}
+              routerDraft={proxyDraft}
+              routerOn={routerOn}
+              setRouterDraft={setProxyDraft}
+            />
             <article className="page-panel">
               <div className="panel-head">
                 <div>
-                  <h2>设置</h2>
-                  <p>应用信息与通用偏好设置入口。路由接管与本地代理配置已移动到路由页。</p>
+                  <h2>应用</h2>
+                  <p>查看当前版本并获取最新稳定版本。</p>
                 </div>
               </div>
               <div className="settings-list">
@@ -2271,11 +2323,9 @@ function App() {
   );
 }
 
-function RouteScreen({
+function LocalProxySettings({
   appState,
   busy,
-  onSaveClientConfig,
-  onSaveMultiAgentEnabled,
   onSaveRouter,
   routerDraft,
   routerOn,
@@ -2283,16 +2333,19 @@ function RouteScreen({
 }: {
   appState: AppState;
   busy: boolean;
-  onSaveClientConfig: (kind: AgentClientKind, enabled: boolean) => Promise<void>;
-  onSaveMultiAgentEnabled: (enabled: boolean) => Promise<void>;
   onSaveRouter: (nextRouter: RouterConfig, apply?: boolean) => Promise<void>;
   routerDraft: RouterConfig;
   routerOn: boolean;
   setRouterDraft: (router: RouterConfig) => void;
 }) {
-  const providerNameError = routerModelProviderError(routerDraft);
   const timeoutError = routerTimeoutError(routerDraft);
-  const routerSettingsValid = !providerNameError && !timeoutError;
+  const slowModeError = routerSlowModeError(routerDraft);
+  const endpointError = routerDraft.enabled && !routerDraft.host.trim()
+    ? "监听地址不能为空。"
+    : routerDraft.enabled && (!Number.isInteger(routerDraft.port) || routerDraft.port < 1 || routerDraft.port > 65_535)
+      ? "监听端口必须是 1 到 65535 之间的整数。"
+      : "";
+  const proxySettingsValid = !endpointError && !timeoutError && !slowModeError;
   const updateTimeout = (
     field: "connect_timeout_secs" | "response_header_timeout_secs" | "stream_idle_timeout_secs",
     rawValue: string,
@@ -2303,6 +2356,246 @@ function RouteScreen({
       [field]: Number.isInteger(value) && value >= 0 ? value : 0,
     });
   };
+  const updateSlowDelay = (
+    field: "slow_delay_secs" | "slow_delay_max_secs",
+    rawValue: string,
+  ) => {
+    const value = Number(rawValue);
+    setRouterDraft({
+      ...routerDraft,
+      [field]: Number.isInteger(value) && value >= 0 ? value : 0,
+    });
+  };
+  const selectSlowMode = (slow_mode: SlowMode) => {
+    const slow_delay_secs = routerDraft.slow_delay_secs || 5;
+    setRouterDraft({
+      ...routerDraft,
+      slow_mode,
+      slow_delay_secs,
+      slow_delay_max_secs:
+        slow_mode === "random"
+          ? Math.max(routerDraft.slow_delay_max_secs || 10, slow_delay_secs)
+          : routerDraft.slow_delay_max_secs,
+    });
+  };
+
+  return (
+    <article className="page-panel local-proxy-settings">
+      <div className="panel-head">
+        <div>
+          <h2>本地代理</h2>
+          <p>配置网关监听、上游超时与请求延迟。</p>
+        </div>
+        <span className={`state-pill ${routerOn ? "ok" : "warn"}`}>
+          <span />
+          {routerOn ? "运行中" : "未运行"}
+        </span>
+      </div>
+
+      <div className="route-form-grid">
+        <label className="compact-field">
+          <span>监听地址</span>
+          <input
+            aria-invalid={Boolean(endpointError && !routerDraft.host.trim())}
+            value={routerDraft.host}
+            onChange={(event) => setRouterDraft({ ...routerDraft, host: event.currentTarget.value })}
+          />
+        </label>
+        <label className="compact-field">
+          <span>监听端口</span>
+          <input
+            aria-invalid={Boolean(endpointError && routerDraft.host.trim())}
+            inputMode="numeric"
+            value={String(routerDraft.port)}
+            onChange={(event) =>
+              setRouterDraft({
+                ...routerDraft,
+                port: Number(event.currentTarget.value.replace(/\D/g, "")) || 0,
+              })
+            }
+          />
+        </label>
+      </div>
+      {endpointError ? <small className="settings-error">{endpointError}</small> : null}
+
+      <div className="route-timeout-settings">
+        <div>
+          <strong>上游超时</strong>
+          <p>每个供应商独立计时，超时后继续尝试下一供应商。</p>
+        </div>
+        <div className="route-timeout-grid">
+          <label className="compact-field">
+            <span>连接超时（秒）</span>
+            <input
+              aria-invalid={
+                routerDraft.connect_timeout_secs < 1 ||
+                routerDraft.connect_timeout_secs > ROUTER_TIMEOUT_LIMITS.connect_timeout_secs
+              }
+              max={ROUTER_TIMEOUT_LIMITS.connect_timeout_secs}
+              min={1}
+              step={1}
+              type="number"
+              value={routerDraft.connect_timeout_secs}
+              onChange={(event) => updateTimeout("connect_timeout_secs", event.currentTarget.value)}
+            />
+          </label>
+          <label className="compact-field">
+            <span>响应头超时（秒）</span>
+            <input
+              aria-invalid={
+                routerDraft.response_header_timeout_secs < 1 ||
+                routerDraft.response_header_timeout_secs >
+                  ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs ||
+                routerDraft.response_header_timeout_secs < routerDraft.connect_timeout_secs
+              }
+              max={ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs}
+              min={1}
+              step={1}
+              type="number"
+              value={routerDraft.response_header_timeout_secs}
+              onChange={(event) =>
+                updateTimeout("response_header_timeout_secs", event.currentTarget.value)
+              }
+            />
+          </label>
+          <label className="compact-field">
+            <span>流空闲超时（秒）</span>
+            <input
+              aria-invalid={
+                routerDraft.stream_idle_timeout_secs < 1 ||
+                routerDraft.stream_idle_timeout_secs > ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs ||
+                routerDraft.stream_idle_timeout_secs < routerDraft.response_header_timeout_secs
+              }
+              max={ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs}
+              min={1}
+              step={1}
+              type="number"
+              value={routerDraft.stream_idle_timeout_secs}
+              onChange={(event) => updateTimeout("stream_idle_timeout_secs", event.currentTarget.value)}
+            />
+          </label>
+        </div>
+        {timeoutError ? <small>{timeoutError}</small> : null}
+      </div>
+
+      <div className="route-slow-settings">
+        <div className="route-slow-heading">
+          <div>
+            <strong>Slow 模式</strong>
+            <p>流式请求等待期间保持连接，延迟结束后再连接上游。</p>
+          </div>
+          <div className="slow-mode-control" role="group" aria-label="Slow 模式">
+            {(["off", "fixed", "random"] as const).map((mode) => (
+              <button
+                aria-pressed={routerDraft.slow_mode === mode}
+                className={routerDraft.slow_mode === mode ? "active" : ""}
+                key={mode}
+                onClick={() => selectSlowMode(mode)}
+                type="button"
+              >
+                {mode === "off" ? "关闭" : mode === "fixed" ? "固定" : "随机"}
+              </button>
+            ))}
+          </div>
+        </div>
+        {routerDraft.slow_mode !== "off" ? (
+          <div className="route-slow-grid">
+            <label className="compact-field">
+              <span>{routerDraft.slow_mode === "fixed" ? "延迟（秒）" : "最小延迟（秒）"}</span>
+              <input
+                aria-invalid={
+                  routerDraft.slow_delay_secs < 1 ||
+                  routerDraft.slow_delay_secs > MAX_SLOW_DELAY_SECS
+                }
+                max={MAX_SLOW_DELAY_SECS}
+                min={1}
+                step={1}
+                type="number"
+                value={routerDraft.slow_delay_secs}
+                onChange={(event) => updateSlowDelay("slow_delay_secs", event.currentTarget.value)}
+              />
+            </label>
+            {routerDraft.slow_mode === "random" ? (
+              <label className="compact-field">
+                <span>最大延迟（秒）</span>
+                <input
+                  aria-invalid={
+                    routerDraft.slow_delay_max_secs < 1 ||
+                    routerDraft.slow_delay_max_secs > MAX_SLOW_DELAY_SECS ||
+                    routerDraft.slow_delay_max_secs < routerDraft.slow_delay_secs
+                  }
+                  max={MAX_SLOW_DELAY_SECS}
+                  min={1}
+                  step={1}
+                  type="number"
+                  value={routerDraft.slow_delay_max_secs}
+                  onChange={(event) => updateSlowDelay("slow_delay_max_secs", event.currentTarget.value)}
+                />
+              </label>
+            ) : null}
+          </div>
+        ) : null}
+        {slowModeError ? <small>{slowModeError}</small> : null}
+      </div>
+
+      <div className="route-toggle-line">
+        <div>
+          <strong>启动程序后自动运行代理</strong>
+        </div>
+        <Toggle
+          checked={routerDraft.enabled}
+          disabled={busy}
+          onChange={(enabled) => setRouterDraft({ ...routerDraft, enabled })}
+        />
+      </div>
+      <div className="route-toggle-line">
+        <div>
+          <strong>允许局域网访问</strong>
+          <p>关闭时仅本机可以连接</p>
+        </div>
+        <Toggle
+          checked={routerDraft.host !== "127.0.0.1"}
+          onChange={(checked) =>
+            setRouterDraft({ ...routerDraft, host: checked ? "0.0.0.0" : "127.0.0.1" })
+          }
+        />
+      </div>
+
+      <div className="route-footer-actions">
+        <button className="ghost" onClick={() => setRouterDraft(appState.router)} type="button">
+          撤销修改
+        </button>
+        <button
+          className="primary"
+          disabled={busy || !proxySettingsValid}
+          onClick={() => onSaveRouter(routerDraft, true)}
+          type="button"
+        >
+          保存代理设置
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function RouteScreen({
+  appState,
+  busy,
+  onSaveClientConfig,
+  onSaveMultiAgentEnabled,
+  onSaveRouter,
+  routerDraft,
+  setRouterDraft,
+}: {
+  appState: AppState;
+  busy: boolean;
+  onSaveClientConfig: (kind: AgentClientKind, enabled: boolean) => Promise<void>;
+  onSaveMultiAgentEnabled: (enabled: boolean) => Promise<void>;
+  onSaveRouter: (nextRouter: RouterConfig, apply?: boolean) => Promise<void>;
+  routerDraft: RouterConfig;
+  setRouterDraft: (router: RouterConfig) => void;
+}) {
+  const providerNameError = routerModelProviderError(routerDraft);
 
   return (
     <section className="route-page">
@@ -2452,160 +2745,15 @@ function RouteScreen({
           </div>
         </article>
 
-        <article className="route-card">
-          <div className="route-card-head">
-            <h3>本地代理</h3>
-            <span className={`state-pill ${routerOn ? "ok" : "warn"}`}>
-              <span />
-              {routerOn ? "运行中" : "未运行"}
-            </span>
-          </div>
-          <div className="route-form-grid">
-            <label className="compact-field">
-              <span>监听地址</span>
-              <input
-                value={routerDraft.host}
-                onChange={(event) => setRouterDraft({ ...routerDraft, host: event.currentTarget.value })}
-              />
-            </label>
-            <label className="compact-field">
-              <span>监听端口</span>
-              <input
-                inputMode="numeric"
-                value={String(routerDraft.port)}
-                onChange={(event) =>
-                  setRouterDraft({
-                    ...routerDraft,
-                    port: Number(event.currentTarget.value.replace(/\D/g, "")) || 0,
-                  })
-                }
-              />
-            </label>
-          </div>
-          <div className="route-timeout-settings">
-            <div>
-              <strong>上游超时</strong>
-              <p>每个供应商独立计时，超时后继续尝试下一供应商。</p>
-            </div>
-            <div className="route-timeout-grid">
-              <label className="compact-field">
-                <span>连接超时（秒）</span>
-                <input
-                  aria-invalid={
-                    routerDraft.connect_timeout_secs < 1 ||
-                    routerDraft.connect_timeout_secs > ROUTER_TIMEOUT_LIMITS.connect_timeout_secs
-                  }
-                  max={ROUTER_TIMEOUT_LIMITS.connect_timeout_secs}
-                  min={1}
-                  step={1}
-                  type="number"
-                  value={routerDraft.connect_timeout_secs}
-                  onChange={(event) => updateTimeout("connect_timeout_secs", event.currentTarget.value)}
-                />
-              </label>
-              <label className="compact-field">
-                <span>响应头超时（秒）</span>
-                <input
-                  aria-invalid={
-                    routerDraft.response_header_timeout_secs < 1 ||
-                    routerDraft.response_header_timeout_secs >
-                      ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs ||
-                    routerDraft.response_header_timeout_secs < routerDraft.connect_timeout_secs
-                  }
-                  max={ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs}
-                  min={1}
-                  step={1}
-                  type="number"
-                  value={routerDraft.response_header_timeout_secs}
-                  onChange={(event) =>
-                    updateTimeout("response_header_timeout_secs", event.currentTarget.value)
-                  }
-                />
-              </label>
-              <label className="compact-field">
-                <span>流空闲超时（秒）</span>
-                <input
-                  aria-invalid={
-                    routerDraft.stream_idle_timeout_secs < 1 ||
-                    routerDraft.stream_idle_timeout_secs > ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs ||
-                    routerDraft.stream_idle_timeout_secs < routerDraft.response_header_timeout_secs
-                  }
-                  max={ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs}
-                  min={1}
-                  step={1}
-                  type="number"
-                  value={routerDraft.stream_idle_timeout_secs}
-                  onChange={(event) => updateTimeout("stream_idle_timeout_secs", event.currentTarget.value)}
-                />
-              </label>
-            </div>
-            {timeoutError ? <small>{timeoutError}</small> : null}
-          </div>
-          <div className="route-toggle-line">
-            <div>
-              <strong>启动程序后自动运行代理</strong>
-            </div>
-            <Toggle
-              checked={routerDraft.enabled}
-              disabled={busy}
-              onChange={(enabled) => setRouterDraft({ ...routerDraft, enabled })}
-            />
-          </div>
-          <div className="route-toggle-line">
-            <div>
-              <strong>允许局域网访问</strong>
-              <p>关闭时仅本机可以连接</p>
-            </div>
-            <Toggle
-              checked={routerDraft.host !== "127.0.0.1"}
-              onChange={(checked) =>
-                setRouterDraft({ ...routerDraft, host: checked ? "0.0.0.0" : "127.0.0.1" })
-              }
-            />
-          </div>
-        </article>
       </div>
-
-      <article className="route-card route-rules-card">
-        <div className="panel-head">
-          <div>
-            <h2>转发规则</h2>
-            <p>请求按照供应商列表中的顺序选择可用上游。</p>
-          </div>
-        </div>
-        <div className="routing-mode">
-          <span>当前路由方式</span>
-          <strong>按供应商顺序故障转移</strong>
-          <button className="ghost small">由供应商列表顺序决定</button>
-        </div>
-        <div className="route-rule-line">
-          <div>
-            <strong>会话固定</strong>
-            <p>同一 Codex 会话优先继续使用当前供应商，即将支持</p>
-          </div>
-          <Toggle checked={false} disabled onChange={() => undefined} />
-        </div>
-        <div className="route-rule-line">
-          <div>
-            <strong>余额不足时自动跳过</strong>
-            <p>供应商余额低于其配置阈值时不再分配新请求，即将支持</p>
-          </div>
-          <Toggle checked={false} disabled onChange={() => undefined} />
-        </div>
-        <button className="route-strategy-row" type="button">
-          <strong>故障转移策略</strong>
-          <span>已支持网络错误、429、5xx 顺序重试；连续失败冷却即将支持</span>
-          <b>›</b>
-        </button>
-      </article>
 
       <div className="route-footer-actions">
         <button className="ghost" onClick={() => setRouterDraft(appState.router)} type="button">
-          恢复默认
+          撤销修改
         </button>
         <button
           className="primary"
-          disabled={busy || !routerSettingsValid}
+          disabled={busy || Boolean(providerNameError)}
           onClick={() => onSaveRouter(routerDraft, true)}
           type="button"
         >
@@ -3228,6 +3376,9 @@ function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () 
               <div><span>上游模型</span><strong>{log.upstream_model || log.model || "-"}</strong></div>
               <div><span>供应商</span><strong>{log.provider_name}</strong></div>
               <div><span>路由尝试</span><strong>{log.route_attempts} 次</strong></div>
+              {log.slow_delay_ms != null ? (
+                <div><span>Slow 延迟</span><strong>{formatDuration(log.slow_delay_ms)}</strong></div>
+              ) : null}
             </div>
           </section>
 
