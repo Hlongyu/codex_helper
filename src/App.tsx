@@ -56,6 +56,8 @@ type ModelMapping = {
 
 type RouterConfig = {
   enabled: boolean;
+  debug_mode: boolean;
+  force_disable_openai_auth: boolean;
   remote_compaction_enabled: boolean;
   model_provider: string;
   host: string;
@@ -279,7 +281,44 @@ type RouteRequestLog = {
   upstream_started_ms?: number | null;
   response_header_ms?: number | null;
   upstream_request_id?: string | null;
+  debug_capture_available: boolean;
+  debug_capture_error?: string | null;
   total_ms: number;
+};
+
+type DebugHeader = {
+  name: string;
+  value: string;
+};
+
+type DebugBodySnapshot = {
+  text: string;
+  captured_bytes: number;
+  total_bytes: number;
+  truncated: boolean;
+};
+
+type DebugRequestSnapshot = {
+  method: string;
+  url: string;
+  headers: DebugHeader[];
+  body: DebugBodySnapshot;
+};
+
+type DebugResponseSnapshot = {
+  status_code?: number | null;
+  headers: DebugHeader[];
+  body: DebugBodySnapshot;
+};
+
+type RouteDebugCapture = {
+  version: number;
+  request_id: string;
+  started_at_ms: number;
+  provider_name: string;
+  inbound_request: DebugRequestSnapshot;
+  upstream_request: DebugRequestSnapshot;
+  upstream_response: DebugResponseSnapshot;
 };
 
 type RouteLogFilter = {
@@ -419,6 +458,8 @@ function defaultBalanceQuery(endpoint = ""): BalanceQueryConfig {
 function defaultRouterConfig(): RouterConfig {
   return {
     enabled: false,
+    debug_mode: false,
+    force_disable_openai_auth: false,
     remote_compaction_enabled: false,
     model_provider: "custom",
     host: "127.0.0.1",
@@ -805,6 +846,34 @@ function formatLogTime(value: number) {
   });
 }
 
+function formatDebugBodyText(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    // Streaming Responses use SSE, with one JSON value per data line.
+  }
+
+  let formattedEvent = false;
+  const lines = text.split(/\r?\n/).map((line) => {
+    const match = line.match(/^(\s*data:\s*)(.+)$/);
+    if (!match || match[2].trim() === "[DONE]") return line;
+    try {
+      const pretty = JSON.stringify(JSON.parse(match[2]), null, 2).split("\n");
+      formattedEvent = true;
+      return [
+        `${match[1]}${pretty[0]}`,
+        ...pretty.slice(1).map((part) => `${" ".repeat(match[1].length)}${part}`),
+      ].join("\n");
+    } catch {
+      return line;
+    }
+  });
+  return formattedEvent ? lines.join("\n") : text;
+}
+
 function statusMeta(status: string) {
   if (status === "success") return { label: "成功", tone: "ok" };
   if (status === "failed") return { label: "失败", tone: "danger" };
@@ -821,6 +890,15 @@ function routeResultTone(result: string) {
 function csvEscape(value: string | number | null | undefined) {
   const text = String(value ?? "");
   return `"${text.replace(/"/g, '""')}"`;
+}
+
+function downloadTextFile(contents: string, type: string, filename: string) {
+  const url = URL.createObjectURL(new Blob([contents], { type }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 function exportRouteLogsCsv(logs: RouteRequestLog[]) {
@@ -849,12 +927,45 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
     log.error ?? "",
   ]);
   const csv = [headers, ...rows].map((row) => row.map(csvEscape).join(",")).join("\n");
-  const url = URL.createObjectURL(new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }));
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `xxswitch-route-logs-${Date.now()}.csv`;
-  link.click();
-  URL.revokeObjectURL(url);
+  downloadTextFile(
+    `\uFEFF${csv}`,
+    "text/csv;charset=utf-8",
+    `xxswitch-route-logs-${Date.now()}.csv`,
+  );
+}
+
+async function exportRouteDebugBundle(logs: RouteRequestLog[]) {
+  const captures: Array<{ route_log: RouteRequestLog; debug_capture: RouteDebugCapture }> = [];
+  const failures: Array<{ request_id: string; error: string }> = [];
+
+  for (const log of logs) {
+    try {
+      const capture = await callCommand<RouteDebugCapture>("load_route_debug_capture", {
+        payload: { request_id: log.id },
+      });
+      captures.push({ route_log: log, debug_capture: capture });
+    } catch (err) {
+      failures.push({ request_id: log.id, error: String(err) });
+    }
+  }
+
+  const exportedAt = new Date();
+  const bundle = {
+    schema: "xxswitch.responses-debug-export",
+    schema_version: 1,
+    exported_at: exportedAt.toISOString(),
+    requested_count: logs.length,
+    capture_count: captures.length,
+    failure_count: failures.length,
+    captures,
+    failures,
+  };
+  downloadTextFile(
+    JSON.stringify(bundle, null, 2),
+    "application/json;charset=utf-8",
+    `xxswitch-responses-debug-${exportedAt.toISOString().replace(/[:.]/g, "-")}.json`,
+  );
+  return failures.length;
 }
 
 function formatBalanceForCard(label: string) {
@@ -2538,6 +2649,17 @@ function LocalProxySettings({
         {slowModeError ? <small>{slowModeError}</small> : null}
       </div>
 
+      <div className="route-toggle-line debug-mode-toggle">
+        <div>
+          <strong>Debug 模式（Responses API）</strong>
+          <p>保存入站请求、实际上游请求和上游原始响应；认证信息会脱敏。</p>
+        </div>
+        <Toggle
+          checked={routerDraft.debug_mode}
+          disabled={busy}
+          onChange={(debug_mode) => setRouterDraft({ ...routerDraft, debug_mode })}
+        />
+      </div>
       <div className="route-toggle-line">
         <div>
           <strong>启动程序后自动运行代理</strong>
@@ -2662,6 +2784,22 @@ function RouteScreen({
               disabled={busy}
               onChange={(remote_compaction_enabled) =>
                 setRouterDraft({ ...routerDraft, remote_compaction_enabled })
+              }
+            />
+          </div>
+          <div className="route-toggle-line">
+            <div>
+              <strong>强制不使用 OpenAI 登录态</strong>
+              <p>
+                开启时 requires_openai_auth 固定为 false；关闭时只检测是否配置 ChatGPT
+                登录态，不校验过期。
+              </p>
+            </div>
+            <Toggle
+              checked={routerDraft.force_disable_openai_auth}
+              disabled={busy}
+              onChange={(force_disable_openai_auth) =>
+                setRouterDraft({ ...routerDraft, force_disable_openai_auth })
               }
             />
           </div>
@@ -3212,14 +3350,94 @@ function RequestLogsScreen({
 }) {
   const rows = logs?.logs ?? [];
   const [selectedLog, setSelectedLog] = useState<RouteRequestLog | null>(null);
+  const [selectedDebugLogs, setSelectedDebugLogs] = useState<Record<string, RouteRequestLog>>({});
+  const [debugExporting, setDebugExporting] = useState(false);
+  const [debugExportStatus, setDebugExportStatus] = useState("");
+  const selectPageDebugRef = useRef<HTMLInputElement>(null);
+  const selectableRows = rows.filter((log) => log.debug_capture_available);
+  const selectedDebugCount = Object.keys(selectedDebugLogs).length;
+  const selectedPageDebugCount = selectableRows.filter((log) => Boolean(selectedDebugLogs[log.id])).length;
+  const allPageDebugSelected = selectableRows.length > 0
+    && selectableRows.every((log) => Boolean(selectedDebugLogs[log.id]));
+
+  useEffect(() => {
+    if (selectPageDebugRef.current) {
+      selectPageDebugRef.current.indeterminate = selectedPageDebugCount > 0 && !allPageDebugSelected;
+    }
+  }, [allPageDebugSelected, selectedPageDebugCount]);
+
+  const toggleDebugSelection = (log: RouteRequestLog, checked: boolean) => {
+    setSelectedDebugLogs((current) => {
+      const next = { ...current };
+      if (checked) next[log.id] = log;
+      else delete next[log.id];
+      return next;
+    });
+    setDebugExportStatus("");
+  };
+
+  const toggleCurrentPageDebugSelection = (checked: boolean) => {
+    setSelectedDebugLogs((current) => {
+      const next = { ...current };
+      selectableRows.forEach((log) => {
+        if (checked) next[log.id] = log;
+        else delete next[log.id];
+      });
+      return next;
+    });
+    setDebugExportStatus("");
+  };
+
+  const exportSelectedDebugLogs = async () => {
+    const selected = Object.values(selectedDebugLogs);
+    if (selected.length === 0 || debugExporting) return;
+    setDebugExporting(true);
+    setDebugExportStatus("");
+    try {
+      const failed = await exportRouteDebugBundle(selected);
+      setDebugExportStatus(
+        failed > 0
+          ? `已导出 ${selected.length - failed} 条，${failed} 条读取失败`
+          : `已导出 ${selected.length} 条 Debug 快照`,
+      );
+    } catch (err) {
+      setDebugExportStatus(`导出失败：${String(err)}`);
+    } finally {
+      setDebugExporting(false);
+    }
+  };
 
   return (
     <section className="requests-page">
       <div className="section-title">
         <h2>请求列表</h2>
-        <button className="ghost" onClick={() => exportRouteLogsCsv(rows)} type="button">
-          导出当前页 CSV
-        </button>
+        <div className="request-export-actions">
+          {debugExportStatus ? <small>{debugExportStatus}</small> : null}
+          <button className="ghost" onClick={() => exportRouteLogsCsv(rows)} type="button">
+            导出当前页 CSV
+          </button>
+          {selectedDebugCount > 0 ? (
+            <button
+              className="ghost"
+              disabled={debugExporting}
+              onClick={() => {
+                setSelectedDebugLogs({});
+                setDebugExportStatus("");
+              }}
+              type="button"
+            >
+              清空选择
+            </button>
+          ) : null}
+          <button
+            className="ghost"
+            disabled={selectedDebugCount === 0 || debugExporting}
+            onClick={() => void exportSelectedDebugLogs()}
+            type="button"
+          >
+            {debugExporting ? "正在导出…" : `导出 Debug JSON (${selectedDebugCount})`}
+          </button>
+        </div>
       </div>
       <div className="request-filter-bar">
         <div className="search-box">
@@ -3263,6 +3481,16 @@ function RequestLogsScreen({
       <article className="route-table-card request-log-card">
         <div className="request-log-table">
           <header>
+            <label className="request-debug-checkbox" title="全选当前页 Debug 快照">
+              <input
+                aria-label="全选当前页 Debug 快照"
+                checked={allPageDebugSelected}
+                disabled={selectableRows.length === 0}
+                onChange={(event) => toggleCurrentPageDebugSelection(event.currentTarget.checked)}
+                ref={selectPageDebugRef}
+                type="checkbox"
+              />
+            </label>
             <span>状态</span>
             <span>时间</span>
             <span>模型</span>
@@ -3292,6 +3520,20 @@ function RequestLogsScreen({
                 role="button"
                 tabIndex={0}
               >
+                <div
+                  className="request-debug-checkbox"
+                  onClick={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  title={log.debug_capture_available ? "选择 Debug 快照" : "该请求没有 Debug 快照"}
+                >
+                  <input
+                    aria-label={`选择请求 ${log.id} 的 Debug 快照`}
+                    checked={Boolean(selectedDebugLogs[log.id])}
+                    disabled={!log.debug_capture_available}
+                    onChange={(event) => toggleDebugSelection(log, event.currentTarget.checked)}
+                    type="checkbox"
+                  />
+                </div>
                 <div className="status-cell">
                   <span className={`dot ${status.tone}`} />
                   <b className={`${status.tone}-text`}>{status.label}</b>
@@ -3310,7 +3552,11 @@ function RequestLogsScreen({
           })}
         </div>
         <footer className="table-pagination">
-          <span>点击任意记录查看路由时间线、Token 明细和错误详情。</span>
+          <span>
+            {selectedDebugCount > 0
+              ? `已选择 ${selectedDebugCount} 条 Debug 快照`
+              : "点击任意记录查看路由时间线、Token 明细和错误详情。"}
+          </span>
           <div>
             <button className="ghost small" disabled={(logs?.page ?? 1) <= 1} onClick={() => onFilter({ page: (logs?.page ?? 1) - 1 })}>‹</button>
             <b>{logs?.page ?? 1}</b>
@@ -3327,6 +3573,10 @@ function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () 
   const status = statusMeta(log.status);
   const phases = routeTimingPhases(log);
   const compactionAudit = remoteCompactionV2AuditLabel(log);
+  const [debugCapture, setDebugCapture] = useState<RouteDebugCapture | null>(null);
+  const [debugError, setDebugError] = useState(log.debug_capture_error || "");
+  const [debugLoading, setDebugLoading] = useState(log.debug_capture_available);
+  const [debugView, setDebugView] = useState<"inbound" | "upstream" | "response">("inbound");
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -3335,6 +3585,44 @@ function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () 
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [onClose]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!log.debug_capture_available) {
+      setDebugLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+    setDebugLoading(true);
+    callCommand<RouteDebugCapture>("load_route_debug_capture", {
+      payload: { request_id: log.id },
+    })
+      .then((capture) => {
+        if (!cancelled) setDebugCapture(capture);
+      })
+      .catch((err) => {
+        if (!cancelled) setDebugError(String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setDebugLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [log.debug_capture_available, log.id]);
+
+  const activeDebug = debugCapture
+    ? debugView === "inbound"
+      ? debugCapture.inbound_request
+      : debugView === "upstream"
+        ? debugCapture.upstream_request
+        : debugCapture.upstream_response
+    : null;
+  const activeDebugBodyText = useMemo(
+    () => formatDebugBodyText(activeDebug?.body.text || ""),
+    [activeDebug],
+  );
 
   return (
     <div
@@ -3429,6 +3717,59 @@ function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () 
               {compactionAudit ? <div><dt>远程压缩</dt><dd>{compactionAudit}</dd></div> : null}
             </dl>
           </section>
+
+          {debugLoading || debugCapture || debugError ? (
+            <section className="request-detail-section request-debug-section">
+              <header>
+                <h3>Debug 快照</h3>
+                {debugCapture ? <span>{debugCapture.provider_name}</span> : null}
+              </header>
+              {debugLoading ? <p className="request-detail-empty">正在读取快照…</p> : null}
+              {debugError ? <pre className="request-debug-error">{debugError}</pre> : null}
+              {debugCapture && activeDebug ? (
+                <>
+                  <div className="request-debug-tabs" role="tablist" aria-label="Debug 快照视图">
+                    {([
+                      ["inbound", "入站请求"],
+                      ["upstream", "上游请求"],
+                      ["response", "上游响应"],
+                    ] as const).map(([value, label]) => (
+                      <button
+                        aria-selected={debugView === value}
+                        className={debugView === value ? "active" : ""}
+                        key={value}
+                        onClick={() => setDebugView(value)}
+                        role="tab"
+                        type="button"
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="request-debug-meta">
+                    {"method" in activeDebug ? (
+                      <code>{activeDebug.method} {activeDebug.url}</code>
+                    ) : (
+                      <code>HTTP {activeDebug.status_code ?? "-"}</code>
+                    )}
+                    {activeDebug.body.truncated ? (
+                      <span>已截断 · {activeDebug.body.captured_bytes.toLocaleString()} / {activeDebug.body.total_bytes.toLocaleString()} bytes</span>
+                    ) : (
+                      <span>{activeDebug.body.total_bytes.toLocaleString()} bytes</span>
+                    )}
+                  </div>
+                  <div className="request-debug-block">
+                    <strong>Headers</strong>
+                    <pre>{activeDebug.headers.map((header) => `${header.name}: ${header.value}`).join("\n") || "-"}</pre>
+                  </div>
+                  <div className="request-debug-block">
+                    <strong>Body</strong>
+                    <pre>{activeDebugBodyText || "-"}</pre>
+                  </div>
+                </>
+              ) : null}
+            </section>
+          ) : null}
 
           {log.error ? (
             <section className="request-detail-section request-error-detail">

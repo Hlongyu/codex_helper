@@ -25,6 +25,8 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,6 +46,8 @@ const DEFAULT_ROUTER_PORT: u16 = 18080;
 const DEFAULT_ROUTER_MODEL_PROVIDER: &str = "custom";
 const DEFAULT_ROUTER_TOKEN: &str = "xxswitch-local-token";
 const LEGACY_DEFAULT_ROUTER_TOKEN: &str = "codex-helper-local-token";
+const OPENAI_ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
+const LOCAL_IMAGE_EXTENSION_AUTHORIZATION: &str = "local-image-extension";
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
@@ -54,6 +58,7 @@ const MAX_SLOW_DELAY_SECS: u64 = 3_600;
 const SLOW_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const SLOW_HEARTBEAT: &[u8] = b": slow-mode keep-alive\n\n";
 const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_DEBUG_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
 const CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT: i64 = 243_200;
 const CODEX_MODEL_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
@@ -286,6 +291,10 @@ struct RouterConfig {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
+    debug_mode: bool,
+    #[serde(default)]
+    force_disable_openai_auth: bool,
+    #[serde(default)]
     remote_compaction_enabled: bool,
     #[serde(default = "default_router_model_provider")]
     model_provider: String,
@@ -470,6 +479,8 @@ impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            debug_mode: false,
+            force_disable_openai_auth: false,
             remote_compaction_enabled: false,
             model_provider: default_router_model_provider(),
             host: default_router_host(),
@@ -535,6 +546,10 @@ struct RouterApplyBackup {
     custom_base_url: RouterFieldBackup,
     #[serde(default)]
     custom_token: RouterFieldBackup,
+    #[serde(default)]
+    custom_requires_openai_auth: RouterFieldBackup,
+    #[serde(default)]
+    custom_image_authorization: RouterFieldBackup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -796,6 +811,10 @@ struct SaveBasePayload {
 #[derive(Debug, Deserialize)]
 struct SaveRouterPayload {
     enabled: bool,
+    #[serde(default)]
+    debug_mode: bool,
+    #[serde(default)]
+    force_disable_openai_auth: bool,
     #[serde(default)]
     remote_compaction_enabled: bool,
     #[serde(default = "default_router_model_provider")]
@@ -1110,7 +1129,132 @@ struct RouteRequestLog {
     response_header_ms: Option<u64>,
     #[serde(default)]
     upstream_request_id: Option<String>,
+    #[serde(default)]
+    debug_capture_available: bool,
+    #[serde(default)]
+    debug_capture_error: Option<String>,
     total_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DebugHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DebugBodySnapshot {
+    text: String,
+    captured_bytes: usize,
+    total_bytes: usize,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DebugRequestSnapshot {
+    method: String,
+    url: String,
+    headers: Vec<DebugHeader>,
+    body: DebugBodySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DebugResponseSnapshot {
+    status_code: Option<u16>,
+    headers: Vec<DebugHeader>,
+    body: DebugBodySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RouteDebugCapture {
+    version: u8,
+    request_id: String,
+    started_at_ms: i64,
+    provider_name: String,
+    inbound_request: DebugRequestSnapshot,
+    upstream_request: DebugRequestSnapshot,
+    upstream_response: DebugResponseSnapshot,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DebugBodyCapture {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+    truncated: bool,
+}
+
+impl DebugBodyCapture {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let mut capture = Self::default();
+        capture.append(bytes);
+        capture
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
+        let remaining = MAX_DEBUG_CAPTURE_BYTES.saturating_sub(self.bytes.len());
+        let take = remaining.min(bytes.len());
+        self.bytes.extend_from_slice(&bytes[..take]);
+        self.truncated |= take < bytes.len();
+    }
+
+    fn snapshot(self) -> DebugBodySnapshot {
+        DebugBodySnapshot {
+            text: String::from_utf8_lossy(&self.bytes).into_owned(),
+            captured_bytes: self.bytes.len(),
+            total_bytes: self.total_bytes,
+            truncated: self.truncated,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingDebugRequest {
+    method: String,
+    url: String,
+    headers: Vec<DebugHeader>,
+    body: DebugBodyCapture,
+}
+
+impl PendingDebugRequest {
+    fn snapshot(self) -> DebugRequestSnapshot {
+        DebugRequestSnapshot {
+            method: self.method,
+            url: self.url,
+            headers: self.headers,
+            body: self.body.snapshot(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingDebugCapture {
+    request_id: String,
+    started_at_ms: i64,
+    provider_name: String,
+    inbound_request: PendingDebugRequest,
+    upstream_request: PendingDebugRequest,
+    upstream_status_code: Option<u16>,
+    upstream_response_headers: Vec<DebugHeader>,
+    upstream_response_body: DebugBodyCapture,
+}
+
+impl PendingDebugCapture {
+    fn snapshot(self) -> RouteDebugCapture {
+        RouteDebugCapture {
+            version: 1,
+            request_id: self.request_id,
+            started_at_ms: self.started_at_ms,
+            provider_name: self.provider_name,
+            inbound_request: self.inbound_request.snapshot(),
+            upstream_request: self.upstream_request.snapshot(),
+            upstream_response: DebugResponseSnapshot {
+                status_code: self.upstream_status_code,
+                headers: self.upstream_response_headers,
+                body: self.upstream_response_body.snapshot(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1153,6 +1297,11 @@ struct RouteLogFilter {
 struct LoadRouteLogsPayload {
     #[serde(default)]
     filter: Option<RouteLogFilter>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LoadRouteDebugCapturePayload {
+    request_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1281,6 +1430,7 @@ struct PendingRouteLog {
     upstream_started_ms: Option<u64>,
     response_header_ms: Option<u64>,
     upstream_request_id: Option<String>,
+    debug_capture: Option<PendingDebugCapture>,
     start: Instant,
 }
 
@@ -1621,12 +1771,89 @@ fn route_logs_path() -> Result<PathBuf, String> {
     Ok(manager_dir()?.join("route-logs.jsonl"))
 }
 
+fn route_debug_captures_dir() -> Result<PathBuf, String> {
+    Ok(manager_dir()?.join("debug-captures"))
+}
+
+fn route_debug_capture_path(request_id: &str) -> Result<PathBuf, String> {
+    let digest = Sha256::digest(request_id.as_bytes());
+    Ok(route_debug_captures_dir()?.join(format!("{digest:x}.json")))
+}
+
 fn provider_failure_events_path() -> Result<PathBuf, String> {
     Ok(manager_dir()?.join("provider-failure-events.jsonl"))
 }
 
 fn codex_config_path() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("config.toml"))
+}
+
+fn parse_codex_chatgpt_login_status(stdout: &str, stderr: &str) -> Option<bool> {
+    let lines = stdout.lines().chain(stderr.lines()).map(str::trim);
+    for line in lines {
+        if line == "Logged in using ChatGPT" {
+            return Some(true);
+        }
+        if line == "Not logged in" || line.starts_with("Logged in using ") {
+            return Some(false);
+        }
+    }
+    None
+}
+
+fn auth_json_has_chatgpt_login(value: &Value) -> bool {
+    match value.get("auth_mode").and_then(Value::as_str) {
+        Some("chatgpt" | "chatgpt_auth_tokens") => true,
+        Some(_) => false,
+        None => value
+            .get("tokens")
+            .and_then(Value::as_object)
+            .is_some_and(|tokens| {
+                ["access_token", "refresh_token", "id_token"]
+                    .iter()
+                    .any(|key| {
+                        tokens
+                            .get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|token| !token.trim().is_empty())
+                    })
+            }),
+    }
+}
+
+fn codex_chatgpt_login_configured() -> bool {
+    for candidate in codex_cli_candidates() {
+        let Ok(output) = Command::new(candidate).args(["login", "status"]).output() else {
+            continue;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(configured) = parse_codex_chatgpt_login_status(&stdout, &stderr) {
+            return configured;
+        }
+    }
+
+    let Ok(path) = codex_home().map(|home| home.join("auth.json")) else {
+        return false;
+    };
+    fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .is_some_and(|value| auth_json_has_chatgpt_login(&value))
+}
+
+fn resolve_router_requires_openai_auth(
+    force_disable_openai_auth: bool,
+    chatgpt_login_configured: bool,
+) -> bool {
+    !force_disable_openai_auth && chatgpt_login_configured
+}
+
+fn router_requires_openai_auth(router: &RouterConfig) -> bool {
+    resolve_router_requires_openai_auth(
+        router.force_disable_openai_auth,
+        codex_chatgpt_login_configured(),
+    )
 }
 
 fn claude_settings_path() -> Result<PathBuf, String> {
@@ -2873,9 +3100,21 @@ fn set_json_path(value: &mut Value, path: &[&str], next: Value) -> Result<(), St
 }
 
 fn desired_config(state: &ManagerState, provider: Option<&ProviderConfig>) -> Value {
+    let requires_openai_auth = state.router.enabled && router_requires_openai_auth(&state.router);
+    desired_config_with_auth(state, provider, requires_openai_auth)
+}
+
+fn desired_config_with_auth(
+    state: &ManagerState,
+    provider: Option<&ProviderConfig>,
+    requires_openai_auth: bool,
+) -> Value {
     let mut desired = state.base.clone();
     if state.router.enabled {
-        merge_values(&mut desired, &router_patch_desired(&state.router));
+        merge_values(
+            &mut desired,
+            &router_patch_desired(&state.router, requires_openai_auth),
+        );
     } else if let Some(provider) = provider {
         merge_values(&mut desired, &provider.config);
     }
@@ -4634,7 +4873,7 @@ fn router_provider_path(provider_name: &str, field: &str) -> String {
     format!("model_providers.{provider_name}.{field}")
 }
 
-fn router_managed_paths(router: &RouterConfig) -> [String; 5] {
+fn router_managed_paths(router: &RouterConfig) -> [String; 7] {
     let provider_name = normalize_router_model_provider(&router.model_provider)
         .unwrap_or_else(|_| default_router_model_provider());
     [
@@ -4642,6 +4881,11 @@ fn router_managed_paths(router: &RouterConfig) -> [String; 5] {
         router_provider_path(&provider_name, "name"),
         router_provider_path(&provider_name, "base_url"),
         router_provider_path(&provider_name, "experimental_bearer_token"),
+        router_provider_path(&provider_name, "requires_openai_auth"),
+        router_provider_path(
+            &provider_name,
+            &format!("http_headers.{OPENAI_ACTOR_AUTHORIZATION_HEADER}"),
+        ),
         "features.remote_compaction_v2".to_string(),
     ]
 }
@@ -4668,6 +4912,17 @@ fn capture_router_backup(doc: &DocumentMut, provider_name: &str) -> RouterApplyB
             doc,
             &router_provider_path(provider_name, "experimental_bearer_token"),
         ),
+        custom_requires_openai_auth: capture_toml_field(
+            doc,
+            &router_provider_path(provider_name, "requires_openai_auth"),
+        ),
+        custom_image_authorization: capture_toml_field(
+            doc,
+            &router_provider_path(
+                provider_name,
+                &format!("http_headers.{OPENAI_ACTOR_AUTHORIZATION_HEADER}"),
+            ),
+        ),
     }
 }
 
@@ -4692,6 +4947,7 @@ fn restore_router_backup(
     mut doc: DocumentMut,
     backup: Option<&RouterApplyBackup>,
     router: &RouterConfig,
+    requires_openai_auth: bool,
 ) -> Result<String, String> {
     if let Some(backup) = backup {
         let provider_name = router_backup_provider_name(backup);
@@ -4716,8 +4972,21 @@ fn restore_router_backup(
             &router_provider_path(&provider_name, "experimental_bearer_token"),
             &backup.custom_token,
         )?;
+        restore_toml_field(
+            &mut doc,
+            &router_provider_path(&provider_name, "requires_openai_auth"),
+            &backup.custom_requires_openai_auth,
+        )?;
+        restore_toml_field(
+            &mut doc,
+            &router_provider_path(
+                &provider_name,
+                &format!("http_headers.{OPENAI_ACTOR_AUTHORIZATION_HEADER}"),
+            ),
+            &backup.custom_image_authorization,
+        )?;
     } else {
-        let desired = router_patch_desired(router);
+        let desired = router_patch_desired(router, requires_openai_auth);
         let desired_flat = flatten(&desired);
         let current = toml_doc_to_json(&doc);
         let current_flat = flatten(&current);
@@ -4734,13 +5003,14 @@ fn prepare_router_patch(
     doc: DocumentMut,
     backup: Option<&RouterApplyBackup>,
     router: &RouterConfig,
+    requires_openai_auth: bool,
 ) -> Result<(DocumentMut, RouterApplyBackup), String> {
     let provider_name = normalize_router_model_provider(&router.model_provider)?;
     if let Some(backup) = backup {
         if router_backup_provider_name(backup) == provider_name {
             return Ok((doc, backup.clone()));
         }
-        let restored = restore_router_backup(doc, Some(backup), router)?
+        let restored = restore_router_backup(doc, Some(backup), router, requires_openai_auth)?
             .parse::<DocumentMut>()
             .map_err(|err| format!("无法解析恢复后的 Codex 配置: {err}"))?;
         let next_backup = capture_router_backup(&restored, &provider_name);
@@ -4754,6 +5024,7 @@ fn render_router_patch_toml(
     mut doc: DocumentMut,
     marker_present: bool,
     router: &RouterConfig,
+    requires_openai_auth: bool,
 ) -> Result<String, String> {
     let provider_name = normalize_router_model_provider(&router.model_provider)?;
     set_toml_path(
@@ -4770,6 +5041,19 @@ fn render_router_patch_toml(
         &mut doc,
         &router_provider_path(&provider_name, "experimental_bearer_token"),
         &Value::String(router.local_token.clone()),
+    )?;
+    set_toml_path(
+        &mut doc,
+        &router_provider_path(&provider_name, "requires_openai_auth"),
+        &Value::Bool(requires_openai_auth),
+    )?;
+    set_toml_path(
+        &mut doc,
+        &router_provider_path(
+            &provider_name,
+            &format!("http_headers.{OPENAI_ACTOR_AUTHORIZATION_HEADER}"),
+        ),
+        &Value::String(LOCAL_IMAGE_EXTENSION_AUTHORIZATION.to_string()),
     )?;
     let configured_name = if router.remote_compaction_enabled {
         "OpenAI".to_string()
@@ -4795,7 +5079,7 @@ fn render_router_patch_toml(
     Ok(raw)
 }
 
-fn router_patch_desired(router: &RouterConfig) -> Value {
+fn router_patch_desired(router: &RouterConfig, requires_openai_auth: bool) -> Value {
     let provider_name = normalize_router_model_provider(&router.model_provider)
         .unwrap_or_else(|_| default_router_model_provider());
     let mut managed_provider = Map::new();
@@ -4806,6 +5090,16 @@ fn router_patch_desired(router: &RouterConfig) -> Value {
     managed_provider.insert(
         "experimental_bearer_token".to_string(),
         Value::String(router.local_token.clone()),
+    );
+    managed_provider.insert(
+        "requires_openai_auth".to_string(),
+        Value::Bool(requires_openai_auth),
+    );
+    managed_provider.insert(
+        "http_headers".to_string(),
+        json!({
+            (OPENAI_ACTOR_AUTHORIZATION_HEADER): LOCAL_IMAGE_EXTENSION_AUTHORIZATION,
+        }),
     );
     managed_provider.insert(
         "name".to_string(),
@@ -4830,8 +5124,12 @@ fn router_patch_desired(router: &RouterConfig) -> Value {
     Value::Object(root)
 }
 
-fn router_patch_matches_current(current_json: &Value, router: &RouterConfig) -> bool {
-    let desired = router_patch_desired(router);
+fn router_patch_matches_current(
+    current_json: &Value,
+    router: &RouterConfig,
+    requires_openai_auth: bool,
+) -> bool {
+    let desired = router_patch_desired(router, requires_openai_auth);
     let desired_flat = flatten(&desired);
     let current_flat = flatten(current_json);
     desired_flat
@@ -5196,10 +5494,11 @@ fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String
         return Ok(false);
     }
 
+    let requires_openai_auth = router_requires_openai_auth(&state.router);
     let (doc, marker_present, _, _) = read_current_toml()?;
-    let desired = router_patch_desired(&state.router);
+    let desired = router_patch_desired(&state.router, requires_openai_auth);
     let current_json = toml_doc_to_json(&doc);
-    if router_patch_matches_current(&current_json, &state.router)
+    if router_patch_matches_current(&current_json, &state.router, requires_openai_auth)
         && state.last_applied.as_ref() == Some(&desired)
     {
         return Ok(false);
@@ -5212,9 +5511,14 @@ fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String
         return Ok(false);
     }
 
-    let (doc, backup) = prepare_router_patch(doc, state.router_backup.as_ref(), &state.router)?;
+    let (doc, backup) = prepare_router_patch(
+        doc,
+        state.router_backup.as_ref(),
+        &state.router,
+        requires_openai_auth,
+    )?;
     state.router_backup = Some(backup);
-    let raw = render_router_patch_toml(doc, marker_present, &state.router)?;
+    let raw = render_router_patch_toml(doc, marker_present, &state.router, requires_openai_auth)?;
     fs::write(codex_config_path()?, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
     state.last_applied = Some(desired);
     state.applied_provider_id = None;
@@ -5981,6 +6285,151 @@ fn claude_models_request(headers: &HeaderMap) -> bool {
     headers.contains_key("x-api-key")
         || headers.contains_key("anthropic-version")
         || headers.contains_key("anthropic-beta")
+}
+
+fn debug_header_is_sensitive(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key" | "api-key"
+    )
+}
+
+fn debug_query_key_is_sensitive(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("token")
+        || name.contains("api_key")
+        || name.contains("apikey")
+        || name.contains("secret")
+        || name.contains("password")
+        || name.contains("authorization")
+}
+
+fn debug_redacted_url(value: &str) -> String {
+    let relative = value.starts_with('/');
+    let candidate = if relative {
+        format!("http://debug.invalid{value}")
+    } else {
+        value.to_string()
+    };
+    let Ok(mut url) = reqwest::Url::parse(&candidate) else {
+        return value.to_string();
+    };
+    let pairs = url
+        .query_pairs()
+        .map(|(name, value)| {
+            let value = if debug_query_key_is_sensitive(&name) {
+                "[REDACTED]".to_string()
+            } else {
+                value.into_owned()
+            };
+            (name.into_owned(), value)
+        })
+        .collect::<Vec<_>>();
+    if !pairs.is_empty() {
+        url.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    if relative {
+        let mut result = url.path().to_string();
+        if let Some(query) = url.query() {
+            result.push('?');
+            result.push_str(query);
+        }
+        result
+    } else {
+        url.to_string()
+    }
+}
+
+fn debug_headers(headers: &HeaderMap) -> Vec<DebugHeader> {
+    headers
+        .iter()
+        .map(|(name, value)| DebugHeader {
+            name: name.as_str().to_string(),
+            value: if debug_header_is_sensitive(name.as_str()) {
+                "[REDACTED]".to_string()
+            } else {
+                String::from_utf8_lossy(value.as_bytes()).into_owned()
+            },
+        })
+        .collect()
+}
+
+fn debug_upstream_request_headers(
+    inbound_headers: &HeaderMap,
+    request_id: &str,
+    body_len: usize,
+) -> Vec<DebugHeader> {
+    let mut headers = inbound_headers
+        .iter()
+        .filter(|(name, _)| {
+            *name != AUTHORIZATION
+                && *name != HOST
+                && *name != CONTENT_ENCODING
+                && *name != CONTENT_LENGTH
+                && !name.as_str().eq_ignore_ascii_case("x-request-id")
+                && !is_hop_by_hop_header(name)
+        })
+        .map(|(name, value)| DebugHeader {
+            name: name.as_str().to_string(),
+            value: if debug_header_is_sensitive(name.as_str()) {
+                "[REDACTED]".to_string()
+            } else {
+                String::from_utf8_lossy(value.as_bytes()).into_owned()
+            },
+        })
+        .collect::<Vec<_>>();
+    headers.push(DebugHeader {
+        name: "authorization".to_string(),
+        value: "[REDACTED]".to_string(),
+    });
+    headers.push(DebugHeader {
+        name: "x-request-id".to_string(),
+        value: request_id.to_string(),
+    });
+    headers.push(DebugHeader {
+        name: "content-length".to_string(),
+        value: body_len.to_string(),
+    });
+    headers
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_pending_debug_capture(
+    enabled: bool,
+    request_id: &str,
+    started_at_ms: i64,
+    provider_name: &str,
+    method: &Method,
+    inbound_url: String,
+    inbound_headers: &HeaderMap,
+    inbound_body: &[u8],
+    upstream_url: String,
+    upstream_body: &[u8],
+) -> Option<PendingDebugCapture> {
+    enabled.then(|| PendingDebugCapture {
+        request_id: request_id.to_string(),
+        started_at_ms,
+        provider_name: provider_name.to_string(),
+        inbound_request: PendingDebugRequest {
+            method: method.as_str().to_string(),
+            url: debug_redacted_url(&inbound_url),
+            headers: debug_headers(inbound_headers),
+            body: DebugBodyCapture::from_bytes(inbound_body),
+        },
+        upstream_request: PendingDebugRequest {
+            method: method.as_str().to_string(),
+            url: debug_redacted_url(&upstream_url),
+            headers: debug_upstream_request_headers(
+                inbound_headers,
+                request_id,
+                upstream_body.len(),
+            ),
+            body: DebugBodyCapture::from_bytes(upstream_body),
+        },
+        upstream_status_code: None,
+        upstream_response_headers: Vec::new(),
+        upstream_response_body: DebugBodyCapture::default(),
+    })
 }
 
 fn model_from_request_body(body: &[u8]) -> String {
@@ -7938,18 +8387,55 @@ fn mark_pending_route_log_cancelled(pending: &mut PendingRouteLog, first_byte_ms
 }
 
 fn persist_route_log(
-    pending: PendingRouteLog,
+    mut pending: PendingRouteLog,
     status: &str,
     usage: TokenUsage,
     first_byte_ms: Option<u64>,
 ) {
-    let log = build_finished_route_log(pending, status, usage, first_byte_ms);
+    let debug_capture = pending.debug_capture.take();
+    let mut log = build_finished_route_log(pending, status, usage, first_byte_ms);
     if !is_usage_route_log(&log) {
         return;
+    }
+    if let Some(debug_capture) = debug_capture {
+        match write_route_debug_capture(&debug_capture.snapshot()) {
+            Ok(()) => log.debug_capture_available = true,
+            Err(err) => log.debug_capture_error = Some(err),
+        }
     }
     if let Err(err) = append_route_log(&log) {
         eprintln!("{err}");
     }
+}
+
+fn write_route_debug_capture(capture: &RouteDebugCapture) -> Result<(), String> {
+    let dir = route_debug_captures_dir()?;
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("无法创建 Debug 快照目录 {}: {err}", dir.display()))?;
+    let path = route_debug_capture_path(&capture.request_id)?;
+    let raw = serde_json::to_vec_pretty(capture)
+        .map_err(|err| format!("无法序列化 Debug 快照: {err}"))?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&path)
+        .map_err(|err| format!("无法写入 Debug 快照 {}: {err}", path.display()))?;
+    file.write_all(&raw)
+        .map_err(|err| format!("无法写入 Debug 快照 {}: {err}", path.display()))
+}
+
+fn read_route_debug_capture(request_id: &str) -> Result<RouteDebugCapture, String> {
+    let path = route_debug_capture_path(request_id)?;
+    let raw =
+        fs::read(&path).map_err(|err| format!("无法读取 Debug 快照 {}: {err}", path.display()))?;
+    let capture = serde_json::from_slice::<RouteDebugCapture>(&raw)
+        .map_err(|err| format!("Debug 快照格式无效 {}: {err}", path.display()))?;
+    if capture.request_id != request_id {
+        return Err("Debug 快照与请求 ID 不匹配".to_string());
+    }
+    Ok(capture)
 }
 
 fn build_finished_route_log(
@@ -7993,6 +8479,8 @@ fn build_finished_route_log(
         upstream_started_ms: pending.upstream_started_ms,
         response_header_ms: pending.response_header_ms,
         upstream_request_id: pending.upstream_request_id,
+        debug_capture_available: false,
+        debug_capture_error: None,
         total_ms,
     }
 }
@@ -8012,6 +8500,7 @@ fn build_pending_route_log(
     upstream_started_ms: Option<u64>,
     response_header_ms: Option<u64>,
     upstream_request_id: Option<String>,
+    debug_capture: Option<PendingDebugCapture>,
     error: Option<String>,
 ) -> PendingRouteLog {
     PendingRouteLog {
@@ -8049,6 +8538,7 @@ fn build_pending_route_log(
         upstream_started_ms,
         response_header_ms,
         upstream_request_id,
+        debug_capture,
         start: timing.start,
     }
 }
@@ -8107,6 +8597,7 @@ fn build_pending_claude_route_log(
         upstream_started_ms,
         response_header_ms,
         upstream_request_id,
+        debug_capture: None,
         start: timing.start,
     }
 }
@@ -8122,6 +8613,9 @@ impl futures_util::Stream for RouteStreamState {
             std::task::Poll::Ready(Some(Ok(bytes))) => {
                 if self.first_byte_ms.is_none() {
                     self.first_byte_ms = Some(self.pending.start.elapsed().as_millis() as u64);
+                }
+                if let Some(capture) = self.pending.debug_capture.as_mut() {
+                    capture.upstream_response_body.append(&bytes);
                 }
                 route_stream_ingest(&mut self, bytes.as_ref());
                 std::task::Poll::Ready(Some(Ok(bytes)))
@@ -8183,6 +8677,9 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                 std::task::Poll::Ready(Some(Ok(bytes))) => {
                     if self.first_byte_ms.is_none() {
                         self.first_byte_ms = Some(self.pending.start.elapsed().as_millis() as u64);
+                    }
+                    if let Some(capture) = self.pending.debug_capture.as_mut() {
+                        capture.upstream_response_body.append(&bytes);
                     }
                     let mut buffer = std::mem::take(&mut self.sse_buffer);
                     let mut response_id = std::mem::take(&mut self.response_id);
@@ -9285,9 +9782,21 @@ async fn proxy_request_now(
                 request_has_compaction_trigger(&prepared.body);
         }
         let upstream_url = join_url(&candidate.base_url, &prepared.path) + &prepared.query;
+        let mut debug_capture = build_pending_debug_capture(
+            router.debug_mode && path.trim_matches('/') == "responses",
+            &route_request_id,
+            request_started_at_ms,
+            &candidate.provider.name,
+            &method,
+            format!("/v1/{path}{query}"),
+            &headers,
+            &body_bytes,
+            upstream_url.clone(),
+            &prepared.body,
+        );
         let mut request = upstream_client
             .client
-            .request(reqwest_method.clone(), upstream_url)
+            .request(reqwest_method.clone(), &upstream_url)
             .body(prepared.body.clone());
 
         for (name, value) in headers.iter() {
@@ -9323,6 +9832,7 @@ async fn proxy_request_now(
             Some(upstream_started_ms),
             None,
             None,
+            debug_capture.clone(),
             None,
         ));
 
@@ -9365,6 +9875,7 @@ async fn proxy_request_now(
                     Some(upstream_started_ms),
                     None,
                     None,
+                    debug_capture.clone(),
                     Some(last_error.clone()),
                 ));
                 let pending = cancellation_guard.take();
@@ -9378,6 +9889,10 @@ async fn proxy_request_now(
 
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        if let Some(capture) = debug_capture.as_mut() {
+            capture.upstream_status_code = Some(status.as_u16());
+            capture.upstream_response_headers = debug_headers(upstream.headers());
+        }
         let should_retry =
             matches!(status.as_u16(), 429 | 500..=599) && attempt_index + 1 < candidates.len();
         if should_retry {
@@ -9416,6 +9931,7 @@ async fn proxy_request_now(
             Some(upstream_started_ms),
             Some(response_header_ms),
             upstream_request_id,
+            debug_capture,
             if status.is_success() {
                 None
             } else {
@@ -9523,6 +10039,9 @@ async fn proxy_request_now(
             }
         };
         let mut pending = cancellation_guard.take();
+        if let Some(capture) = pending.debug_capture.as_mut() {
+            capture.upstream_response_body.append(&bytes);
+        }
         let response_is_passthrough = matches!(&prepared.adapter, ResponseAdapter::Passthrough);
         let response_bytes = match prepared.adapter {
             ResponseAdapter::Passthrough => bytes,
@@ -10831,6 +11350,8 @@ fn normalized_page_size(page_size: Option<usize>) -> usize {
 }
 
 fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppState, String> {
+    let requires_openai_auth =
+        state.clients.codex.enabled && router_requires_openai_auth(&state.router);
     let provider = active_provider(&state);
     let redacted_active_provider = provider.clone().map(redacted_provider);
     let redacted_active_claude_provider = state
@@ -10840,7 +11361,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
         .cloned()
         .map(redacted_claude_provider);
     let desired = if state.clients.codex.enabled {
-        router_patch_desired(&state.router)
+        router_patch_desired(&state.router, requires_openai_auth)
     } else {
         provider
             .as_ref()
@@ -10851,7 +11372,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
     let multi_agent_enabled = multi_agent_enabled(&doc);
     let current_json = toml_doc_to_json(&doc);
     let final_preview_toml = if state.clients.codex.enabled {
-        render_router_patch_toml(doc, marker_present, &state.router)?
+        render_router_patch_toml(doc, marker_present, &state.router, requires_openai_auth)?
     } else {
         current_config_raw.clone()
     };
@@ -10877,7 +11398,7 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
             let provider_desired = if state.clients.codex.enabled {
                 desired.clone()
             } else {
-                desired_config(&state, Some(provider))
+                desired_config_with_auth(&state, Some(provider), requires_openai_auth)
             };
             let pending_changes =
                 compute_diffs(&state, Some(provider), &current_json, &provider_desired).len();
@@ -11496,6 +12017,8 @@ fn save_router_config(
     let model_provider = normalize_router_model_provider(&payload.model_provider)?;
     let router = RouterConfig {
         enabled: payload.enabled,
+        debug_mode: payload.debug_mode,
+        force_disable_openai_auth: payload.force_disable_openai_auth,
         remote_compaction_enabled: payload.remote_compaction_enabled,
         model_provider,
         host: if host.is_empty() {
@@ -11678,6 +12201,8 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
     if state.clients.codex.enabled || state.clients.claude.enabled || state.clients.pi.enabled {
         state.router.enabled = true;
     }
+    let requires_openai_auth =
+        state.clients.codex.enabled && router_requires_openai_auth(&state.router);
 
     if state.clients.codex.enabled {
         fs::create_dir_all(codex_home()?).map_err(|err| format!("无法创建 Codex 目录: {err}"))?;
@@ -11694,12 +12219,18 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
         }
 
         let (doc, marker_present, _, _) = read_current_toml()?;
-        let (doc, backup) = prepare_router_patch(doc, state.router_backup.as_ref(), &state.router)?;
+        let (doc, backup) = prepare_router_patch(
+            doc,
+            state.router_backup.as_ref(),
+            &state.router,
+            requires_openai_auth,
+        )?;
         state.router_backup = Some(backup);
-        let raw = render_router_patch_toml(doc, marker_present, &state.router)?;
+        let raw =
+            render_router_patch_toml(doc, marker_present, &state.router, requires_openai_auth)?;
 
         fs::write(&config_path, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
-        state.last_applied = Some(router_patch_desired(&state.router));
+        state.last_applied = Some(router_patch_desired(&state.router, requires_openai_auth));
     } else if config_path.exists() {
         let backup_name = format!(
             "config.toml.{}.bak",
@@ -11711,7 +12242,12 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
         fs::copy(&config_path, manager_dir()?.join(backup_name))
             .map_err(|err| format!("无法备份现有配置: {err}"))?;
         let (doc, _, _, _) = read_current_toml()?;
-        let raw = restore_router_backup(doc, state.router_backup.as_ref(), &state.router)?;
+        let raw = restore_router_backup(
+            doc,
+            state.router_backup.as_ref(),
+            &state.router,
+            requires_openai_auth,
+        )?;
         fs::write(&config_path, raw).map_err(|err| format!("无法写入 Codex 配置: {err}"))?;
         state.last_applied = None;
         state.router_backup = None;
@@ -11823,6 +12359,13 @@ fn load_route_logs(payload: Option<LoadRouteLogsPayload>) -> Result<RouteLogsRes
         .and_then(|payload| payload.filter)
         .unwrap_or_default();
     Ok(build_route_logs_response(read_route_logs()?, filter))
+}
+
+#[tauri::command]
+fn load_route_debug_capture(
+    payload: LoadRouteDebugCapturePayload,
+) -> Result<RouteDebugCapture, String> {
+    read_route_debug_capture(payload.request_id.trim())
 }
 
 #[tauri::command]
@@ -12156,6 +12699,7 @@ pub fn run() {
             delete_shared_skill,
             apply_config,
             load_route_logs,
+            load_route_debug_capture,
             load_route_usage_stats,
             load_provider_models,
             load_claude_provider_models,
@@ -12241,6 +12785,69 @@ mod tests {
         assert_eq!(router.slow_mode, SlowMode::Off);
         assert_eq!(router.slow_delay_secs, 0);
         assert_eq!(router.slow_delay_max_secs, 0);
+        assert!(!router.debug_mode);
+        assert!(!router.force_disable_openai_auth);
+    }
+
+    #[test]
+    fn detects_configured_chatgpt_login_without_checking_expiry() {
+        assert_eq!(
+            parse_codex_chatgpt_login_status("", "Logged in using ChatGPT\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_codex_chatgpt_login_status("", "Logged in using an API key - sk-...\n"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_codex_chatgpt_login_status("", "Not logged in\n"),
+            Some(false)
+        );
+
+        let auth = json!({
+            "auth_mode": "chatgpt",
+            "last_refresh": "2000-01-01T00:00:00Z",
+            "tokens": {
+                "access_token": "expired-token"
+            }
+        });
+        assert!(auth_json_has_chatgpt_login(&auth));
+    }
+
+    #[test]
+    fn force_disable_openai_auth_overrides_configured_login() {
+        assert!(resolve_router_requires_openai_auth(false, true));
+        assert!(!resolve_router_requires_openai_auth(false, false));
+        assert!(!resolve_router_requires_openai_auth(true, true));
+    }
+
+    #[test]
+    fn debug_capture_redacts_credentials_and_limits_body_size() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        headers.insert("cookie", HeaderValue::from_static("session=secret"));
+        headers.insert("x-visible", HeaderValue::from_static("kept"));
+
+        let captured_headers = debug_headers(&headers);
+        assert!(captured_headers
+            .iter()
+            .any(|header| header.name == "authorization" && header.value == "[REDACTED]"));
+        assert!(captured_headers
+            .iter()
+            .any(|header| header.name == "cookie" && header.value == "[REDACTED]"));
+        assert!(captured_headers
+            .iter()
+            .any(|header| header.name == "x-visible" && header.value == "kept"));
+        let url = debug_redacted_url("/v1/responses?api_key=secret&mode=debug");
+        assert!(url.contains("api_key=%5BREDACTED%5D"));
+        assert!(url.contains("mode=debug"));
+        assert!(!url.contains("secret"));
+
+        let bytes = vec![b'a'; MAX_DEBUG_CAPTURE_BYTES + 17];
+        let body = DebugBodyCapture::from_bytes(&bytes).snapshot();
+        assert_eq!(body.captured_bytes, MAX_DEBUG_CAPTURE_BYTES);
+        assert_eq!(body.total_bytes, bytes.len());
+        assert!(body.truncated);
     }
 
     #[test]
@@ -12768,11 +13375,11 @@ multi_agent = false
         };
         let backup = capture_router_backup(&doc, &router.model_provider);
 
-        let patched = render_router_patch_toml(doc, false, &router)
+        let patched = render_router_patch_toml(doc, false, &router, false)
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
-        let restored = restore_router_backup(patched, Some(&backup), &router).unwrap();
+        let restored = restore_router_backup(patched, Some(&backup), &router, false).unwrap();
         let restored_doc = restored.parse::<DocumentMut>().unwrap();
 
         assert_eq!(
@@ -12803,11 +13410,11 @@ web_search = true
         };
         let backup = capture_router_backup(&doc, &router.model_provider);
 
-        let patched = render_router_patch_toml(doc, false, &router)
+        let patched = render_router_patch_toml(doc, false, &router, false)
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
-        let restored = restore_router_backup(patched, Some(&backup), &router)
+        let restored = restore_router_backup(patched, Some(&backup), &router, false)
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
@@ -12828,6 +13435,73 @@ web_search = true
     }
 
     #[test]
+    fn router_image_authorization_is_scoped_and_restored() {
+        let doc = r#"[model_providers.custom]
+requires_openai_auth = true
+
+[model_providers.custom.http_headers]
+x-openai-actor-authorization = "previous-actor"
+x-custom-header = "kept"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let router = RouterConfig {
+            enabled: true,
+            local_token: "local-token".to_string(),
+            ..RouterConfig::default()
+        };
+        let backup = capture_router_backup(&doc, &router.model_provider);
+
+        let patched = render_router_patch_toml(doc, false, &router, true)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            toml_path_value(&patched, "model_providers.custom.requires_openai_auth"),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            toml_path_value(
+                &patched,
+                "model_providers.custom.http_headers.x-openai-actor-authorization"
+            ),
+            Some(Value::String(
+                LOCAL_IMAGE_EXTENSION_AUTHORIZATION.to_string()
+            ))
+        );
+        assert_eq!(
+            toml_path_value(
+                &patched,
+                "model_providers.custom.http_headers.x-custom-header"
+            ),
+            Some(Value::String("kept".to_string()))
+        );
+
+        let restored = restore_router_backup(patched, Some(&backup), &router, true)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            toml_path_value(&restored, "model_providers.custom.requires_openai_auth"),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            toml_path_value(
+                &restored,
+                "model_providers.custom.http_headers.x-openai-actor-authorization"
+            ),
+            Some(Value::String("previous-actor".to_string()))
+        );
+        assert_eq!(
+            toml_path_value(
+                &restored,
+                "model_providers.custom.http_headers.x-custom-header"
+            ),
+            Some(Value::String("kept".to_string()))
+        );
+    }
+
+    #[test]
     fn remote_compaction_switches_configured_provider_name() {
         let doc = DocumentMut::new();
         let enabled_router = RouterConfig {
@@ -12840,7 +13514,7 @@ web_search = true
             ..RouterConfig::default()
         };
 
-        let patched = render_router_patch_toml(doc, false, &enabled_router)
+        let patched = render_router_patch_toml(doc, false, &enabled_router, false)
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
@@ -12853,7 +13527,20 @@ web_search = true
             Some(Value::String("OpenAI".to_string()))
         );
         assert_eq!(
-            router_patch_desired(&enabled_router)
+            toml_path_value(&patched, "model_providers.team4.requires_openai_auth"),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            toml_path_value(
+                &patched,
+                "model_providers.team4.http_headers.x-openai-actor-authorization"
+            ),
+            Some(Value::String(
+                LOCAL_IMAGE_EXTENSION_AUTHORIZATION.to_string()
+            ))
+        );
+        assert_eq!(
+            router_patch_desired(&enabled_router, false)
                 .pointer("/model_providers/team4/name")
                 .and_then(Value::as_str),
             Some("OpenAI")
@@ -12868,7 +13555,7 @@ web_search = true
             Some(Value::Bool(true))
         );
         assert_eq!(
-            router_patch_desired(&enabled_router).pointer("/features/remote_compaction_v2"),
+            router_patch_desired(&enabled_router, false).pointer("/features/remote_compaction_v2"),
             Some(&Value::Bool(true))
         );
 
@@ -12876,7 +13563,7 @@ web_search = true
             remote_compaction_enabled: false,
             ..enabled_router
         };
-        let restored = render_router_patch_toml(patched, true, &disabled_router)
+        let restored = render_router_patch_toml(patched, true, &disabled_router, false)
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
@@ -12885,7 +13572,7 @@ web_search = true
             Some(Value::String("team4".to_string()))
         );
         assert_eq!(
-            router_patch_desired(&disabled_router)
+            router_patch_desired(&disabled_router, false)
                 .pointer("/model_providers/team4/name")
                 .and_then(Value::as_str),
             Some("team4")
@@ -12907,7 +13594,7 @@ web_search = true
             ..RouterConfig::default()
         };
         let custom_backup = capture_router_backup(&doc, &custom_router.model_provider);
-        let custom_patched = render_router_patch_toml(doc, false, &custom_router)
+        let custom_patched = render_router_patch_toml(doc, false, &custom_router, false)
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
@@ -12917,8 +13604,9 @@ web_search = true
             ..custom_router
         };
         let (restored_doc, team_backup) =
-            prepare_router_patch(custom_patched, Some(&custom_backup), &team_router).unwrap();
-        let team_patched = render_router_patch_toml(restored_doc, true, &team_router)
+            prepare_router_patch(custom_patched, Some(&custom_backup), &team_router, false)
+                .unwrap();
+        let team_patched = render_router_patch_toml(restored_doc, true, &team_router, false)
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
@@ -12933,7 +13621,7 @@ web_search = true
             Some(Value::String("team4".to_string()))
         );
 
-        let restored = restore_router_backup(team_patched, Some(&team_backup), &team_router)
+        let restored = restore_router_backup(team_patched, Some(&team_backup), &team_router, false)
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
@@ -13303,6 +13991,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             upstream_started_ms: Some(10),
             response_header_ms: Some(80),
             upstream_request_id: Some("upstream-test-id".to_string()),
+            debug_capture_available: false,
+            debug_capture_error: None,
             total_ms: 200,
         }
     }
@@ -13328,6 +14018,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             upstream_started_ms: Some(10),
             response_header_ms: status_code.map(|_| 80),
             upstream_request_id: status_code.map(|_| "upstream-test-id".to_string()),
+            debug_capture: None,
             start: Instant::now(),
         }
     }

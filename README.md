@@ -16,6 +16,7 @@ XXSwitch 只记录实际经过本地路由的生成调用及其 Token、延迟�
 - **系统代理**：上游请求、模型测试、余额查询和应用更新自动使用 Windows 或 macOS 的系统 HTTP/HTTPS 代理，并兼容代理环境变量。
 - **余额查询**：支持 Sub2API 与 New API，余额查询与模型路由相互独立。
 - **调用观测**：筛选和导出真实路由调用，并查看单次请求的模型映射、Token 明细、分段耗时、上游链路和错误诊断。
+- **Responses Debug 快照**：按需记录入站请求、实际上游请求和上游原始响应，用于比较供应商可见载荷与缓存差异。
 - **Skills 管理**：扫描 Codex、Claude Code 和 Pi 的 Skills，并通过 XXSwitch Skill Library 管理共享与暴露。
 - **应用更新**：支持从 GitHub Release 检查并安装新版本。
 
@@ -43,7 +44,7 @@ XXSwitch 只维护各客户端中由自己接管的字段，并在关闭接管�
 
 配置文件：`~/.codex/config.toml`
 
-XXSwitch 将 `model_provider` 指向本地 `custom` provider，维护其 Base URL、本地访问令牌和名称，并根据设置同步 `features.remote_compaction_v2`。
+XXSwitch 将 `model_provider` 指向本地 `custom` provider，维护其 Base URL、本地访问令牌和名称，并根据设置同步 `features.remote_compaction_v2`。接管期间会合并设置 `http_headers = { "x-openai-actor-authorization" = "local-image-extension" }`，让当前 `custom` provider 暴露 Codex 内置 `image_gen`。同时，XXSwitch 只判断是否已配置 ChatGPT 登录态：已配置时设置 `requires_openai_auth = true`，未配置时设置为 `false`；不会检查凭据是否过期，也不会主动刷新或联网验证。用户可通过“强制不使用 OpenAI 登录态”将该字段固定为 `false`。该 header 只是自定义 provider 的能力标记，不是 ChatGPT 凭证；接管请求仍使用本地访问令牌并转发到当前供应商。关闭接管后会恢复这些字段的原值。
 
 ### Claude Code
 
@@ -76,6 +77,14 @@ XXSwitch 仅记录经过本地路由的生成调用，模型列表等非生成�
 - 本地与上游请求 ID、远程压缩审计结果和错误详情
 
 请求列表支持按状态、供应商、模型和日期筛选，可搜索请求 ID 或错误信息、实时刷新并导出当前页 CSV。点击任意记录可打开请求详情，旧记录未采集的分段耗时会明确标记为不可用。
+
+在“本地代理”中开启 Debug 模式后，新的 `POST /v1/responses` 调用会在请求详情中增加
+“入站请求 / 上游请求 / 上游响应”快照。认证头、API Key 和 Cookie 始终脱敏；每段请求体或
+响应体最多保存 4 MiB，超过部分会标记为截断。快照反映 XXSwitch 收到和发出的线上数据，
+不能观察供应商服务端未回传的隐藏提示词或内部处理。
+
+请求列表支持跨分页勾选多条 Debug 快照并导出为一个 JSON 文件。导出包包含对应的路由日志、
+完整快照和读取失败清单，可直接交给 Codex 比较不同供应商的请求转换、响应与缓存差异。
 
 “使用统计”由这些路由记录聚合生成，不读取金额、不维护模型价格，也不计算供应商成本。
 
@@ -115,6 +124,9 @@ XXSwitch 的状态、路由日志、供应商故障记录和 Skill Library 位�
 ```text
 ~/.codex/config-manager/
 ```
+
+Debug 快照单独保存在 `~/.codex/config-manager/debug-captures/`，关闭 Debug 模式不会删除
+已有快照。快照包含完整提示词和模型输出，应按敏感数据保护该目录。
 
 该目录沿用旧版本路径以兼容已有数据。保存的供应商 API Key 会写入本地状态文件，请按包含敏感信息的配置目录进行保护。
 
