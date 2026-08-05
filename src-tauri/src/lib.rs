@@ -62,6 +62,7 @@ const MAX_DEBUG_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
 const CODEX_MODEL_AUTO_COMPACT_TOKEN_LIMIT: i64 = 243_200;
 const CODEX_MODEL_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
+const CODEX_ROUTER_MODEL_CATALOG: &str = "config-manager/router-models.json";
 const PI_PROVIDER_ID: &str = "xxswitch";
 const LEGACY_PI_PROVIDER_ID: &str = "codex-helper";
 const PI_PROVIDER_API: &str = "openai-responses";
@@ -572,6 +573,8 @@ struct RouterApplyBackup {
     provider_name: String,
     #[serde(default)]
     model_provider: RouterFieldBackup,
+    #[serde(default)]
+    model_catalog_json: RouterFieldBackup,
     #[serde(default)]
     custom_name: RouterFieldBackup,
     #[serde(default)]
@@ -1807,6 +1810,10 @@ fn claude_home() -> Result<PathBuf, String> {
 
 fn manager_dir() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("config-manager"))
+}
+
+fn codex_router_model_catalog_path() -> Result<PathBuf, String> {
+    Ok(codex_home()?.join(CODEX_ROUTER_MODEL_CATALOG))
 }
 
 fn state_path() -> Result<PathBuf, String> {
@@ -5124,11 +5131,12 @@ fn router_provider_path(provider_name: &str, field: &str) -> String {
     format!("model_providers.{provider_name}.{field}")
 }
 
-fn router_managed_paths(router: &RouterConfig) -> [String; 7] {
+fn router_managed_paths(router: &RouterConfig) -> [String; 8] {
     let provider_name = normalize_router_model_provider(&router.model_provider)
         .unwrap_or_else(|_| default_router_model_provider());
     [
         "model_provider".to_string(),
+        "model_catalog_json".to_string(),
         router_provider_path(&provider_name, "name"),
         router_provider_path(&provider_name, "base_url"),
         router_provider_path(&provider_name, "experimental_bearer_token"),
@@ -5156,6 +5164,7 @@ fn capture_router_backup(doc: &DocumentMut, provider_name: &str) -> RouterApplyB
     RouterApplyBackup {
         provider_name: provider_name.to_string(),
         model_provider: capture_toml_field(doc, "model_provider"),
+        model_catalog_json: capture_toml_field(doc, "model_catalog_json"),
         custom_name: capture_toml_field(doc, &router_provider_path(provider_name, "name")),
         remote_compaction_v2: capture_toml_field(doc, "features.remote_compaction_v2"),
         custom_base_url: capture_toml_field(doc, &router_provider_path(provider_name, "base_url")),
@@ -5203,6 +5212,7 @@ fn restore_router_backup(
     if let Some(backup) = backup {
         let provider_name = router_backup_provider_name(backup);
         restore_toml_field(&mut doc, "model_provider", &backup.model_provider)?;
+        restore_toml_field(&mut doc, "model_catalog_json", &backup.model_catalog_json)?;
         restore_toml_field(
             &mut doc,
             &router_provider_path(&provider_name, "name"),
@@ -5259,7 +5269,16 @@ fn prepare_router_patch(
     let provider_name = normalize_router_model_provider(&router.model_provider)?;
     if let Some(backup) = backup {
         if router_backup_provider_name(backup) == provider_name {
-            return Ok((doc, backup.clone()));
+            let mut backup = backup.clone();
+            let current_model_catalog = capture_toml_field(&doc, "model_catalog_json");
+            let managed_model_catalog = Value::String(CODEX_ROUTER_MODEL_CATALOG.to_string());
+            if !backup.model_catalog_json.existed
+                && backup.model_catalog_json.value.is_none()
+                && current_model_catalog.value.as_ref() != Some(&managed_model_catalog)
+            {
+                backup.model_catalog_json = current_model_catalog;
+            }
+            return Ok((doc, backup));
         }
         let restored = restore_router_backup(doc, Some(backup), router, requires_openai_auth)?
             .parse::<DocumentMut>()
@@ -5282,6 +5301,11 @@ fn render_router_patch_toml(
         &mut doc,
         "model_provider",
         &Value::String(provider_name.clone()),
+    )?;
+    set_toml_path(
+        &mut doc,
+        "model_catalog_json",
+        &Value::String(CODEX_ROUTER_MODEL_CATALOG.to_string()),
     )?;
     set_toml_path(
         &mut doc,
@@ -5364,6 +5388,10 @@ fn router_patch_desired(router: &RouterConfig, requires_openai_auth: bool) -> Va
     model_providers.insert(provider_name.clone(), Value::Object(managed_provider));
     let mut root = Map::new();
     root.insert("model_provider".to_string(), Value::String(provider_name));
+    root.insert(
+        "model_catalog_json".to_string(),
+        Value::String(CODEX_ROUTER_MODEL_CATALOG.to_string()),
+    );
     root.insert(
         "model_providers".to_string(),
         Value::Object(model_providers),
@@ -5623,7 +5651,7 @@ fn capture_pi_backup(config: &Value) -> PiApplyBackup {
     }
 }
 
-fn route_models_for_pi(state: &ManagerState) -> Vec<String> {
+fn route_models_for_clients(state: &ManagerState) -> Vec<String> {
     let candidates = state
         .providers
         .iter()
@@ -5642,6 +5670,56 @@ fn route_models_for_pi(state: &ManagerState) -> Vec<String> {
         })
         .collect::<Vec<_>>();
     configured_route_models(&candidates)
+}
+
+fn codex_catalog_models_for_state(state: &ManagerState) -> Vec<String> {
+    let configured = route_models_for_clients(state);
+    if !configured.is_empty() {
+        return configured;
+    }
+
+    load_codex_model_catalog_templates()
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .get("supported_in_api")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && entry
+                    .get("visibility")
+                    .and_then(Value::as_str)
+                    .is_some_and(|visibility| visibility == "list")
+        })
+        .filter_map(|entry| {
+            entry
+                .get("slug")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn ensure_codex_model_catalog_applied(state: &ManagerState) -> Result<bool, String> {
+    let path = codex_router_model_catalog_path()?;
+    let desired = codex_models_catalog_value(codex_catalog_models_for_state(state));
+    if path.exists() {
+        let current = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+        if current.as_ref() == Some(&desired) {
+            return Ok(false);
+        }
+    }
+
+    fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| "无法定位 Codex 模型目录".to_string())?,
+    )
+    .map_err(|err| format!("无法创建 Codex 模型目录: {err}"))?;
+    let raw = serde_json::to_string_pretty(&desired)
+        .map_err(|err| format!("无法生成 Codex capability 模型目录: {err}"))?;
+    fs::write(path, raw).map_err(|err| format!("无法写入 Codex capability 模型目录: {err}"))?;
+    Ok(true)
 }
 
 fn pi_provider_value(router: &RouterConfig, models: &[String]) -> Value {
@@ -5745,6 +5823,7 @@ fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String
         return Ok(false);
     }
 
+    let catalog_changed = ensure_codex_model_catalog_applied(state)?;
     let requires_openai_auth = router_requires_openai_auth(&state.router);
     let (doc, marker_present, _, _) = read_current_toml()?;
     let desired = router_patch_desired(&state.router, requires_openai_auth);
@@ -5752,14 +5831,14 @@ fn ensure_router_config_applied(state: &mut ManagerState) -> Result<bool, String
     if router_patch_matches_current(&current_json, &state.router, requires_openai_auth)
         && state.last_applied.as_ref() == Some(&desired)
     {
-        return Ok(false);
+        return Ok(catalog_changed);
     }
 
     let was_managed = marker_present
         || state.router_backup.is_some()
         || state.last_applied.as_ref() == Some(&desired);
     if !was_managed {
-        return Ok(false);
+        return Ok(catalog_changed);
     }
 
     let (doc, backup) = prepare_router_patch(
@@ -5801,7 +5880,7 @@ fn ensure_pi_config_applied(state: &mut ManagerState) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let models = route_models_for_pi(state);
+    let models = route_models_for_clients(state);
     if disable_pi_takeover_if_unroutable(state, &models) {
         restore_pi_config_after_takeover(state)?;
         return Ok(true);
@@ -6362,6 +6441,78 @@ fn apply_codex_gpt_5_6_profile(model: &str, object: &mut Map<String, Value>) {
     );
 }
 
+fn apply_codex_deepseek_profile(model: &str, object: &mut Map<String, Value>) {
+    if !model.trim().eq_ignore_ascii_case("deepseek-v4-flash") {
+        return;
+    }
+
+    object.insert(
+        "display_name".to_string(),
+        Value::String("DeepSeek-V4-Flash".to_string()),
+    );
+    object.insert(
+        "description".to_string(),
+        Value::String("Latest frontier agentic coding model.".to_string()),
+    );
+    object.insert(
+        "default_reasoning_level".to_string(),
+        Value::String("high".to_string()),
+    );
+    object.insert(
+        "supported_reasoning_levels".to_string(),
+        Value::Array(vec![
+            codex_reasoning_level_entry("low", "Fast responses with lighter reasoning"),
+            codex_reasoning_level_entry("high", "Extra high reasoning depth for complex problems"),
+            codex_reasoning_level_entry("max", "Maximum reasoning depth for the hardest problems"),
+        ]),
+    );
+    object.insert("prefer_websockets".to_string(), Value::Bool(false));
+    object.insert("input_modalities".to_string(), json!(["text"]));
+    object.insert(
+        "supports_image_detail_original".to_string(),
+        Value::Bool(false),
+    );
+    object.insert(
+        "web_search_tool_type".to_string(),
+        Value::String("text".to_string()),
+    );
+    object.insert(
+        "supports_parallel_tool_calls".to_string(),
+        Value::Bool(true),
+    );
+    object.insert("tool_mode".to_string(), Value::Null);
+    object.insert(
+        "multi_agent_version".to_string(),
+        Value::String("v2".to_string()),
+    );
+    object.insert("use_responses_lite".to_string(), Value::Bool(false));
+    object.insert(
+        "include_skills_usage_instructions".to_string(),
+        Value::Bool(false),
+    );
+    object.insert(
+        "context_window".to_string(),
+        Value::Number(1_048_576.into()),
+    );
+    object.insert(
+        "max_context_window".to_string(),
+        Value::Number(1_048_576.into()),
+    );
+    object.insert("auto_compact_token_limit".to_string(), Value::Null);
+    object.insert(
+        "minimal_client_version".to_string(),
+        Value::String("0.144.0".to_string()),
+    );
+    object.insert(
+        "reasoning_summary_format".to_string(),
+        Value::String("experimental".to_string()),
+    );
+    object.insert(
+        "default_reasoning_summary".to_string(),
+        Value::String("none".to_string()),
+    );
+}
+
 fn fallback_codex_model_catalog_entry(model: &str) -> Value {
     let supported_reasoning_levels = codex_reasoning_level_specs(model)
         .into_iter()
@@ -6481,6 +6632,7 @@ fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Value {
         apply_codex_model_reasoning_levels(model, object);
         apply_codex_gpt_5_6_profile(model, object);
         apply_codex_model_context_fields(object);
+        apply_codex_deepseek_profile(model, object);
         object.insert("visibility".to_string(), Value::String("list".to_string()));
         object.insert("supported_in_api".to_string(), Value::Bool(true));
     }
@@ -12422,7 +12574,7 @@ fn save_client_configs(
     state.clients.codex.enabled = payload.codex_enabled;
     state.clients.claude.enabled = payload.claude_enabled;
     state.clients.pi.enabled = payload.pi_enabled;
-    if state.clients.pi.enabled && route_models_for_pi(&state).is_empty() {
+    if state.clients.pi.enabled && route_models_for_clients(&state).is_empty() {
         return Err("Pi 接管需要至少一个已启用且配置完整的 Codex 供应商路由模型".to_string());
     }
     if state.clients.codex.enabled || state.clients.claude.enabled || state.clients.pi.enabled {
@@ -12571,6 +12723,7 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
 
     if state.clients.codex.enabled {
         fs::create_dir_all(codex_home()?).map_err(|err| format!("无法创建 Codex 目录: {err}"))?;
+        ensure_codex_model_catalog_applied(&state)?;
         if config_path.exists() {
             let backup_name = format!(
                 "config.toml.{}.bak",
@@ -12662,7 +12815,7 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
 
     let pi_path = pi_models_path()?;
     if state.clients.pi.enabled {
-        let models = route_models_for_pi(&state);
+        let models = route_models_for_clients(&state);
         if models.is_empty() {
             return Err("Pi 接管需要至少一个已启用且配置完整的 Codex 供应商路由模型".to_string());
         }
@@ -13863,6 +14016,10 @@ multi_agent = false
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
+        assert_eq!(
+            toml_path_value(&patched, "model_catalog_json"),
+            Some(Value::String(CODEX_ROUTER_MODEL_CATALOG.to_string()))
+        );
         let restored = restore_router_backup(patched, Some(&backup), &router, false).unwrap();
         let restored_doc = restored.parse::<DocumentMut>().unwrap();
 
@@ -13872,6 +14029,57 @@ multi_agent = false
         );
         assert!(restored_doc.get("model_providers").is_none());
         assert!(restored_doc.get("features").is_none());
+        assert!(restored_doc.get("model_catalog_json").is_none());
+    }
+
+    #[test]
+    fn router_model_catalog_path_is_backed_up_and_restored() {
+        let doc = r#"model_catalog_json = "user-models.json"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let router = RouterConfig::default();
+        let backup = capture_router_backup(&doc, &router.model_provider);
+        let patched = render_router_patch_toml(doc, false, &router, false)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        assert_eq!(
+            toml_path_value(&patched, "model_catalog_json"),
+            Some(Value::String(CODEX_ROUTER_MODEL_CATALOG.to_string()))
+        );
+
+        let restored = restore_router_backup(patched, Some(&backup), &router, false)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            toml_path_value(&restored, "model_catalog_json"),
+            Some(Value::String("user-models.json".to_string()))
+        );
+    }
+
+    #[test]
+    fn legacy_router_backup_captures_an_unmanaged_model_catalog() {
+        let doc = r#"model_catalog_json = "user-models.json"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let router = RouterConfig::default();
+        let legacy_backup = RouterApplyBackup {
+            provider_name: router.model_provider.clone(),
+            ..RouterApplyBackup::default()
+        };
+
+        let (_, migrated_backup) =
+            prepare_router_patch(doc, Some(&legacy_backup), &router, false).unwrap();
+
+        assert!(migrated_backup.model_catalog_json.existed);
+        assert_eq!(
+            migrated_backup.model_catalog_json.value,
+            Some(Value::String("user-models.json".to_string()))
+        );
     }
 
     #[test]
@@ -16111,6 +16319,65 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 .get("effective_context_window_percent")
                 .and_then(Value::as_i64),
             Some(95)
+        );
+    }
+
+    #[test]
+    fn codex_catalog_applies_deepseek_v4_flash_capabilities() {
+        let template = json!({
+            "slug": "gpt-template",
+            "display_name": "GPT Template",
+            "input_modalities": ["text", "image"],
+            "supports_image_detail_original": true,
+            "context_window": 256000,
+            "max_context_window": 256000,
+            "auto_compact_token_limit": 243200,
+            "supported_reasoning_levels": [
+                { "effort": "medium", "description": "medium" }
+            ]
+        });
+        let catalog = codex_models_catalog_value_with_templates(
+            vec!["deepseek-v4-flash".to_string()],
+            &[template],
+        );
+        let model = catalog
+            .pointer("/models/0")
+            .and_then(Value::as_object)
+            .expect("DeepSeek capability entry");
+
+        assert_eq!(
+            model.get("display_name").and_then(Value::as_str),
+            Some("DeepSeek-V4-Flash")
+        );
+        assert_eq!(model.get("input_modalities"), Some(&json!(["text"])));
+        assert_eq!(
+            model
+                .get("supports_image_detail_original")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            model.get("context_window").and_then(Value::as_i64),
+            Some(1_048_576)
+        );
+        assert_eq!(model.get("auto_compact_token_limit"), Some(&Value::Null));
+        assert_eq!(
+            model
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .expect("reasoning levels")
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["low", "high", "max"]
+        );
+        assert_eq!(
+            model.get("visibility").and_then(Value::as_str),
+            Some("list")
+        );
+        assert_eq!(
+            model.get("supported_in_api").and_then(Value::as_bool),
+            Some(true)
         );
     }
 

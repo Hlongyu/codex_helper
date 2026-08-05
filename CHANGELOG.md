@@ -1,5 +1,13 @@
 # 更新记录
 
+## v1.2.21 - 2026-08-05
+
+### 修复
+
+- Codex 接管现在生成受管的 capability 模型目录，并通过 `model_catalog_json` 注入 Codex 配置，使非官方认证也能在 `/model` 中获得完整模型能力。
+- 为 `deepseek-v4-flash` 提供原生 capability 描述，包括文本输入、1M 上下文以及 `low`、`high`、`max` 推理等级。
+- 关闭接管时恢复用户原有的 `model_catalog_json` 配置，并兼容升级前创建的旧版接管备份。
+
 ## v1.2.20 - 2026-08-05
 
 ### CI/CD
