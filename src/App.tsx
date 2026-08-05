@@ -61,6 +61,7 @@ type RouterConfig = {
   force_disable_openai_auth: boolean;
   remote_compaction_enabled: boolean;
   model_provider: string;
+  codex_model: string;
   host: string;
   port: number;
   local_token: string;
@@ -434,6 +435,7 @@ type AppState = {
   final_preview_toml: string;
   diffs: Array<{ path: string; action: string }>;
   router: RouterConfig;
+  codex_models: string[];
   clients: ClientConfigs;
   multi_agent_enabled: boolean;
   router_status: RouterStatus;
@@ -475,6 +477,7 @@ function defaultRouterConfig(): RouterConfig {
     force_disable_openai_auth: false,
     remote_compaction_enabled: false,
     model_provider: "custom",
+    codex_model: "",
     host: "127.0.0.1",
     port: 18080,
     local_token: "",
@@ -493,6 +496,16 @@ function routerModelProviderError(router: RouterConfig) {
   if (providerName.length > 64) return "Provider 名称不能超过 64 个字符。";
   if (!/^[A-Za-z0-9_-]+$/.test(providerName)) {
     return "Provider 名称只能包含英文字母、数字、下划线和连字符。";
+  }
+  return "";
+}
+
+function routerCodexModelError(router: RouterConfig, models: string[]) {
+  const selected = router.codex_model.trim();
+  if (!models.length) return "至少配置一个可路由模型后才能接管 Codex。";
+  if (!selected) return "请选择 Codex 默认模型。";
+  if (!models.some((model) => model.toLowerCase() === selected.toLowerCase())) {
+    return "当前模型已不在可路由模型列表中。";
   }
   return "";
 }
@@ -2767,6 +2780,15 @@ function RouteScreen({
   setRouterDraft: (router: RouterConfig) => void;
 }) {
   const providerNameError = routerModelProviderError(routerDraft);
+  const codexSelectionError = routerCodexModelError(routerDraft, appState.codex_models);
+  const selectedModelUnavailable = Boolean(
+    routerDraft.codex_model.trim() &&
+      !appState.codex_models.some(
+        (model) => model.toLowerCase() === routerDraft.codex_model.trim().toLowerCase(),
+      ),
+  );
+  const codexModelError =
+    appState.clients.codex.enabled || selectedModelUnavailable ? codexSelectionError : "";
 
   return (
     <section className="route-page">
@@ -2811,12 +2833,42 @@ function RouteScreen({
             />
             {providerNameError ? <small>{providerNameError}</small> : null}
           </label>
+          <label className="compact-field route-model-field">
+            <span>Codex 默认模型</span>
+            <select
+              aria-invalid={Boolean(codexModelError)}
+              disabled={busy || appState.codex_models.length === 0}
+              value={routerDraft.codex_model}
+              onChange={(event) =>
+                setRouterDraft({ ...routerDraft, codex_model: event.currentTarget.value })
+              }
+            >
+              <option value="">
+                {appState.codex_models.length ? "选择模型" : "暂无可路由模型"}
+              </option>
+              {selectedModelUnavailable ? (
+                <option value={routerDraft.codex_model}>
+                  {routerDraft.codex_model}（当前不可路由）
+                </option>
+              ) : null}
+              {appState.codex_models.map((model) => (
+                <option key={model} value={model}>
+                  {model}
+                </option>
+              ))}
+            </select>
+            {codexModelError ? <small>{codexModelError}</small> : null}
+          </label>
           <div className="route-diff-row">
             <span>openai_base_url → 本地代理地址</span>
             <button className="ghost small">查看变更</button>
             <Toggle
               checked={appState.clients.codex.enabled}
-              disabled={busy}
+              disabled={
+                busy ||
+                (!appState.clients.codex.enabled &&
+                  (!appState.codex_models.length || selectedModelUnavailable))
+              }
               onChange={(checked) => void onSaveClientConfig("codex", checked)}
             />
           </div>
@@ -2940,7 +2992,7 @@ function RouteScreen({
         </button>
         <button
           className="primary"
-          disabled={busy || Boolean(providerNameError)}
+          disabled={busy || Boolean(providerNameError) || Boolean(codexModelError)}
           onClick={() => onSaveRouter(routerDraft, true)}
           type="button"
         >
