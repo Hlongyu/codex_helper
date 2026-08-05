@@ -27,6 +27,8 @@ use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,6 +70,9 @@ const LEGACY_PI_PROVIDER_ID: &str = "codex-helper";
 const PI_PROVIDER_API: &str = "openai-responses";
 static ROUTE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROVIDER_HEALTH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CODEX_CLI_CHATGPT_LOGIN: OnceLock<bool> = OnceLock::new();
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const AUTO_DISABLE_FAILURE_THRESHOLD: u32 = 3;
 const DEFAULT_AUTO_DISABLE_RESET_TIME: &str = "00:00";
 const DEFAULT_AUTO_DISABLE_RESET_WEEKDAY: u32 = 1;
@@ -1854,14 +1859,14 @@ fn parse_codex_chatgpt_login_status(stdout: &str, stderr: &str) -> Option<bool> 
     None
 }
 
-fn auth_json_has_chatgpt_login(value: &Value) -> bool {
+fn auth_json_chatgpt_login_status(value: &Value) -> Option<bool> {
     match value.get("auth_mode").and_then(Value::as_str) {
-        Some("chatgpt" | "chatgpt_auth_tokens") => true,
-        Some(_) => false,
+        Some("chatgpt" | "chatgpt_auth_tokens") => Some(true),
+        Some(_) => Some(false),
         None => value
             .get("tokens")
             .and_then(Value::as_object)
-            .is_some_and(|tokens| {
+            .map(|tokens| {
                 ["access_token", "refresh_token", "id_token"]
                     .iter()
                     .any(|key| {
@@ -1874,9 +1879,31 @@ fn auth_json_has_chatgpt_login(value: &Value) -> bool {
     }
 }
 
-fn codex_chatgpt_login_configured() -> bool {
+#[cfg(windows)]
+fn background_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(not(windows))]
+fn background_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    Command::new(program)
+}
+
+fn codex_chatgpt_login_from_auth_file() -> Option<bool> {
+    let path = codex_home().ok()?.join("auth.json");
+    let raw = fs::read(path).ok()?;
+    let value = serde_json::from_slice::<Value>(&raw).ok()?;
+    auth_json_chatgpt_login_status(&value)
+}
+
+fn codex_chatgpt_login_from_cli() -> bool {
     for candidate in codex_cli_candidates() {
-        let Ok(output) = Command::new(candidate).args(["login", "status"]).output() else {
+        let Ok(output) = background_command(candidate)
+            .args(["login", "status"])
+            .output()
+        else {
             continue;
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1885,14 +1912,14 @@ fn codex_chatgpt_login_configured() -> bool {
             return configured;
         }
     }
+    false
+}
 
-    let Ok(path) = codex_home().map(|home| home.join("auth.json")) else {
-        return false;
-    };
-    fs::read(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
-        .is_some_and(|value| auth_json_has_chatgpt_login(&value))
+fn codex_chatgpt_login_configured() -> bool {
+    if let Some(configured) = codex_chatgpt_login_from_auth_file() {
+        return configured;
+    }
+    *CODEX_CLI_CHATGPT_LOGIN.get_or_init(codex_chatgpt_login_from_cli)
 }
 
 fn resolve_router_requires_openai_auth(
@@ -1903,10 +1930,10 @@ fn resolve_router_requires_openai_auth(
 }
 
 fn router_requires_openai_auth(router: &RouterConfig) -> bool {
-    resolve_router_requires_openai_auth(
-        router.force_disable_openai_auth,
-        codex_chatgpt_login_configured(),
-    )
+    if router.force_disable_openai_auth {
+        return false;
+    }
+    resolve_router_requires_openai_auth(false, codex_chatgpt_login_configured())
 }
 
 fn claude_settings_path() -> Result<PathBuf, String> {
@@ -6250,7 +6277,7 @@ fn codex_cli_candidates() -> Vec<PathBuf> {
 
 fn load_bundled_codex_model_catalog_templates() -> Vec<Value> {
     for candidate in codex_cli_candidates() {
-        let Ok(output) = Command::new(candidate)
+        let Ok(output) = background_command(candidate)
             .args(["debug", "models", "--bundled"])
             .output()
         else {
@@ -13337,7 +13364,12 @@ mod tests {
                 "access_token": "expired-token"
             }
         });
-        assert!(auth_json_has_chatgpt_login(&auth));
+        assert_eq!(auth_json_chatgpt_login_status(&auth), Some(true));
+        assert_eq!(
+            auth_json_chatgpt_login_status(&json!({ "auth_mode": "apikey" })),
+            Some(false)
+        );
+        assert_eq!(auth_json_chatgpt_login_status(&json!({})), None);
     }
 
     #[test]
