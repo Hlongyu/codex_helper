@@ -11,6 +11,7 @@ default:
     - docker
 
 .macos-runner:
+  resource_group: xxswitch-macos-shell
   tags:
     - shell
     - node
