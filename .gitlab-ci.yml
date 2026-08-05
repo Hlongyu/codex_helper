@@ -89,6 +89,24 @@ macos:preflight:
         exit 1
       fi
       echo "Developer ID Application signing identity is available."
+    - |
+      apple_id="${APPLE_ID:-zqtqzy@163.com}"
+      apple_team_id="${APPLE_TEAM_ID:-YDJE97CX57}"
+      notary_password="${APPLE_SPECIFIC_PWD:-${APPLE_APP_SPECIFIC_PASSWORD:-}}"
+      notary_profile="${NOTARY_PROFILE:-notarytool-profile}"
+
+      if [ -n "$notary_password" ]; then
+        xcrun notarytool history \
+          --apple-id "$apple_id" \
+          --team-id "$apple_team_id" \
+          --password "$notary_password" >/dev/null
+        echo "Apple notarization credentials are available from CI variables."
+      elif xcrun notarytool history --keychain-profile "$notary_profile" >/dev/null 2>&1; then
+        echo "Apple notarization credentials are available from the Runner keychain."
+      else
+        echo "No Apple notarization credentials are available. Configure APPLE_SPECIFIC_PWD or the '$notary_profile' keychain profile." >&2
+        exit 1
+      fi
 
 windows:preflight:
   stage: verify
@@ -187,7 +205,49 @@ release:macos-universal:
     - |
       dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
       test -n "$dmg_path"
+
+      apple_id="${APPLE_ID:-zqtqzy@163.com}"
+      apple_team_id="${APPLE_TEAM_ID:-YDJE97CX57}"
+      notary_password="${APPLE_SPECIFIC_PWD:-${APPLE_APP_SPECIFIC_PASSWORD:-}}"
+      notary_profile="${NOTARY_PROFILE:-notarytool-profile}"
+
+      if [ -n "$notary_password" ]; then
+        echo "Submitting DMG for notarization with CI credentials."
+        xcrun notarytool submit "$dmg_path" \
+          --apple-id "$apple_id" \
+          --team-id "$apple_team_id" \
+          --password "$notary_password" \
+          --wait \
+          --timeout 30m
+      elif xcrun notarytool history --keychain-profile "$notary_profile" >/dev/null 2>&1; then
+        echo "Submitting DMG for notarization with Runner keychain profile '$notary_profile'."
+        xcrun notarytool submit "$dmg_path" \
+          --keychain-profile "$notary_profile" \
+          --wait \
+          --timeout 30m
+      else
+        echo "No Apple notarization credentials are available. Configure APPLE_SPECIFIC_PWD or the '$notary_profile' keychain profile." >&2
+        exit 1
+      fi
+
+      xcrun stapler staple "$dmg_path"
+      xcrun stapler validate "$dmg_path"
       codesign --verify --strict --verbose=2 "$dmg_path"
+      spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
+    - |
+      dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+      mount_dir="$(mktemp -d)"
+      cleanup_mount() {
+        hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true
+        rmdir "$mount_dir" >/dev/null 2>&1 || true
+      }
+      trap cleanup_mount EXIT
+
+      hdiutil attach "$dmg_path" -nobrowse -readonly -mountpoint "$mount_dir" >/dev/null
+      app_path="$(find "$mount_dir" -maxdepth 1 -name '*.app' -print -quit)"
+      test -n "$app_path"
+      codesign --verify --deep --strict --verbose=2 "$app_path"
+      spctl --assess --type execute --verbose=4 "$app_path"
   artifacts:
     name: "xxswitch-$CI_COMMIT_TAG-macos-universal"
     expire_in: 1 week
