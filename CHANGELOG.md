@@ -1,5 +1,12 @@
 # 更新记录
 
+## v1.2.18 - 2026-08-05
+
+### CI/CD
+
+- Windows 打包工具改为缓存到项目的 `target/.tauri`，兼容以 System 用户运行的 GitLab Shell Runner，避免 NSIS `makensis` 无法启动。
+- macOS 发布作业直接校验 Tauri 最终生成并签名的 DMG，不再依赖打包后会被清理的临时 `.app` 目录。
+
 ## v1.2.17 - 2026-08-05
 
 ### CI/CD
