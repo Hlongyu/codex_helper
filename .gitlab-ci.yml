@@ -1,4 +1,5 @@
 stages:
+  - test
   - verify
   - package
   - release
@@ -290,3 +291,31 @@ release:publish:
         --name "XXSwitch $CI_COMMIT_TAG" \
         --notes "$release_notes" \
         --use-package-registry < release-assets
+include:
+  - project: software_group/ci-templates
+    ref: 2.0.5
+    file: /quality/security-baseline.v2.yml
+  - project: software_group/ci-templates
+    ref: 2.0.5
+    file: /quality/rust.v2.yml
+
+quality:rustfmt:
+  before_script:
+    - cd src-tauri
+    - rustup component add rustfmt
+
+quality:clippy:
+  image: rust:1.96-bookworm
+  before_script:
+    - cd src-tauri
+    - rustup component add clippy
+    - apt-get update
+    - >-
+      DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends
+      build-essential
+      libayatana-appindicator3-dev
+      librsvg2-dev
+      libssl-dev
+      libwebkit2gtk-4.1-dev
+      libxdo-dev
+      pkg-config
