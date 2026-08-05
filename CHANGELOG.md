@@ -1,5 +1,12 @@
 # 更新记录
 
+## v1.2.20 - 2026-08-05
+
+### CI/CD
+
+- GitLab macOS 发布复用 M1 Runner 钥匙串中的 `notarytool-profile`，对最终 Universal DMG 执行 Apple 公证并装订公证票据。
+- 发布前强制通过 Developer ID 签名、公证票据和 Gatekeeper 校验，避免上传无法直接打开的 macOS 安装包。
+
 ## v1.2.19 - 2026-08-05
 
 ### CI/CD
