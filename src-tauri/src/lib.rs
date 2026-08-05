@@ -6,7 +6,7 @@ use axum::{
     routing::any,
     Router,
 };
-use chrono::{DateTime, Datelike, Local, Timelike, Utc};
+use chrono::{DateTime, Datelike, Days, Local, NaiveDate, Timelike, Utc};
 use futures_util::{
     future::BoxFuture,
     stream::{self, BoxStream},
@@ -68,6 +68,9 @@ const PI_PROVIDER_API: &str = "openai-responses";
 static ROUTE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROVIDER_HEALTH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const AUTO_DISABLE_FAILURE_THRESHOLD: u32 = 3;
+const DEFAULT_AUTO_DISABLE_RESET_TIME: &str = "00:00";
+const DEFAULT_AUTO_DISABLE_RESET_WEEKDAY: u32 = 1;
+const DEFAULT_AUTO_DISABLE_RESET_DAY: u32 = 1;
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_SHOW_ID: &str = "show";
 const TRAY_QUIT_ID: &str = "quit";
@@ -89,6 +92,14 @@ struct ProviderConfig {
     consecutive_failure_count: u32,
     #[serde(default)]
     auto_disabled_day: Option<String>,
+    #[serde(default)]
+    auto_disable_reset_period: AutoDisableResetPeriod,
+    #[serde(default = "default_auto_disable_reset_weekday")]
+    auto_disable_reset_weekday: u32,
+    #[serde(default = "default_auto_disable_reset_day")]
+    auto_disable_reset_day: u32,
+    #[serde(default = "default_auto_disable_reset_time")]
+    auto_disable_reset_time: String,
     #[serde(default)]
     last_failure_reason: Option<String>,
     #[serde(default)]
@@ -124,6 +135,14 @@ struct ClaudeProviderConfig {
     #[serde(default)]
     auto_disabled_day: Option<String>,
     #[serde(default)]
+    auto_disable_reset_period: AutoDisableResetPeriod,
+    #[serde(default = "default_auto_disable_reset_weekday")]
+    auto_disable_reset_weekday: u32,
+    #[serde(default = "default_auto_disable_reset_day")]
+    auto_disable_reset_day: u32,
+    #[serde(default = "default_auto_disable_reset_time")]
+    auto_disable_reset_time: String,
+    #[serde(default)]
     last_failure_reason: Option<String>,
     #[serde(default)]
     last_failure_at_ms: Option<i64>,
@@ -145,6 +164,21 @@ enum ProviderStatus {
     Enabled,
     Disabled,
     AutoDisabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AutoDisableResetPeriod {
+    Daily,
+    Weekly,
+    Monthly,
+    Never,
+}
+
+impl Default for AutoDisableResetPeriod {
+    fn default() -> Self {
+        Self::Daily
+    }
 }
 
 impl Default for ProviderStatus {
@@ -622,6 +656,10 @@ struct ProviderSummary {
     enabled: bool,
     consecutive_failure_count: u32,
     auto_disabled_day: Option<String>,
+    auto_disable_reset_period: AutoDisableResetPeriod,
+    auto_disable_reset_weekday: u32,
+    auto_disable_reset_day: u32,
+    auto_disable_reset_time: String,
     last_failure_reason: Option<String>,
     last_failure_at_ms: Option<i64>,
     pending_changes: usize,
@@ -733,6 +771,10 @@ struct SaveProviderPayload {
     wire_api: Option<ProviderWireApi>,
     service_tier: Option<String>,
     enabled: Option<bool>,
+    auto_disable_reset_period: Option<AutoDisableResetPeriod>,
+    auto_disable_reset_weekday: Option<u32>,
+    auto_disable_reset_day: Option<u32>,
+    auto_disable_reset_time: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
 }
@@ -742,6 +784,10 @@ struct SaveClaudeProviderPayload {
     provider_id: String,
     provider_name: Option<String>,
     enabled: Option<bool>,
+    auto_disable_reset_period: Option<AutoDisableResetPeriod>,
+    auto_disable_reset_weekday: Option<u32>,
+    auto_disable_reset_day: Option<u32>,
+    auto_disable_reset_time: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
     connection_test_model: Option<String>,
@@ -2714,9 +2760,181 @@ fn default_state() -> ManagerState {
     }
 }
 
-fn provider_day_now() -> String {
-    let now = Local::now();
-    format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day())
+fn default_auto_disable_reset_time() -> String {
+    DEFAULT_AUTO_DISABLE_RESET_TIME.to_string()
+}
+
+fn default_auto_disable_reset_weekday() -> u32 {
+    DEFAULT_AUTO_DISABLE_RESET_WEEKDAY
+}
+
+fn default_auto_disable_reset_day() -> u32 {
+    DEFAULT_AUTO_DISABLE_RESET_DAY
+}
+
+fn normalize_auto_disable_reset_weekday(value: u32) -> u32 {
+    if (1..=7).contains(&value) {
+        value
+    } else {
+        default_auto_disable_reset_weekday()
+    }
+}
+
+fn normalize_auto_disable_reset_day(value: u32) -> u32 {
+    if (1..=31).contains(&value) {
+        value
+    } else {
+        default_auto_disable_reset_day()
+    }
+}
+
+fn normalize_auto_disable_reset_time(value: &str) -> String {
+    let Some((hour, minute)) = value.trim().split_once(':') else {
+        return default_auto_disable_reset_time();
+    };
+    let Ok(hour) = hour.parse::<u32>() else {
+        return default_auto_disable_reset_time();
+    };
+    let Ok(minute) = minute.parse::<u32>() else {
+        return default_auto_disable_reset_time();
+    };
+    if hour >= 24 || minute >= 60 {
+        return default_auto_disable_reset_time();
+    }
+    format!("{hour:02}:{minute:02}")
+}
+
+fn auto_disable_reset_minutes(reset_time: &str) -> u32 {
+    normalize_auto_disable_reset_time(reset_time)
+        .split_once(':')
+        .map(|(hour, minute)| {
+            hour.parse::<u32>().unwrap_or(0) * 60 + minute.parse::<u32>().unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+fn format_provider_cycle(date: NaiveDate) -> String {
+    format!("{:04}-{:02}-{:02}", date.year(), date.month(), date.day())
+}
+
+fn previous_month(year: i32, month: u32) -> (i32, u32) {
+    if month == 1 {
+        (year - 1, 12)
+    } else {
+        (year, month - 1)
+    }
+}
+
+fn month_reset_date(year: i32, month: u32, reset_day: u32) -> NaiveDate {
+    let reset_day = normalize_auto_disable_reset_day(reset_day);
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let last_day = NaiveDate::from_ymd_opt(next_year, next_month, 1)
+        .and_then(|date| date.pred_opt())
+        .map(|date| date.day())
+        .unwrap_or(28);
+    NaiveDate::from_ymd_opt(year, month, reset_day.min(last_day))
+        .unwrap_or_else(|| NaiveDate::from_ymd_opt(year, month, 1).unwrap())
+}
+
+fn provider_cycle_for_date_and_time(
+    date: NaiveDate,
+    hour: u32,
+    minute: u32,
+    reset_period: AutoDisableResetPeriod,
+    reset_weekday: u32,
+    reset_day: u32,
+    reset_time: &str,
+) -> String {
+    if reset_period == AutoDisableResetPeriod::Never {
+        return "never".to_string();
+    }
+    let reset_minutes = auto_disable_reset_minutes(reset_time);
+    let current_minutes = hour.saturating_mul(60).saturating_add(minute);
+    let before_reset_time = current_minutes < reset_minutes;
+    let cycle_start = match reset_period {
+        AutoDisableResetPeriod::Daily => {
+            if before_reset_time {
+                date.pred_opt().unwrap_or(date)
+            } else {
+                date
+            }
+        }
+        AutoDisableResetPeriod::Weekly => {
+            let reset_weekday = normalize_auto_disable_reset_weekday(reset_weekday);
+            let current_weekday = date.weekday().number_from_monday();
+            let days_since_reset = (current_weekday + 7 - reset_weekday) % 7;
+            let mut cycle_start = date
+                .checked_sub_days(Days::new(days_since_reset.into()))
+                .unwrap_or(date);
+            if days_since_reset == 0 && before_reset_time {
+                cycle_start = cycle_start
+                    .checked_sub_days(Days::new(7))
+                    .unwrap_or(cycle_start);
+            }
+            cycle_start
+        }
+        AutoDisableResetPeriod::Monthly => {
+            let current_reset = month_reset_date(date.year(), date.month(), reset_day);
+            if date > current_reset || (date == current_reset && !before_reset_time) {
+                current_reset
+            } else {
+                let (year, month) = previous_month(date.year(), date.month());
+                month_reset_date(year, month, reset_day)
+            }
+        }
+        AutoDisableResetPeriod::Never => unreachable!(),
+    };
+    format_provider_cycle(cycle_start)
+}
+
+fn provider_cycle_for_local(
+    local: DateTime<Local>,
+    reset_period: AutoDisableResetPeriod,
+    reset_weekday: u32,
+    reset_day: u32,
+    reset_time: &str,
+) -> String {
+    provider_cycle_for_date_and_time(
+        local.date_naive(),
+        local.hour(),
+        local.minute(),
+        reset_period,
+        reset_weekday,
+        reset_day,
+        reset_time,
+    )
+}
+
+fn provider_cycle_now(
+    reset_period: AutoDisableResetPeriod,
+    reset_weekday: u32,
+    reset_day: u32,
+    reset_time: &str,
+) -> String {
+    provider_cycle_for_local(
+        Local::now(),
+        reset_period,
+        reset_weekday,
+        reset_day,
+        reset_time,
+    )
+}
+
+fn provider_cycle_for_timestamp(
+    timestamp_ms: i64,
+    reset_period: AutoDisableResetPeriod,
+    reset_weekday: u32,
+    reset_day: u32,
+    reset_time: &str,
+) -> String {
+    let local = DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .unwrap_or_else(Utc::now)
+        .with_timezone(&Local);
+    provider_cycle_for_local(local, reset_period, reset_weekday, reset_day, reset_time)
 }
 
 fn provider_enabled_from_status(status: ProviderStatus) -> bool {
@@ -2727,10 +2945,26 @@ fn normalize_provider_status(
     status: ProviderStatus,
     enabled: bool,
     auto_disabled_day: &Option<String>,
-    today: &str,
+    auto_disable_reset_period: AutoDisableResetPeriod,
+    auto_disable_reset_weekday: u32,
+    auto_disable_reset_day: u32,
+    auto_disable_reset_time: &str,
 ) -> ProviderStatus {
+    if status == ProviderStatus::AutoDisabled
+        && auto_disable_reset_period == AutoDisableResetPeriod::Never
+    {
+        return ProviderStatus::AutoDisabled;
+    }
+    let current_cycle = provider_cycle_now(
+        auto_disable_reset_period,
+        auto_disable_reset_weekday,
+        auto_disable_reset_day,
+        auto_disable_reset_time,
+    );
     match status {
-        ProviderStatus::AutoDisabled if auto_disabled_day.as_deref() == Some(today) => {
+        ProviderStatus::AutoDisabled
+            if auto_disabled_day.as_deref() == Some(current_cycle.as_str()) =>
+        {
             ProviderStatus::AutoDisabled
         }
         ProviderStatus::AutoDisabled => ProviderStatus::Enabled,
@@ -2811,14 +3045,22 @@ fn load_state_file() -> Result<ManagerState, String> {
 }
 
 fn normalize_state(mut state: ManagerState) -> ManagerState {
-    let today = provider_day_now();
     for provider in &mut state.providers {
+        provider.auto_disable_reset_weekday =
+            normalize_auto_disable_reset_weekday(provider.auto_disable_reset_weekday);
+        provider.auto_disable_reset_day =
+            normalize_auto_disable_reset_day(provider.auto_disable_reset_day);
+        provider.auto_disable_reset_time =
+            normalize_auto_disable_reset_time(&provider.auto_disable_reset_time);
         let previous_status = provider.status;
         provider.status = normalize_provider_status(
             provider.status,
             provider.enabled,
             &provider.auto_disabled_day,
-            &today,
+            provider.auto_disable_reset_period,
+            provider.auto_disable_reset_weekday,
+            provider.auto_disable_reset_day,
+            &provider.auto_disable_reset_time,
         );
         provider.enabled = provider_enabled_from_status(provider.status);
         if provider.status == ProviderStatus::Disabled
@@ -2836,12 +3078,21 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
             normalize_model_mappings(std::mem::take(&mut provider.model_mappings));
     }
     for provider in &mut state.claude_providers {
+        provider.auto_disable_reset_weekday =
+            normalize_auto_disable_reset_weekday(provider.auto_disable_reset_weekday);
+        provider.auto_disable_reset_day =
+            normalize_auto_disable_reset_day(provider.auto_disable_reset_day);
+        provider.auto_disable_reset_time =
+            normalize_auto_disable_reset_time(&provider.auto_disable_reset_time);
         let previous_status = provider.status;
         provider.status = normalize_provider_status(
             provider.status,
             provider.enabled,
             &provider.auto_disabled_day,
-            &today,
+            provider.auto_disable_reset_period,
+            provider.auto_disable_reset_weekday,
+            provider.auto_disable_reset_day,
+            &provider.auto_disable_reset_time,
         );
         provider.enabled = provider_enabled_from_status(provider.status);
         if provider.status == ProviderStatus::Disabled
@@ -10908,7 +11159,13 @@ fn record_provider_failure(
                         if provider.consecutive_failure_count >= AUTO_DISABLE_FAILURE_THRESHOLD {
                             provider.status = ProviderStatus::AutoDisabled;
                             provider.enabled = false;
-                            provider.auto_disabled_day = Some(day.clone());
+                            provider.auto_disabled_day = Some(provider_cycle_for_timestamp(
+                                started_at_ms,
+                                provider.auto_disable_reset_period,
+                                provider.auto_disable_reset_weekday,
+                                provider.auto_disable_reset_day,
+                                &provider.auto_disable_reset_time,
+                            ));
                             auto_disabled = true;
                         }
                         consecutive_failure_count = provider.consecutive_failure_count;
@@ -10932,7 +11189,13 @@ fn record_provider_failure(
                         if provider.consecutive_failure_count >= AUTO_DISABLE_FAILURE_THRESHOLD {
                             provider.status = ProviderStatus::AutoDisabled;
                             provider.enabled = false;
-                            provider.auto_disabled_day = Some(day.clone());
+                            provider.auto_disabled_day = Some(provider_cycle_for_timestamp(
+                                started_at_ms,
+                                provider.auto_disable_reset_period,
+                                provider.auto_disable_reset_weekday,
+                                provider.auto_disable_reset_day,
+                                &provider.auto_disable_reset_time,
+                            ));
                             auto_disabled = true;
                         }
                         consecutive_failure_count = provider.consecutive_failure_count;
@@ -11411,6 +11674,10 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                 enabled: provider.enabled,
                 consecutive_failure_count: provider.consecutive_failure_count,
                 auto_disabled_day: provider.auto_disabled_day.clone(),
+                auto_disable_reset_period: provider.auto_disable_reset_period,
+                auto_disable_reset_weekday: provider.auto_disable_reset_weekday,
+                auto_disable_reset_day: provider.auto_disable_reset_day,
+                auto_disable_reset_time: provider.auto_disable_reset_time.clone(),
                 last_failure_reason: provider.last_failure_reason.clone(),
                 last_failure_at_ms: provider.last_failure_at_ms,
                 pending_changes,
@@ -11444,6 +11711,10 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                 enabled: provider.enabled,
                 consecutive_failure_count: provider.consecutive_failure_count,
                 auto_disabled_day: provider.auto_disabled_day.clone(),
+                auto_disable_reset_period: provider.auto_disable_reset_period,
+                auto_disable_reset_weekday: provider.auto_disable_reset_weekday,
+                auto_disable_reset_day: provider.auto_disable_reset_day,
+                auto_disable_reset_time: provider.auto_disable_reset_time.clone(),
                 last_failure_reason: provider.last_failure_reason.clone(),
                 last_failure_at_ms: provider.last_failure_at_ms,
                 pending_changes: 0,
@@ -11623,6 +11894,43 @@ fn save_provider(
             &mut provider.last_failure_at_ms,
         );
     }
+    let next_reset_period = payload
+        .auto_disable_reset_period
+        .unwrap_or(provider.auto_disable_reset_period);
+    let next_reset_weekday = normalize_auto_disable_reset_weekday(
+        payload
+            .auto_disable_reset_weekday
+            .unwrap_or(provider.auto_disable_reset_weekday),
+    );
+    let next_reset_day = normalize_auto_disable_reset_day(
+        payload
+            .auto_disable_reset_day
+            .unwrap_or(provider.auto_disable_reset_day),
+    );
+    let next_reset_time = payload
+        .auto_disable_reset_time
+        .as_deref()
+        .map(normalize_auto_disable_reset_time)
+        .unwrap_or_else(|| provider.auto_disable_reset_time.clone());
+    let reset_policy_changed = next_reset_period != provider.auto_disable_reset_period
+        || next_reset_weekday != provider.auto_disable_reset_weekday
+        || next_reset_day != provider.auto_disable_reset_day
+        || next_reset_time != provider.auto_disable_reset_time;
+    provider.auto_disable_reset_period = next_reset_period;
+    provider.auto_disable_reset_weekday = next_reset_weekday;
+    provider.auto_disable_reset_day = next_reset_day;
+    provider.auto_disable_reset_time = next_reset_time;
+    if reset_policy_changed && provider.status == ProviderStatus::AutoDisabled {
+        if let Some(last_failure_at_ms) = provider.last_failure_at_ms {
+            provider.auto_disabled_day = Some(provider_cycle_for_timestamp(
+                last_failure_at_ms,
+                provider.auto_disable_reset_period,
+                provider.auto_disable_reset_weekday,
+                provider.auto_disable_reset_day,
+                &provider.auto_disable_reset_time,
+            ));
+        }
+    }
     if let Some(connection_test_model) = payload.connection_test_model {
         provider.connection_test_model = connection_test_model.trim().to_string();
     }
@@ -11697,6 +12005,43 @@ fn save_claude_provider(
             &mut provider.last_failure_reason,
             &mut provider.last_failure_at_ms,
         );
+    }
+    let next_reset_period = payload
+        .auto_disable_reset_period
+        .unwrap_or(provider.auto_disable_reset_period);
+    let next_reset_weekday = normalize_auto_disable_reset_weekday(
+        payload
+            .auto_disable_reset_weekday
+            .unwrap_or(provider.auto_disable_reset_weekday),
+    );
+    let next_reset_day = normalize_auto_disable_reset_day(
+        payload
+            .auto_disable_reset_day
+            .unwrap_or(provider.auto_disable_reset_day),
+    );
+    let next_reset_time = payload
+        .auto_disable_reset_time
+        .as_deref()
+        .map(normalize_auto_disable_reset_time)
+        .unwrap_or_else(|| provider.auto_disable_reset_time.clone());
+    let reset_policy_changed = next_reset_period != provider.auto_disable_reset_period
+        || next_reset_weekday != provider.auto_disable_reset_weekday
+        || next_reset_day != provider.auto_disable_reset_day
+        || next_reset_time != provider.auto_disable_reset_time;
+    provider.auto_disable_reset_period = next_reset_period;
+    provider.auto_disable_reset_weekday = next_reset_weekday;
+    provider.auto_disable_reset_day = next_reset_day;
+    provider.auto_disable_reset_time = next_reset_time;
+    if reset_policy_changed && provider.status == ProviderStatus::AutoDisabled {
+        if let Some(last_failure_at_ms) = provider.last_failure_at_ms {
+            provider.auto_disabled_day = Some(provider_cycle_for_timestamp(
+                last_failure_at_ms,
+                provider.auto_disable_reset_period,
+                provider.auto_disable_reset_weekday,
+                provider.auto_disable_reset_day,
+                &provider.auto_disable_reset_time,
+            ));
+        }
     }
     if let Some(base_url) = payload.base_url {
         provider.base_url = base_url.trim().trim_end_matches('/').to_string();
@@ -11847,6 +12192,18 @@ fn preview_provider(
         }
         provider.name = trimmed.to_string();
     }
+    if let Some(reset_period) = payload.auto_disable_reset_period {
+        provider.auto_disable_reset_period = reset_period;
+    }
+    if let Some(reset_weekday) = payload.auto_disable_reset_weekday {
+        provider.auto_disable_reset_weekday = normalize_auto_disable_reset_weekday(reset_weekday);
+    }
+    if let Some(reset_day) = payload.auto_disable_reset_day {
+        provider.auto_disable_reset_day = normalize_auto_disable_reset_day(reset_day);
+    }
+    if let Some(reset_time) = payload.auto_disable_reset_time {
+        provider.auto_disable_reset_time = normalize_auto_disable_reset_time(&reset_time);
+    }
 
     provider.config = toml_text_to_json(&payload.config_toml)?;
     if let Some(allowed_models) = payload.allowed_models {
@@ -11909,6 +12266,10 @@ fn add_provider(
         enabled: true,
         consecutive_failure_count: 0,
         auto_disabled_day: None,
+        auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+        auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+        auto_disable_reset_day: default_auto_disable_reset_day(),
+        auto_disable_reset_time: default_auto_disable_reset_time(),
         last_failure_reason: None,
         last_failure_at_ms: None,
         wire_api: ProviderWireApi::Responses,
@@ -11983,6 +12344,10 @@ fn add_claude_provider(
         enabled: true,
         consecutive_failure_count: 0,
         auto_disabled_day: None,
+        auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+        auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+        auto_disable_reset_day: default_auto_disable_reset_day(),
+        auto_disable_reset_time: default_auto_disable_reset_time(),
         last_failure_reason: None,
         last_failure_at_ms: None,
         base_url: String::new(),
@@ -12724,6 +13089,10 @@ mod tests {
             enabled,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
+            auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+            auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+            auto_disable_reset_day: default_auto_disable_reset_day(),
+            auto_disable_reset_time: default_auto_disable_reset_time(),
             last_failure_reason: None,
             last_failure_at_ms: None,
             config: json!({}),
@@ -12750,6 +13119,10 @@ mod tests {
             enabled,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
+            auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+            auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+            auto_disable_reset_day: default_auto_disable_reset_day(),
+            auto_disable_reset_time: default_auto_disable_reset_time(),
             last_failure_reason: None,
             last_failure_at_ms: None,
             base_url: String::new(),
@@ -13178,7 +13551,12 @@ multi_agent = false
     fn keeps_auto_disabled_provider_for_current_day() {
         let mut provider = test_provider_config("provider-a", ProviderStatus::AutoDisabled, false);
         provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD;
-        provider.auto_disabled_day = Some(provider_day_now());
+        provider.auto_disabled_day = Some(provider_cycle_now(
+            AutoDisableResetPeriod::Daily,
+            DEFAULT_AUTO_DISABLE_RESET_WEEKDAY,
+            DEFAULT_AUTO_DISABLE_RESET_DAY,
+            DEFAULT_AUTO_DISABLE_RESET_TIME,
+        ));
         provider.last_failure_reason = Some("upstream failed".to_string());
         provider.last_failure_at_ms = Some(1);
         let mut state = default_state();
@@ -13192,6 +13570,86 @@ multi_agent = false
             normalized.providers[0].consecutive_failure_count,
             AUTO_DISABLE_FAILURE_THRESHOLD
         );
+    }
+
+    #[test]
+    fn auto_disable_reset_cycles_follow_daily_weekly_and_monthly_boundaries() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
+
+        assert_eq!(
+            provider_cycle_for_date_and_time(
+                date,
+                8,
+                59,
+                AutoDisableResetPeriod::Daily,
+                1,
+                1,
+                "09:00",
+            ),
+            "2026-08-04"
+        );
+        assert_eq!(
+            provider_cycle_for_date_and_time(
+                date,
+                9,
+                0,
+                AutoDisableResetPeriod::Daily,
+                1,
+                1,
+                "09:00",
+            ),
+            "2026-08-05"
+        );
+        assert_eq!(
+            provider_cycle_for_date_and_time(
+                date,
+                8,
+                59,
+                AutoDisableResetPeriod::Weekly,
+                3,
+                1,
+                "09:00",
+            ),
+            "2026-07-29"
+        );
+        assert_eq!(
+            provider_cycle_for_date_and_time(
+                date,
+                9,
+                0,
+                AutoDisableResetPeriod::Weekly,
+                3,
+                1,
+                "09:00",
+            ),
+            "2026-08-05"
+        );
+        assert_eq!(
+            provider_cycle_for_date_and_time(
+                NaiveDate::from_ymd_opt(2026, 2, 28).unwrap(),
+                9,
+                0,
+                AutoDisableResetPeriod::Monthly,
+                1,
+                31,
+                "09:00",
+            ),
+            "2026-02-28"
+        );
+        assert_eq!(
+            provider_cycle_for_date_and_time(
+                date,
+                9,
+                0,
+                AutoDisableResetPeriod::Never,
+                1,
+                1,
+                "09:00",
+            ),
+            "never"
+        );
+        assert_eq!(normalize_auto_disable_reset_time("9:05"), "09:05");
+        assert_eq!(normalize_auto_disable_reset_time("25:00"), "00:00");
     }
 
     #[test]
@@ -13237,10 +13695,36 @@ multi_agent = false
     }
 
     #[test]
+    fn never_reset_provider_stays_auto_disabled() {
+        let mut provider = test_provider_config("provider-a", ProviderStatus::AutoDisabled, false);
+        provider.auto_disable_reset_period = AutoDisableResetPeriod::Never;
+        provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD;
+        provider.auto_disabled_day = Some("1900-01-01".to_string());
+        provider.last_failure_reason = Some("upstream failed".to_string());
+        provider.last_failure_at_ms = Some(1);
+        let mut state = default_state();
+        state.providers = vec![provider];
+
+        let normalized = normalize_state(state);
+
+        assert_eq!(normalized.providers[0].status, ProviderStatus::AutoDisabled);
+        assert!(!normalized.providers[0].enabled);
+        assert_eq!(
+            normalized.providers[0].consecutive_failure_count,
+            AUTO_DISABLE_FAILURE_THRESHOLD
+        );
+    }
+
+    #[test]
     fn provider_success_clears_auto_disabled_state() {
         let mut provider = test_provider_config("provider-a", ProviderStatus::AutoDisabled, false);
         provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD;
-        provider.auto_disabled_day = Some(provider_day_now());
+        provider.auto_disabled_day = Some(provider_cycle_now(
+            AutoDisableResetPeriod::Daily,
+            DEFAULT_AUTO_DISABLE_RESET_WEEKDAY,
+            DEFAULT_AUTO_DISABLE_RESET_DAY,
+            DEFAULT_AUTO_DISABLE_RESET_TIME,
+        ));
         provider.last_failure_reason = Some("upstream failed".to_string());
         provider.last_failure_at_ms = Some(1);
 
@@ -13734,6 +14218,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             enabled: true,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
+            auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+            auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+            auto_disable_reset_day: default_auto_disable_reset_day(),
+            auto_disable_reset_time: default_auto_disable_reset_time(),
             last_failure_reason: None,
             last_failure_at_ms: None,
             base_url: "https://api.anthropic.com".to_string(),
@@ -14232,6 +14720,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             enabled: true,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
+            auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+            auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+            auto_disable_reset_day: default_auto_disable_reset_day(),
+            auto_disable_reset_time: default_auto_disable_reset_time(),
             last_failure_reason: None,
             last_failure_at_ms: None,
             config: json!({
@@ -14416,6 +14908,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             enabled: true,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
+            auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+            auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+            auto_disable_reset_day: default_auto_disable_reset_day(),
+            auto_disable_reset_time: default_auto_disable_reset_time(),
             last_failure_reason: None,
             last_failure_at_ms: None,
             config: json!({}),
@@ -14549,6 +15045,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     enabled: true,
                     consecutive_failure_count: 0,
                     auto_disabled_day: None,
+                    auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+                    auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+                    auto_disable_reset_day: default_auto_disable_reset_day(),
+                    auto_disable_reset_time: default_auto_disable_reset_time(),
                     last_failure_reason: None,
                     last_failure_at_ms: None,
                     config: json!({}),
@@ -14577,6 +15077,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     enabled: true,
                     consecutive_failure_count: 0,
                     auto_disabled_day: None,
+                    auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+                    auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+                    auto_disable_reset_day: default_auto_disable_reset_day(),
+                    auto_disable_reset_time: default_auto_disable_reset_time(),
                     last_failure_reason: None,
                     last_failure_at_ms: None,
                     config: json!({}),
@@ -14610,6 +15114,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             enabled: true,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
+            auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+            auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+            auto_disable_reset_day: default_auto_disable_reset_day(),
+            auto_disable_reset_time: default_auto_disable_reset_time(),
             last_failure_reason: None,
             last_failure_at_ms: None,
             config: json!({}),
@@ -14646,6 +15154,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             enabled: true,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
+            auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+            auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+            auto_disable_reset_day: default_auto_disable_reset_day(),
+            auto_disable_reset_time: default_auto_disable_reset_time(),
             last_failure_reason: None,
             last_failure_at_ms: None,
             config: json!({}),
@@ -15482,6 +15994,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             enabled: true,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
+            auto_disable_reset_period: AutoDisableResetPeriod::Daily,
+            auto_disable_reset_weekday: default_auto_disable_reset_weekday(),
+            auto_disable_reset_day: default_auto_disable_reset_day(),
+            auto_disable_reset_time: default_auto_disable_reset_time(),
             last_failure_reason: None,
             last_failure_at_ms: None,
             base_url: "https://api.anthropic.com".to_string(),

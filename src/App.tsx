@@ -16,6 +16,7 @@ type NewApiBalanceTarget = "token_quota" | "account_balance";
 type BalanceAuthMode = "provider_token" | "separate_token";
 type ProviderWireApi = "responses" | "chat_completions";
 type ProviderStatus = "enabled" | "disabled" | "auto_disabled";
+type AutoDisableResetPeriod = "daily" | "weekly" | "monthly" | "never";
 type SlowMode = "off" | "fixed" | "random";
 
 type BalanceQueryConfig = {
@@ -166,6 +167,10 @@ type ProviderConfig = {
   enabled: boolean;
   consecutive_failure_count: number;
   auto_disabled_day?: string | null;
+  auto_disable_reset_period: AutoDisableResetPeriod;
+  auto_disable_reset_weekday: number;
+  auto_disable_reset_day: number;
+  auto_disable_reset_time: string;
   last_failure_reason?: string | null;
   last_failure_at_ms?: number | null;
   config: JsonValue;
@@ -186,6 +191,10 @@ type ClaudeProviderConfig = {
   enabled: boolean;
   consecutive_failure_count: number;
   auto_disabled_day?: string | null;
+  auto_disable_reset_period: AutoDisableResetPeriod;
+  auto_disable_reset_weekday: number;
+  auto_disable_reset_day: number;
+  auto_disable_reset_time: string;
   last_failure_reason?: string | null;
   last_failure_at_ms?: number | null;
   base_url: string;
@@ -203,6 +212,10 @@ type ProviderSummary = {
   enabled: boolean;
   consecutive_failure_count: number;
   auto_disabled_day?: string | null;
+  auto_disable_reset_period: AutoDisableResetPeriod;
+  auto_disable_reset_weekday: number;
+  auto_disable_reset_day: number;
+  auto_disable_reset_time: string;
   last_failure_reason?: string | null;
   last_failure_at_ms?: number | null;
   pending_changes: number;
@@ -1288,6 +1301,10 @@ function App() {
   const [providerApiKeyDirty, setProviderApiKeyDirty] = useState(false);
   const [providerEnabled, setProviderEnabled] = useState(true);
   const [providerEnabledDirty, setProviderEnabledDirty] = useState(false);
+  const [providerAutoDisableResetPeriod, setProviderAutoDisableResetPeriod] = useState<AutoDisableResetPeriod>("daily");
+  const [providerAutoDisableResetWeekday, setProviderAutoDisableResetWeekday] = useState(1);
+  const [providerAutoDisableResetDay, setProviderAutoDisableResetDay] = useState(1);
+  const [providerAutoDisableResetTime, setProviderAutoDisableResetTime] = useState("00:00");
   const [providerWireApi, setProviderWireApi] = useState<ProviderWireApi>("responses");
   const [providerFastMode, setProviderFastMode] = useState(false);
   const [providerTestModel, setProviderTestModel] = useState("");
@@ -1468,6 +1485,10 @@ function App() {
     setProviderApiKeyDirty(false);
     setProviderEnabled((summary?.status ?? targetFull.status) === "enabled");
     setProviderEnabledDirty(false);
+    setProviderAutoDisableResetPeriod(targetFull.auto_disable_reset_period ?? summary?.auto_disable_reset_period ?? "daily");
+    setProviderAutoDisableResetWeekday(targetFull.auto_disable_reset_weekday ?? summary?.auto_disable_reset_weekday ?? 1);
+    setProviderAutoDisableResetDay(targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1);
+    setProviderAutoDisableResetTime(targetFull.auto_disable_reset_time ?? summary?.auto_disable_reset_time ?? "00:00");
     setProviderWireApi(targetFull.wire_api ?? "responses");
     setProviderFastMode(targetFull.service_tier?.trim().toLowerCase() === "priority");
     setProviderTestModel(targetFull.connection_test_model ?? "");
@@ -1497,6 +1518,10 @@ function App() {
     setProviderApiKeyDirty(false);
     setProviderEnabled((summary?.status ?? targetFull.status) === "enabled");
     setProviderEnabledDirty(false);
+    setProviderAutoDisableResetPeriod(targetFull.auto_disable_reset_period ?? summary?.auto_disable_reset_period ?? "daily");
+    setProviderAutoDisableResetWeekday(targetFull.auto_disable_reset_weekday ?? summary?.auto_disable_reset_weekday ?? 1);
+    setProviderAutoDisableResetDay(targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1);
+    setProviderAutoDisableResetTime(targetFull.auto_disable_reset_time ?? summary?.auto_disable_reset_time ?? "00:00");
     setProviderTestModel(targetFull.connection_test_model ?? "");
     setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
     setAllowedModels(targetFull.allowed_models ?? []);
@@ -1574,6 +1599,10 @@ function App() {
         base_url: providerBaseUrl,
         wire_api: providerWireApi,
         service_tier: providerFastMode ? "priority" : "",
+        auto_disable_reset_period: providerAutoDisableResetPeriod,
+        auto_disable_reset_weekday: providerAutoDisableResetWeekday,
+        auto_disable_reset_day: providerAutoDisableResetDay,
+        auto_disable_reset_time: providerAutoDisableResetTime,
         balance_query: nextBalance,
         balance_status: balanceTestStatus,
         connection_test_model: providerTestModel,
@@ -1600,6 +1629,10 @@ function App() {
       const payload: Record<string, unknown> = {
         provider_id: editingId,
         provider_name: providerName,
+        auto_disable_reset_period: providerAutoDisableResetPeriod,
+        auto_disable_reset_weekday: providerAutoDisableResetWeekday,
+        auto_disable_reset_day: providerAutoDisableResetDay,
+        auto_disable_reset_time: providerAutoDisableResetTime,
         base_url: providerBaseUrl,
         connection_test_model: providerTestModel,
         allowed_models: allowedModels,
@@ -2371,6 +2404,10 @@ function App() {
           providerBaseUrl={providerBaseUrl}
           providerModels={providerModels}
           providerName={providerName}
+          providerAutoDisableResetPeriod={providerAutoDisableResetPeriod}
+          providerAutoDisableResetWeekday={providerAutoDisableResetWeekday}
+          providerAutoDisableResetDay={providerAutoDisableResetDay}
+          providerAutoDisableResetTime={providerAutoDisableResetTime}
           providerFastMode={providerFastMode}
           providerWireApi={providerWireApi}
           secretVisible={secretVisible}
@@ -2392,6 +2429,10 @@ function App() {
           setAllowedModels={setAllowedModels}
           setModelMappings={setModelMappings}
           setProviderName={setProviderName}
+          setProviderAutoDisableResetPeriod={setProviderAutoDisableResetPeriod}
+          setProviderAutoDisableResetWeekday={setProviderAutoDisableResetWeekday}
+          setProviderAutoDisableResetDay={setProviderAutoDisableResetDay}
+          setProviderAutoDisableResetTime={setProviderAutoDisableResetTime}
           setProviderFastMode={setProviderFastMode}
           setProviderWireApi={setProviderWireApi}
           setSecretVisible={setSecretVisible}
@@ -2411,6 +2452,10 @@ function App() {
           providerBaseUrl={providerBaseUrl}
           providerModels={providerModels}
           providerName={providerName}
+          providerAutoDisableResetPeriod={providerAutoDisableResetPeriod}
+          providerAutoDisableResetWeekday={providerAutoDisableResetWeekday}
+          providerAutoDisableResetDay={providerAutoDisableResetDay}
+          providerAutoDisableResetTime={providerAutoDisableResetTime}
           secretVisible={secretVisible}
           setAllowedModels={setAllowedModels}
           setModelMappings={setModelMappings}
@@ -2427,6 +2472,10 @@ function App() {
             setProviderTestModel("");
           }}
           setProviderName={setProviderName}
+          setProviderAutoDisableResetPeriod={setProviderAutoDisableResetPeriod}
+          setProviderAutoDisableResetWeekday={setProviderAutoDisableResetWeekday}
+          setProviderAutoDisableResetDay={setProviderAutoDisableResetDay}
+          setProviderAutoDisableResetTime={setProviderAutoDisableResetTime}
           setSecretVisible={setSecretVisible}
         />
       )}
@@ -4484,6 +4533,65 @@ function ProvidersScreen({
   );
 }
 
+function AutoDisableResetFields(props: {
+  period: AutoDisableResetPeriod;
+  resetDay: number;
+  resetTime: string;
+  resetWeekday: number;
+  setPeriod: (value: AutoDisableResetPeriod) => void;
+  setResetDay: (value: number) => void;
+  setResetTime: (value: string) => void;
+  setResetWeekday: (value: number) => void;
+}) {
+  const { period, resetDay, resetTime, resetWeekday, setPeriod, setResetDay, setResetTime, setResetWeekday } = props;
+  return (
+    <>
+      <label className="field">
+        <span>额度刷新周期</span>
+        <select value={period} onChange={(event) => setPeriod(event.currentTarget.value as AutoDisableResetPeriod)}>
+          <option value="daily">每天</option>
+          <option value="weekly">每周</option>
+          <option value="monthly">每月</option>
+          <option value="never">不刷新</option>
+        </select>
+      </label>
+      {period === "weekly" && (
+        <label className="field">
+          <span>每周刷新日</span>
+          <select value={resetWeekday} onChange={(event) => setResetWeekday(Number(event.currentTarget.value))}>
+            <option value={1}>星期一</option>
+            <option value={2}>星期二</option>
+            <option value={3}>星期三</option>
+            <option value={4}>星期四</option>
+            <option value={5}>星期五</option>
+            <option value={6}>星期六</option>
+            <option value={7}>星期日</option>
+          </select>
+        </label>
+      )}
+      {period === "monthly" && (
+        <label className="field">
+          <span>每月刷新日</span>
+          <input
+            max={31}
+            min={1}
+            type="number"
+            value={resetDay}
+            onChange={(event) => setResetDay(Math.min(31, Math.max(1, Number(event.currentTarget.value) || 1)))}
+          />
+          <small>短月份按当月最后一天刷新</small>
+        </label>
+      )}
+      {period !== "never" && (
+        <label className="field">
+          <span>刷新时间</span>
+          <input type="time" value={resetTime} onChange={(event) => setResetTime(event.currentTarget.value)} />
+        </label>
+      )}
+    </>
+  );
+}
+
 function ProviderEditor(props: {
   allowedModels: string[];
   balanceAccountOptions: AiGateBalanceAccount[];
@@ -4504,6 +4612,10 @@ function ProviderEditor(props: {
   providerBaseUrl: string;
   providerModels: string[];
   providerName: string;
+  providerAutoDisableResetPeriod: AutoDisableResetPeriod;
+  providerAutoDisableResetWeekday: number;
+  providerAutoDisableResetDay: number;
+  providerAutoDisableResetTime: string;
   providerFastMode: boolean;
   providerWireApi: ProviderWireApi;
   secretVisible: boolean;
@@ -4513,6 +4625,10 @@ function ProviderEditor(props: {
   setProviderBaseUrl: (value: string) => void;
   setModelMappings: (mappings: ModelMapping[]) => void;
   setProviderName: (value: string) => void;
+  setProviderAutoDisableResetPeriod: (value: AutoDisableResetPeriod) => void;
+  setProviderAutoDisableResetWeekday: (value: number) => void;
+  setProviderAutoDisableResetDay: (value: number) => void;
+  setProviderAutoDisableResetTime: (value: string) => void;
   setProviderFastMode: (value: boolean) => void;
   setProviderWireApi: (value: ProviderWireApi) => void;
   setSecretVisible: (value: boolean) => void;
@@ -4538,6 +4654,10 @@ function ProviderEditor(props: {
     providerBaseUrl,
     providerModels,
     providerName,
+    providerAutoDisableResetPeriod,
+    providerAutoDisableResetWeekday,
+    providerAutoDisableResetDay,
+    providerAutoDisableResetTime,
     providerFastMode,
     providerWireApi,
     secretVisible,
@@ -4547,6 +4667,10 @@ function ProviderEditor(props: {
     setProviderBaseUrl,
     setModelMappings,
     setProviderName,
+    setProviderAutoDisableResetPeriod,
+    setProviderAutoDisableResetWeekday,
+    setProviderAutoDisableResetDay,
+    setProviderAutoDisableResetTime,
     setProviderFastMode,
     setProviderWireApi,
     setSecretVisible,
@@ -4637,6 +4761,16 @@ function ProviderEditor(props: {
                 </select>
                 <small>上游不支持 Responses API 时选择 Chat Completions 兼容模式</small>
               </label>
+              <AutoDisableResetFields
+                period={providerAutoDisableResetPeriod}
+                resetDay={providerAutoDisableResetDay}
+                resetTime={providerAutoDisableResetTime}
+                resetWeekday={providerAutoDisableResetWeekday}
+                setPeriod={setProviderAutoDisableResetPeriod}
+                setResetDay={setProviderAutoDisableResetDay}
+                setResetTime={setProviderAutoDisableResetTime}
+                setResetWeekday={setProviderAutoDisableResetWeekday}
+              />
               <div className="provider-fast-mode-row">
                 <strong>强制启用 Fast 模式</strong>
                 <Toggle
@@ -4986,6 +5120,10 @@ function ClaudeProviderEditor(props: {
   providerBaseUrl: string;
   providerModels: string[];
   providerName: string;
+  providerAutoDisableResetPeriod: AutoDisableResetPeriod;
+  providerAutoDisableResetWeekday: number;
+  providerAutoDisableResetDay: number;
+  providerAutoDisableResetTime: string;
   secretVisible: boolean;
   setAllowedModels: (models: string[]) => void;
   setModelMappings: (mappings: ModelMapping[]) => void;
@@ -4993,6 +5131,10 @@ function ClaudeProviderEditor(props: {
   setProviderApiKeyDirty: (dirty: boolean) => void;
   setProviderBaseUrl: (value: string) => void;
   setProviderName: (value: string) => void;
+  setProviderAutoDisableResetPeriod: (value: AutoDisableResetPeriod) => void;
+  setProviderAutoDisableResetWeekday: (value: number) => void;
+  setProviderAutoDisableResetDay: (value: number) => void;
+  setProviderAutoDisableResetTime: (value: string) => void;
   setSecretVisible: (value: boolean) => void;
 }) {
   const {
@@ -5007,6 +5149,10 @@ function ClaudeProviderEditor(props: {
     providerBaseUrl,
     providerModels,
     providerName,
+    providerAutoDisableResetPeriod,
+    providerAutoDisableResetWeekday,
+    providerAutoDisableResetDay,
+    providerAutoDisableResetTime,
     secretVisible,
     setAllowedModels,
     setModelMappings,
@@ -5014,6 +5160,10 @@ function ClaudeProviderEditor(props: {
     setProviderApiKeyDirty,
     setProviderBaseUrl,
     setProviderName,
+    setProviderAutoDisableResetPeriod,
+    setProviderAutoDisableResetWeekday,
+    setProviderAutoDisableResetDay,
+    setProviderAutoDisableResetTime,
     setSecretVisible,
   } = props;
   const [customAllowedModel, setCustomAllowedModel] = useState("");
@@ -5082,6 +5232,16 @@ function ClaudeProviderEditor(props: {
               </button>
             </div>
           </label>
+          <AutoDisableResetFields
+            period={providerAutoDisableResetPeriod}
+            resetDay={providerAutoDisableResetDay}
+            resetTime={providerAutoDisableResetTime}
+            resetWeekday={providerAutoDisableResetWeekday}
+            setPeriod={setProviderAutoDisableResetPeriod}
+            setResetDay={setProviderAutoDisableResetDay}
+            setResetTime={setProviderAutoDisableResetTime}
+            setResetWeekday={setProviderAutoDisableResetWeekday}
+          />
           <section className="model-config-intro compact">
             <div>
               <span className="section-kicker">模型来源</span>
