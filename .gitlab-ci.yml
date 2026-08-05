@@ -8,7 +8,11 @@ default:
 
 .docker-runner:
   tags:
+    - us
     - docker
+    - internet
+    - aws
+    - c6i-large
 
 .macos-runner:
   resource_group: xxswitch-macos-shell
