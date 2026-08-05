@@ -52,15 +52,27 @@ jobs:
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Checkout release source
+        if: steps.release.outputs.publish == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Extract release notes
+        if: steps.release.outputs.publish == 'true'
+        run: node scripts/extract-release-notes.mjs "${{ steps.release.outputs.tag }}" release-notes.md
+
       - name: Create or find GitHub Release
         id: github-release
         if: steps.release.outputs.publish == 'true'
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
             const tag = '${{ steps.release.outputs.tag }}';
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const body = fs.readFileSync('release-notes.md', 'utf8');
             let release;
 
             try {
@@ -76,12 +88,20 @@ jobs:
                 repo,
                 tag_name: tag,
                 name: tag,
-                body: 'See the assets below to download and install this version.',
+                body,
                 draft: false,
                 prerelease: false,
-                generate_release_notes: true,
               });
               release = created.data;
+            } else {
+              const updated = await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: release.id,
+                name: tag,
+                body,
+              });
+              release = updated.data;
             }
 
             const assets = await github.paginate(github.rest.repos.listReleaseAssets, {

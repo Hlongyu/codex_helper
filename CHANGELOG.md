@@ -1,5 +1,19 @@
 # 更新记录
 
+## v1.2.17 - 2026-08-05
+
+### CI/CD
+
+- 增加 GitLab CI 发布流程，推送 `v*` 标签时同时构建 Windows NSIS 与 macOS Universal DMG，并创建 GitLab Release。
+- GitLab macOS 构建固定使用带 Node、Rust、Xcode 与 Developer ID Application 签名身份的 M1 Shell Runner。
+- macOS Shell 作业通过资源组串行执行，避免共享工作区并发导致 Git shallow metadata 冲突。
+- Linux 容器作业固定使用 Docker Autoscaler Runner，避免带 `docker` 标签的 Shell Runner 忽略容器镜像。
+
+### 发布
+
+- GitHub Release 与 GitLab Release 统一从本文件提取对应版本的更新说明。
+- 本地 `origin` 已配置同时推送 GitHub 与 GitLab，分支和新版本标签可一次同步到两个平台。
+
 ## v1.2.16 - 2026-08-05
 
 ### 新增
