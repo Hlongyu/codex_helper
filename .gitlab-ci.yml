@@ -52,9 +52,8 @@ frontend:build:
       - dist/
 
 backend:test:
-  extends: .docker-runner
+  extends: .macos-runner
   stage: verify
-  image: rust:1.96-bookworm
   cache:
     key:
       files:
@@ -63,17 +62,6 @@ backend:test:
       - .cargo/registry/
       - .cargo/git/
       - src-tauri/target/
-  before_script:
-    - apt-get update
-    - >-
-      DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends
-      build-essential
-      libayatana-appindicator3-dev
-      librsvg2-dev
-      libssl-dev
-      libwebkit2gtk-4.1-dev
-      libxdo-dev
-      pkg-config
   script:
     - cargo test --locked --manifest-path src-tauri/Cargo.toml
 
