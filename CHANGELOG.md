@@ -1,5 +1,18 @@
 # 更新记录
 
+## v1.2.24 - 2026-08-05
+
+### 新增
+
+- Codex 路由页面增加默认模型选择器，可从当前可路由模型中选择并写入 Codex 顶层 `model` 配置。
+- Codex 接管会备份并恢复用户原有的 `model` 字段，升级旧版接管备份时也会保留当前选择。
+
+### 兼容与行为
+
+- capability 模型目录改为仅以当前 Codex CLI 的 bundled 模型为基准，官方模型条目保持原样，不再从 `models_cache.json` 读取或覆盖能力字段。
+- `deepseek-v4-flash` 使用 DeepSeek 官方 capability 描述，并复用 bundled `gpt-5.6-sol` 的完整提示词。
+- GLM 等未知模型仍可作为默认路由模型写入 `model`，但不会生成虚假的 capability 条目，由 Codex 使用未知模型兼容逻辑。
+
 ## v1.2.22 - 2026-08-05
 
 ### 修复
