@@ -60,6 +60,7 @@ type RouterConfig = {
   debug_mode: boolean;
   force_disable_openai_auth: boolean;
   remote_compaction_enabled: boolean;
+  gpt56_long_context_enabled: boolean;
   model_provider: string;
   codex_model: string;
   host: string;
@@ -476,6 +477,7 @@ function defaultRouterConfig(): RouterConfig {
     debug_mode: false,
     force_disable_openai_auth: false,
     remote_compaction_enabled: false,
+    gpt56_long_context_enabled: false,
     model_provider: "custom",
     codex_model: "",
     host: "127.0.0.1",
@@ -2885,6 +2887,20 @@ function RouteScreen({
               disabled={busy}
               onChange={(remote_compaction_enabled) =>
                 setRouterDraft({ ...routerDraft, remote_compaction_enabled })
+              }
+            />
+          </div>
+          <div className="route-toggle-line">
+            <div>
+              <strong>GPT-5.6 长上下文</strong>
+              <p>将 Sol、Terra 和 Luna 的窗口从 272K 提升到 372K，有效上下文约 353K。</p>
+            </div>
+            <Toggle
+              checked={routerDraft.gpt56_long_context_enabled}
+              disabled={busy}
+              label="启用 GPT-5.6 长上下文"
+              onChange={(gpt56_long_context_enabled) =>
+                setRouterDraft({ ...routerDraft, gpt56_long_context_enabled })
               }
             />
           </div>

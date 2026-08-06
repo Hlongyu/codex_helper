@@ -1,5 +1,18 @@
 # 更新记录
 
+## v1.2.25 - 2026-08-06
+
+### 新增
+
+- Codex 路由增加 GPT-5.6 长上下文开关，可将 Sol、Terra 和 Luna 的上下文窗口提升至 372K，有效上下文约 353K。
+- 内置 Codex CLI `0.146.1` 的完整 bundled 模型目录；未安装 Codex、检测到旧版本或外部目录无效时自动使用内置基线。
+- 增加 `npm run catalog:update`，用于从当前 Codex CLI 更新内置 bundled 模型目录及版本基线。
+
+### 修复
+
+- capability 模型条目缺少 `supports_reasoning_summaries` 时自动补齐默认值，避免 Codex 拒绝加载 `model_catalog_json`。
+- 外部 Codex bundled 目录缺少 `gpt-5.6-sol` 时回退到内置目录，确保可以生成 DeepSeek-V4-Flash capability。
+
 ## v1.2.24 - 2026-08-05
 
 ### 新增

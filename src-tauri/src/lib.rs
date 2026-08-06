@@ -62,6 +62,9 @@ const SLOW_HEARTBEAT: &[u8] = b": slow-mode keep-alive\n\n";
 const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DEBUG_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
+const GPT56_LONG_CONTEXT_WINDOW: i64 = 372_000;
+const EMBEDDED_CODEX_MODEL_CATALOG_VERSION: &str = "0.146.1";
+const EMBEDDED_CODEX_MODEL_CATALOG_JSON: &str = include_str!("catalogs/codex-models.json");
 const CODEX_ROUTER_MODEL_CATALOG: &str = "config-manager/router-models.json";
 const ROUTER_BACKUP_SCHEMA_VERSION: u8 = 2;
 const PI_PROVIDER_ID: &str = "xxswitch";
@@ -335,6 +338,8 @@ struct RouterConfig {
     force_disable_openai_auth: bool,
     #[serde(default)]
     remote_compaction_enabled: bool,
+    #[serde(default)]
+    gpt56_long_context_enabled: bool,
     #[serde(default = "default_router_model_provider")]
     model_provider: String,
     #[serde(default)]
@@ -523,6 +528,7 @@ impl Default for RouterConfig {
             debug_mode: false,
             force_disable_openai_auth: false,
             remote_compaction_enabled: false,
+            gpt56_long_context_enabled: false,
             model_provider: default_router_model_provider(),
             codex_model: String::new(),
             host: default_router_host(),
@@ -878,6 +884,8 @@ struct SaveRouterPayload {
     force_disable_openai_auth: bool,
     #[serde(default)]
     remote_compaction_enabled: bool,
+    #[serde(default)]
+    gpt56_long_context_enabled: bool,
     #[serde(default = "default_router_model_provider")]
     model_provider: String,
     #[serde(default)]
@@ -5815,7 +5823,10 @@ fn codex_catalog_models_for_state(state: &ManagerState) -> Vec<String> {
 
 fn ensure_codex_model_catalog_applied(state: &ManagerState) -> Result<bool, String> {
     let path = codex_router_model_catalog_path()?;
-    let desired = codex_models_catalog_value(codex_catalog_models_for_state(state))?;
+    let desired = codex_models_catalog_value(
+        codex_catalog_models_for_state(state),
+        state.router.gpt56_long_context_enabled,
+    )?;
     if path.exists() {
         let current = fs::read_to_string(&path)
             .ok()
@@ -6345,26 +6356,82 @@ fn codex_cli_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+fn parse_codex_cli_version_output(output: &[u8]) -> Option<Version> {
+    std::str::from_utf8(output)
+        .ok()?
+        .split_whitespace()
+        .rev()
+        .find_map(|value| Version::parse(value.trim_start_matches('v')).ok())
+}
+
+fn codex_cli_version(candidate: &Path) -> Option<Version> {
+    let output = background_command(candidate)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_codex_cli_version_output(&output.stdout)
+}
+
+fn catalog_has_deepseek_base_model(templates: &[Value]) -> bool {
+    templates.iter().any(|entry| {
+        entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| slug.eq_ignore_ascii_case("gpt-5.6-sol"))
+    })
+}
+
+fn embedded_codex_model_catalog_templates() -> Vec<Value> {
+    let value = serde_json::from_str::<Value>(EMBEDDED_CODEX_MODEL_CATALOG_JSON)
+        .expect("embedded Codex model catalog must be valid JSON");
+    let templates = codex_model_catalog_templates_from_value(&value);
+    assert!(
+        catalog_has_deepseek_base_model(&templates),
+        "embedded Codex model catalog must contain gpt-5.6-sol"
+    );
+    templates
+}
+
+fn external_codex_catalog_is_eligible(version: &Version, templates: &[Value]) -> bool {
+    let embedded_version = Version::parse(EMBEDDED_CODEX_MODEL_CATALOG_VERSION)
+        .expect("embedded Codex model catalog version must be valid semver");
+    version >= &embedded_version && catalog_has_deepseek_base_model(templates)
+}
+
 fn load_bundled_codex_model_catalog_templates() -> Vec<Value> {
+    let embedded = embedded_codex_model_catalog_templates();
     for candidate in codex_cli_candidates() {
-        let Ok(output) = background_command(candidate)
+        let Some(version) = codex_cli_version(&candidate) else {
+            continue;
+        };
+        if version
+            < Version::parse(EMBEDDED_CODEX_MODEL_CATALOG_VERSION)
+                .expect("embedded Codex model catalog version must be valid semver")
+        {
+            return embedded;
+        }
+        let Ok(output) = background_command(&candidate)
             .args(["debug", "models", "--bundled"])
             .output()
         else {
-            continue;
+            return embedded;
         };
         if !output.status.success() {
-            continue;
+            return embedded;
         }
         let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
-            continue;
+            return embedded;
         };
         let templates = codex_model_catalog_templates_from_value(&value);
-        if !templates.is_empty() {
+        if external_codex_catalog_is_eligible(&version, &templates) {
             return templates;
         }
+        return embedded;
     }
-    Vec::new()
+    embedded
 }
 
 fn load_codex_model_catalog_templates() -> Vec<Value> {
@@ -6461,7 +6528,7 @@ fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Result<Option<
         return deepseek_v4_flash_catalog_entry(templates).map(Some);
     }
 
-    Ok(templates
+    let mut entry = templates
         .iter()
         .find(|entry| {
             entry
@@ -6469,25 +6536,78 @@ fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Result<Option<
                 .and_then(Value::as_str)
                 .is_some_and(|slug| slug.eq_ignore_ascii_case(model.trim()))
         })
-        .cloned())
+        .cloned();
+    if let Some(object) = entry.as_mut().and_then(Value::as_object_mut) {
+        object
+            .entry("supports_reasoning_summaries".to_string())
+            .or_insert(Value::Bool(false));
+    }
+    Ok(entry)
 }
 
+#[cfg(test)]
 fn codex_models_catalog_value_with_templates(
     models: Vec<String>,
     templates: &[Value],
 ) -> Result<Value, String> {
+    codex_models_catalog_value_with_templates_and_context(models, templates, false)
+}
+
+fn codex_models_catalog_value_with_templates_and_context(
+    models: Vec<String>,
+    templates: &[Value],
+    gpt56_long_context_enabled: bool,
+) -> Result<Value, String> {
     let mut catalog_models = Vec::new();
     for model in models {
-        if let Some(entry) = codex_model_catalog_entry(&model, templates)? {
+        if let Some(mut entry) = codex_model_catalog_entry(&model, templates)? {
+            apply_gpt56_long_context(&mut entry, gpt56_long_context_enabled);
             catalog_models.push(entry);
         }
     }
     Ok(json!({ "models": catalog_models }))
 }
 
-fn codex_models_catalog_value(models: Vec<String>) -> Result<Value, String> {
+fn apply_gpt56_long_context(entry: &mut Value, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    let is_gpt56 = object
+        .get("slug")
+        .and_then(Value::as_str)
+        .is_some_and(|slug| {
+            matches!(
+                slug.to_ascii_lowercase().as_str(),
+                "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+            )
+        });
+    if !is_gpt56 {
+        return;
+    }
+    object.insert(
+        "context_window".to_string(),
+        Value::from(GPT56_LONG_CONTEXT_WINDOW),
+    );
+    object.insert(
+        "max_context_window".to_string(),
+        Value::from(GPT56_LONG_CONTEXT_WINDOW),
+    );
+    object.insert("auto_compact_token_limit".to_string(), Value::Null);
+}
+
+fn codex_models_catalog_value(
+    models: Vec<String>,
+    gpt56_long_context_enabled: bool,
+) -> Result<Value, String> {
     let templates = load_codex_model_catalog_templates();
-    codex_models_catalog_value_with_templates(models, &templates)
+    codex_models_catalog_value_with_templates_and_context(
+        models,
+        &templates,
+        gpt56_long_context_enabled,
+    )
 }
 
 fn json_response(value: Value) -> Response {
@@ -6502,8 +6622,8 @@ fn models_response(models: Vec<String>) -> Response {
     json_response(openai_models_value(models))
 }
 
-fn codex_models_response(models: Vec<String>) -> Response {
-    match codex_models_catalog_value(models) {
+fn codex_models_response(models: Vec<String>, gpt56_long_context_enabled: bool) -> Response {
+    match codex_models_catalog_value(models, gpt56_long_context_enabled) {
         Ok(value) => json_response(value),
         Err(err) => proxy_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
@@ -9939,7 +10059,7 @@ async fn proxy_request_now(
         let models = configured_route_models(&candidates);
         if !models.is_empty() {
             return if codex_model_catalog_requested(uri.query()) {
-                codex_models_response(models)
+                codex_models_response(models, router.gpt56_long_context_enabled)
             } else {
                 models_response(models)
             };
@@ -12388,6 +12508,7 @@ fn save_router_config(
         debug_mode: payload.debug_mode,
         force_disable_openai_auth: payload.force_disable_openai_auth,
         remote_compaction_enabled: payload.remote_compaction_enabled,
+        gpt56_long_context_enabled: payload.gpt56_long_context_enabled,
         model_provider,
         codex_model,
         host: if host.is_empty() {
@@ -13180,6 +13301,7 @@ mod tests {
         assert_eq!(router.slow_delay_max_secs, 0);
         assert!(!router.debug_mode);
         assert!(!router.force_disable_openai_auth);
+        assert!(!router.gpt56_long_context_enabled);
     }
 
     #[test]
@@ -16195,7 +16317,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
-    fn codex_catalog_preserves_bundled_entries_exactly() {
+    fn codex_catalog_fills_required_bundled_defaults() {
         let template = json!({
             "slug": "gpt-5.6-sol",
             "display_name": "GPT-5.6-Sol",
@@ -16214,7 +16336,87 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         )
         .expect("bundled catalog");
 
-        assert_eq!(catalog.pointer("/models/0"), Some(&template));
+        let mut expected = template;
+        expected["supports_reasoning_summaries"] = Value::Bool(false);
+        assert_eq!(catalog.pointer("/models/0"), Some(&expected));
+
+        let template_with_summaries = json!({
+            "slug": "gpt-5.6-terra",
+            "supports_reasoning_summaries": true
+        });
+        let catalog = codex_models_catalog_value_with_templates(
+            vec!["gpt-5.6-terra".to_string()],
+            &[template_with_summaries],
+        )
+        .expect("bundled catalog with summaries");
+        assert_eq!(
+            catalog
+                .pointer("/models/0/supports_reasoning_summaries")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn codex_catalog_expands_gpt56_context_when_enabled() {
+        let templates = [
+            json!({
+                "slug": "gpt-5.6-sol",
+                "context_window": 272_000,
+                "max_context_window": 272_000,
+                "auto_compact_token_limit": 244_800
+            }),
+            json!({
+                "slug": "gpt-5.6-terra",
+                "context_window": 272_000,
+                "max_context_window": 272_000
+            }),
+            json!({
+                "slug": "gpt-5.6-luna",
+                "context_window": 272_000,
+                "max_context_window": 272_000
+            }),
+            json!({
+                "slug": "gpt-5.5",
+                "context_window": 272_000,
+                "max_context_window": 272_000
+            }),
+        ];
+        let catalog = codex_models_catalog_value_with_templates_and_context(
+            vec![
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "gpt-5.6-luna".to_string(),
+                "gpt-5.5".to_string(),
+            ],
+            &templates,
+            true,
+        )
+        .expect("long-context catalog");
+        let models = catalog
+            .get("models")
+            .and_then(Value::as_array)
+            .expect("catalog models");
+
+        for model in &models[..3] {
+            assert_eq!(
+                model.get("context_window").and_then(Value::as_i64),
+                Some(GPT56_LONG_CONTEXT_WINDOW)
+            );
+            assert_eq!(
+                model.get("max_context_window").and_then(Value::as_i64),
+                Some(GPT56_LONG_CONTEXT_WINDOW)
+            );
+            assert_eq!(model.get("auto_compact_token_limit"), Some(&Value::Null));
+        }
+        assert_eq!(
+            models[3].get("context_window").and_then(Value::as_i64),
+            Some(272_000)
+        );
+        assert_eq!(
+            models[3].get("max_context_window").and_then(Value::as_i64),
+            Some(272_000)
+        );
     }
 
     #[test]
@@ -16328,7 +16530,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         )
         .expect("catalog");
 
-        assert_eq!(catalog.pointer("/models/0"), Some(&official));
+        let mut expected = official;
+        expected["supports_reasoning_summaries"] = Value::Bool(false);
+        assert_eq!(catalog.pointer("/models/0"), Some(&expected));
         assert_eq!(
             catalog
                 .get("models")
@@ -16347,6 +16551,50 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         .expect_err("DeepSeek profile must not use a fabricated fallback");
 
         assert!(err.contains("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn parses_codex_cli_semver_output() {
+        assert_eq!(
+            parse_codex_cli_version_output(b"codex-cli 0.146.1\n"),
+            Some(Version::new(0, 146, 1))
+        );
+        assert_eq!(
+            parse_codex_cli_version_output(b"codex-cli v0.147.0-beta.1\n"),
+            Version::parse("0.147.0-beta.1").ok()
+        );
+        assert_eq!(parse_codex_cli_version_output(b"not-codex\n"), None);
+    }
+
+    #[test]
+    fn embedded_codex_catalog_contains_deepseek_base_model() {
+        let templates = embedded_codex_model_catalog_templates();
+        assert_eq!(templates.len(), 8);
+        let sol = templates
+            .iter()
+            .find(|entry| entry.get("slug").and_then(Value::as_str) == Some("gpt-5.6-sol"))
+            .expect("embedded gpt-5.6-sol");
+        assert!(sol
+            .get("base_instructions")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() > 1_000));
+    }
+
+    #[test]
+    fn external_codex_catalog_requires_current_version_and_sol() {
+        let templates = vec![json!({ "slug": "gpt-5.6-sol" })];
+        assert!(!external_codex_catalog_is_eligible(
+            &Version::new(0, 146, 0),
+            &templates
+        ));
+        assert!(external_codex_catalog_is_eligible(
+            &Version::new(0, 146, 1),
+            &templates
+        ));
+        assert!(!external_codex_catalog_is_eligible(
+            &Version::new(0, 147, 0),
+            &[json!({ "slug": "gpt-5.6-terra" })]
+        ));
     }
 
     #[test]

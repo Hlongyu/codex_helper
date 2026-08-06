@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "catalog:update": "node scripts/update-codex-bundled-catalog.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
