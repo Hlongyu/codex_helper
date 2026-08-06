@@ -4361,6 +4361,113 @@ fn claude_route_model_values(
     models
 }
 
+/// Claude Code 不读 `/v1/models` 里的任何容量字段（响应 schema 只保留 `id` 和
+/// `display_name`），也不向上游查询上下文大小：它唯一的判定是模型名里有没有
+/// `[1m]` 后缀，命中就把上下文窗口按 1_000_000 处理。因此这里为官方默认 1M
+/// 上下文的模型额外合成一个 `<id>[1m]` 条目，让用户能在 `/model` 里选到。
+///
+/// 只收录「默认即 1M、无需 beta 头」的模型。Sonnet 4.5 / Sonnet 4 默认 200K，
+/// 只有加 `context-1m-2025-08-07` beta 且账号 tier 达标才到 1M，第三方中转多半
+/// 不认，误报会让 Claude Code 以为有 1M 而静默截断，故不收录。
+///
+/// 官方发布新模型后在此追加即可。
+const CLAUDE_LONG_CONTEXT_MODELS: &[&str] = &[
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+];
+
+const CLAUDE_LONG_CONTEXT_SUFFIX: &str = "[1m]";
+
+/// 去掉模型名末尾的 `[1m]` 后缀（大小写不敏感，与 Claude Code 的 `/\[1m\]/i` 一致）。
+fn strip_claude_long_context_suffix(model: &str) -> &str {
+    let trimmed = model.trim();
+    let Some(cut) = trimmed.len().checked_sub(CLAUDE_LONG_CONTEXT_SUFFIX.len()) else {
+        return trimmed;
+    };
+    if !trimmed.is_char_boundary(cut) {
+        return trimmed;
+    }
+    if trimmed[cut..].eq_ignore_ascii_case(CLAUDE_LONG_CONTEXT_SUFFIX) {
+        trimmed[..cut].trim_end()
+    } else {
+        trimmed
+    }
+}
+
+/// 归一化成用于查表的基础模型名：去掉 `[1m]` 后缀和 `-YYYYMMDD` 日期后缀。
+fn claude_model_base_id(model: &str) -> String {
+    let model = strip_claude_long_context_suffix(model).to_ascii_lowercase();
+    match model.rsplit_once('-') {
+        Some((prefix, tail))
+            if tail.len() == 8 && tail.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            prefix.to_string()
+        }
+        _ => model,
+    }
+}
+
+fn claude_model_supports_long_context(model: &str) -> bool {
+    let base = claude_model_base_id(model);
+    CLAUDE_LONG_CONTEXT_MODELS
+        .iter()
+        .any(|known| base == *known)
+}
+
+/// 为命中 1M 清单的上游模型合成一个 `<id>[1m]` 条目，紧跟在原条目之后。
+/// 原条目保留：其它 Claude 客户端不认 `[1m]`，裸 id 仍需可见。
+fn with_claude_long_context_variants(models: Vec<Value>) -> Vec<Value> {
+    let mut seen = models
+        .iter()
+        .filter_map(model_id_from_value)
+        .map(|id| id.to_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut expanded = Vec::with_capacity(models.len());
+    for model in models {
+        let variant = claude_long_context_variant(&model, &mut seen);
+        expanded.push(model);
+        if let Some(variant) = variant {
+            expanded.push(variant);
+        }
+    }
+    expanded
+}
+
+fn claude_long_context_variant(model: &Value, seen: &mut BTreeSet<String>) -> Option<Value> {
+    let id = model_id_from_value(model)?;
+    if !claude_model_supports_long_context(&id) {
+        return None;
+    }
+    // 上游自己就带 `[1m]` 后缀时不再合成。
+    if strip_claude_long_context_suffix(&id).len() != id.trim().len() {
+        return None;
+    }
+    let variant_id = format!("{id}{CLAUDE_LONG_CONTEXT_SUFFIX}");
+    if !seen.insert(variant_id.to_lowercase()) {
+        return None;
+    }
+    let mut variant = model.clone();
+    let object = variant.as_object_mut()?;
+    let display_name = object
+        .get("display_name")
+        .and_then(Value::as_str)
+        .unwrap_or(id.as_str())
+        .to_string();
+    object.insert("id".to_string(), Value::String(variant_id));
+    object.insert(
+        "display_name".to_string(),
+        Value::String(format!("{display_name} (1M)")),
+    );
+    Some(variant)
+}
+
 fn claude_models_value(models: Vec<Value>) -> Value {
     let ids = models
         .iter()
@@ -9673,7 +9780,7 @@ async fn proxy_claude_models(proxy_state: Arc<ProxyState>, headers: HeaderMap) -
         return proxy_error(StatusCode::BAD_GATEWAY, last_error);
     }
 
-    claude_models_response(models)
+    claude_models_response(with_claude_long_context_variants(models))
 }
 
 async fn proxy_claude_request(
@@ -9717,7 +9824,12 @@ async fn proxy_claude_request(
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
-    let model = model_from_request_body(&body_bytes);
+    // Claude Code 用模型名的 `[1m]` 后缀声明 1M 上下文，实测 2.1.187 会在发请求前
+    // 自行剥掉。这里再兜一层：一律按裸模型名做供应商筛选/映射/日志，并强制把请求体
+    // 里的 model 改写回裸名，避免客户端行为变化时上游收到不认识的模型名。
+    let requested_model = model_from_request_body(&body_bytes);
+    let model = strip_claude_long_context_suffix(&requested_model).to_string();
+    let long_context_suffix_stripped = model != requested_model;
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(method) => method,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("请求方法无效: {err}")),
@@ -9748,7 +9860,8 @@ async fn proxy_claude_request(
     for (attempt_index, candidate) in candidates.iter().enumerate() {
         cancellation_guard.disarm();
         upstream_chain.push(candidate.provider.name.clone());
-        let upstream_model = mapped_model_for_claude_provider(&candidate.provider, &model);
+        let upstream_model = mapped_model_for_claude_provider(&candidate.provider, &model)
+            .or_else(|| long_context_suffix_stripped.then(|| model.clone()));
         let prepared_body =
             body_with_provider_overrides(&body_bytes, upstream_model.as_deref(), None);
         let request_body = request_body_info(
@@ -16470,6 +16583,112 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             ids,
             vec!["claude-sonnet-5", "claude-fable-5", "local-alias"]
         );
+    }
+
+    #[test]
+    fn strips_claude_long_context_suffix_case_insensitively() {
+        assert_eq!(
+            strip_claude_long_context_suffix("claude-opus-5[1m]"),
+            "claude-opus-5"
+        );
+        assert_eq!(
+            strip_claude_long_context_suffix("claude-opus-5[1M]"),
+            "claude-opus-5"
+        );
+        assert_eq!(
+            strip_claude_long_context_suffix("  claude-opus-5[1m]  "),
+            "claude-opus-5"
+        );
+        assert_eq!(
+            strip_claude_long_context_suffix("claude-opus-5"),
+            "claude-opus-5"
+        );
+        // 不能把短名或含中文的名字切出非法边界
+        assert_eq!(strip_claude_long_context_suffix("m]"), "m]");
+        assert_eq!(strip_claude_long_context_suffix("模型[1m]"), "模型");
+    }
+
+    #[test]
+    fn detects_claude_long_context_models() {
+        for model in [
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-fable-5",
+            "CLAUDE-SONNET-4-6",
+            // 带日期后缀的快照也应命中
+            "claude-opus-4-8-20260101",
+        ] {
+            assert!(
+                claude_model_supports_long_context(model),
+                "{model} 应被识别为 1M 模型"
+            );
+        }
+
+        for model in [
+            // Sonnet 4.5 / Opus 4.5 / Haiku 4.5 默认 200K，未收录
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-5-20251101",
+            "claude-haiku-4-5-20251001",
+            "claude-3-5-sonnet-20241022",
+            "gpt-5.6-sol",
+        ] {
+            assert!(
+                !claude_model_supports_long_context(model),
+                "{model} 不应被识别为 1M 模型"
+            );
+        }
+    }
+
+    #[test]
+    fn synthesizes_long_context_model_variants() {
+        let models = claude_model_values_from_response_value(&json!({
+            "data": [
+                { "id": "claude-opus-5" },
+                { "id": "claude-sonnet-4-5-20250929" },
+                { "id": "claude-opus-4-8", "display_name": "Claude Opus 4.8" }
+            ]
+        }));
+
+        let expanded = with_claude_long_context_variants(models);
+        let ids = expanded
+            .iter()
+            .filter_map(model_id_from_value)
+            .collect::<Vec<_>>();
+        // 1M 模型的 [1m] 变体紧跟原条目；200K 模型不生成变体，原条目一律保留
+        assert_eq!(
+            ids,
+            vec![
+                "claude-opus-5",
+                "claude-opus-5[1m]",
+                "claude-sonnet-4-5-20250929",
+                "claude-opus-4-8",
+                "claude-opus-4-8[1m]",
+            ]
+        );
+        assert_eq!(
+            expanded[1].get("display_name").and_then(Value::as_str),
+            Some("claude-opus-5 (1M)")
+        );
+        assert_eq!(
+            expanded[4].get("display_name").and_then(Value::as_str),
+            Some("Claude Opus 4.8 (1M)")
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_existing_long_context_variants() {
+        let models = claude_model_values_from_response_value(&json!({
+            "data": [
+                { "id": "claude-opus-5" },
+                { "id": "claude-opus-5[1m]" }
+            ]
+        }));
+
+        let ids = with_claude_long_context_variants(models)
+            .iter()
+            .filter_map(model_id_from_value)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["claude-opus-5", "claude-opus-5[1m]"]);
     }
 
     #[test]
