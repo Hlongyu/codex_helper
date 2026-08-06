@@ -492,6 +492,32 @@ function defaultRouterConfig(): RouterConfig {
   };
 }
 
+function routerConfigsEqual(left: RouterConfig, right: RouterConfig) {
+  const leftKeys = Object.keys(left) as Array<keyof RouterConfig>;
+  const rightKeys = Object.keys(right) as Array<keyof RouterConfig>;
+  return (
+    leftKeys.length === rightKeys.length && leftKeys.every((key) => left[key] === right[key])
+  );
+}
+
+function routerSelectedModelUnavailable(router: RouterConfig, models: string[]) {
+  return Boolean(
+    router.codex_model.trim() &&
+      !models.some(
+        (model) => model.toLowerCase() === router.codex_model.trim().toLowerCase(),
+      ),
+  );
+}
+
+function effectiveRouterCodexModelError(
+  router: RouterConfig,
+  models: string[],
+  codexEnabled: boolean,
+) {
+  const selectionError = routerCodexModelError(router, models);
+  return codexEnabled || routerSelectedModelUnavailable(router, models) ? selectionError : "";
+}
+
 function routerModelProviderError(router: RouterConfig) {
   const providerName = router.model_provider.trim();
   if (!providerName) return "Provider 名称不能为空。";
@@ -1299,6 +1325,7 @@ function App() {
   const [requestFilter, setRequestFilter] = useState<RouteLogFilter>({ model: "", page_size: 20 });
   const [requestAutoRefresh, setRequestAutoRefresh] = useState(true);
   const [screen, setScreen] = useState<Screen>("dashboard");
+  const [pendingScreen, setPendingScreen] = useState<Screen | null>(null);
   const [providerKind, setProviderKind] = useState<ProviderKind>("codex");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1465,6 +1492,18 @@ function App() {
   useEffect(() => {
     if (shellRef.current) shellRef.current.scrollTop = 0;
   }, [screen]);
+
+  const routeDirty = Boolean(appState && !routerConfigsEqual(routerDraft, appState.router));
+
+  useEffect(() => {
+    if (!routeDirty) return;
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [routeDirty]);
 
   const activeProvider = useMemo(() => {
     if (!appState) return null;
@@ -2082,6 +2121,35 @@ function App() {
     );
   }
 
+  const savedRouter = appState.router;
+  const routeSaveDisabled =
+    busy ||
+    !routeDirty ||
+    Boolean(routerModelProviderError(routerDraft)) ||
+    Boolean(
+      effectiveRouterCodexModelError(
+        routerDraft,
+        appState.codex_models,
+        appState.clients.codex.enabled,
+      ),
+    );
+
+  function navigateToScreen(nextScreen: Screen) {
+    if (nextScreen === screen) return;
+    if (screen === "route" && routeDirty) {
+      setPendingScreen(nextScreen);
+      return;
+    }
+    setScreen(nextScreen);
+  }
+
+  function discardRouteChangesAndNavigate() {
+    if (!pendingScreen) return;
+    setRouterDraft(savedRouter);
+    setScreen(pendingScreen);
+    setPendingScreen(null);
+  }
+
   const routerOn = serviceOk(appState);
   const navGroups = [
     {
@@ -2124,7 +2192,7 @@ function App() {
                 <button
                   className={screen === key ? "active" : ""}
                   key={key}
-                  onClick={() => setScreen(key as Screen)}
+                  onClick={() => navigateToScreen(key as Screen)}
                   type="button"
                 >
                   <NavIcon type={key as Screen} />
@@ -2204,6 +2272,26 @@ function App() {
                 onChange={(checked) => void saveClientConfig("pi", checked)}
               />
             </div>
+            {screen === "route" && (
+              <div className="topbar-route-actions">
+                <button
+                  className="ghost"
+                  disabled={busy || !routeDirty}
+                  onClick={() => setRouterDraft(savedRouter)}
+                  type="button"
+                >
+                  撤销修改
+                </button>
+                <button
+                  className="primary"
+                  disabled={routeSaveDisabled}
+                  onClick={() => void saveRouter(routerDraft, true)}
+                  type="button"
+                >
+                  保存修改
+                </button>
+              </div>
+            )}
           </div>
         </header>
 
@@ -2236,7 +2324,6 @@ function App() {
             onSaveMultiAgentEnabled={saveMultiAgentEnabled}
             routerDraft={routerDraft}
             setRouterDraft={setRouterDraft}
-            onSaveRouter={saveRouter}
           />
         )}
 
@@ -2386,6 +2473,40 @@ function App() {
           </section>
         )}
       </section>
+
+      {pendingScreen && (
+        <div
+          className="latency-dialog-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setPendingScreen(null);
+          }}
+        >
+          <section
+            aria-labelledby="unsaved-route-dialog-title"
+            aria-modal="true"
+            className="latency-dialog unsaved-route-dialog"
+            role="dialog"
+          >
+            <header>
+              <div>
+                <h2 id="unsaved-route-dialog-title">未保存路由设置</h2>
+                <p>离开当前页面将丢失这些修改。</p>
+              </div>
+            </header>
+            <div className="unsaved-route-dialog-body">
+              你对路由配置所做的修改尚未保存。可以继续编辑并使用右上角的保存按钮，或放弃本次修改。
+            </div>
+            <footer>
+              <button autoFocus className="ghost" onClick={() => setPendingScreen(null)} type="button">
+                继续编辑
+              </button>
+              <button className="danger" onClick={discardRouteChangesAndNavigate} type="button">
+                放弃修改
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
 
       {latencyDialog && (
         <ProviderLatencyDialog
@@ -2769,7 +2890,6 @@ function RouteScreen({
   busy,
   onSaveClientConfig,
   onSaveMultiAgentEnabled,
-  onSaveRouter,
   routerDraft,
   setRouterDraft,
 }: {
@@ -2777,26 +2897,24 @@ function RouteScreen({
   busy: boolean;
   onSaveClientConfig: (kind: AgentClientKind, enabled: boolean) => Promise<void>;
   onSaveMultiAgentEnabled: (enabled: boolean) => Promise<void>;
-  onSaveRouter: (nextRouter: RouterConfig, apply?: boolean) => Promise<void>;
   routerDraft: RouterConfig;
   setRouterDraft: (router: RouterConfig) => void;
 }) {
   const providerNameError = routerModelProviderError(routerDraft);
-  const codexSelectionError = routerCodexModelError(routerDraft, appState.codex_models);
-  const selectedModelUnavailable = Boolean(
-    routerDraft.codex_model.trim() &&
-      !appState.codex_models.some(
-        (model) => model.toLowerCase() === routerDraft.codex_model.trim().toLowerCase(),
-      ),
+  const selectedModelUnavailable = routerSelectedModelUnavailable(
+    routerDraft,
+    appState.codex_models,
   );
-  const codexModelError =
-    appState.clients.codex.enabled || selectedModelUnavailable ? codexSelectionError : "";
+  const codexModelError = effectiveRouterCodexModelError(
+    routerDraft,
+    appState.codex_models,
+    appState.clients.codex.enabled,
+  );
 
   return (
     <section className="route-page">
       <div className="section-title">
         <h2>路由配置</h2>
-        <button className="ghost">测试完整链路</button>
       </div>
 
       <div className="route-config-grid">
@@ -3000,20 +3118,6 @@ function RouteScreen({
           </div>
         </article>
 
-      </div>
-
-      <div className="route-footer-actions">
-        <button className="ghost" onClick={() => setRouterDraft(appState.router)} type="button">
-          撤销修改
-        </button>
-        <button
-          className="primary"
-          disabled={busy || Boolean(providerNameError) || Boolean(codexModelError)}
-          onClick={() => onSaveRouter(routerDraft, true)}
-          type="button"
-        >
-          保存修改
-        </button>
       </div>
     </section>
   );
