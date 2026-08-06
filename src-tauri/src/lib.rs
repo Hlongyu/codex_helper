@@ -1181,6 +1181,8 @@ struct RouteRequestLog {
     remote_compaction_v2: RemoteCompactionV2Audit,
     #[serde(default)]
     upstream_model: Option<String>,
+    #[serde(default)]
+    request_body: Option<RequestBodyInfo>,
     provider_id: String,
     provider_name: String,
     provider_order: usize,
@@ -1242,11 +1244,33 @@ struct DebugResponseSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct RequestBodyInfo {
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    content_encoding: Option<String>,
+    #[serde(default)]
+    zstd_detected: bool,
+    #[serde(default)]
+    decompression_enabled: bool,
+    #[serde(default)]
+    decompressed: bool,
+    #[serde(default)]
+    inbound_bytes: usize,
+    #[serde(default)]
+    decoded_bytes: usize,
+    #[serde(default)]
+    upstream_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RouteDebugCapture {
     version: u8,
     request_id: String,
     started_at_ms: i64,
     provider_name: String,
+    #[serde(default)]
+    request_body: Option<RequestBodyInfo>,
     inbound_request: DebugRequestSnapshot,
     upstream_request: DebugRequestSnapshot,
     upstream_response: DebugResponseSnapshot,
@@ -1308,6 +1332,7 @@ struct PendingDebugCapture {
     request_id: String,
     started_at_ms: i64,
     provider_name: String,
+    request_body: RequestBodyInfo,
     inbound_request: PendingDebugRequest,
     upstream_request: PendingDebugRequest,
     upstream_status_code: Option<u16>,
@@ -1318,10 +1343,11 @@ struct PendingDebugCapture {
 impl PendingDebugCapture {
     fn snapshot(self) -> RouteDebugCapture {
         RouteDebugCapture {
-            version: 1,
+            version: 2,
             request_id: self.request_id,
             started_at_ms: self.started_at_ms,
             provider_name: self.provider_name,
+            request_body: Some(self.request_body),
             inbound_request: self.inbound_request.snapshot(),
             upstream_request: self.upstream_request.snapshot(),
             upstream_response: DebugResponseSnapshot {
@@ -1494,6 +1520,7 @@ struct PendingRouteLog {
     model: String,
     remote_compaction_v2: RemoteCompactionV2Audit,
     upstream_model: Option<String>,
+    request_body: Option<RequestBodyInfo>,
     provider_id: String,
     provider_name: String,
     provider_order: usize,
@@ -6762,6 +6789,44 @@ fn debug_upstream_request_headers(
     headers
 }
 
+fn request_body_info(
+    headers: &HeaderMap,
+    inbound_body: &[u8],
+    decoded_body: &[u8],
+    upstream_body: &[u8],
+    decompression_enabled: bool,
+) -> RequestBodyInfo {
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let content_encoding = headers
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let zstd_detected = content_encoding.as_deref().is_some_and(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .any(|encoding| encoding.eq_ignore_ascii_case("zstd"))
+    }) || inbound_body.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
+
+    RequestBodyInfo {
+        content_type,
+        content_encoding,
+        zstd_detected,
+        decompression_enabled,
+        decompressed: decompression_enabled && zstd_detected,
+        inbound_bytes: inbound_body.len(),
+        decoded_bytes: decoded_body.len(),
+        upstream_bytes: upstream_body.len(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_pending_debug_capture(
     enabled: bool,
@@ -6775,11 +6840,13 @@ fn build_pending_debug_capture(
     upstream_url: String,
     upstream_body: &[u8],
     preserve_content_encoding: bool,
+    request_body: RequestBodyInfo,
 ) -> Option<PendingDebugCapture> {
     enabled.then(|| PendingDebugCapture {
         request_id: request_id.to_string(),
         started_at_ms,
         provider_name: provider_name.to_string(),
+        request_body,
         inbound_request: PendingDebugRequest {
             method: method.as_str().to_string(),
             url: debug_redacted_url(&inbound_url),
@@ -8835,6 +8902,7 @@ fn build_finished_route_log(
         model: pending.model,
         remote_compaction_v2: pending.remote_compaction_v2,
         upstream_model: pending.upstream_model,
+        request_body: pending.request_body,
         provider_id: pending.provider_id,
         provider_name: pending.provider_name,
         provider_order: pending.provider_order,
@@ -8879,6 +8947,7 @@ fn build_pending_route_log(
     upstream_started_ms: Option<u64>,
     response_header_ms: Option<u64>,
     upstream_request_id: Option<String>,
+    request_body: Option<RequestBodyInfo>,
     debug_capture: Option<PendingDebugCapture>,
     error: Option<String>,
 ) -> PendingRouteLog {
@@ -8890,6 +8959,7 @@ fn build_pending_route_log(
         model: model.to_string(),
         remote_compaction_v2,
         upstream_model: upstream_model.map(str::to_string),
+        request_body,
         provider_id: candidate.provider.id.clone(),
         provider_name: candidate.provider.name.clone(),
         provider_order: candidate.route_order,
@@ -8937,6 +9007,7 @@ fn build_pending_claude_route_log(
     upstream_started_ms: Option<u64>,
     response_header_ms: Option<u64>,
     upstream_request_id: Option<String>,
+    request_body: Option<RequestBodyInfo>,
     error: Option<String>,
 ) -> PendingRouteLog {
     let route_result = if let Some(upstream_model) = upstream_model {
@@ -8964,6 +9035,7 @@ fn build_pending_claude_route_log(
         model: model.to_string(),
         remote_compaction_v2: RemoteCompactionV2Audit::default(),
         upstream_model: upstream_model.map(str::to_string),
+        request_body,
         provider_id: candidate.provider.id.clone(),
         provider_name: candidate.provider.name.clone(),
         provider_order: candidate.route_order,
@@ -9633,14 +9705,14 @@ async fn proxy_claude_request(
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let body_bytes = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
+    let inbound_body = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
     };
     let body_bytes = match decoded_proxy_request_body(
         router.zstd_decompression_enabled,
         &headers,
-        &body_bytes,
+        &inbound_body,
     ) {
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
@@ -9679,6 +9751,13 @@ async fn proxy_claude_request(
         let upstream_model = mapped_model_for_claude_provider(&candidate.provider, &model);
         let prepared_body =
             body_with_provider_overrides(&body_bytes, upstream_model.as_deref(), None);
+        let request_body = request_body_info(
+            &headers,
+            &inbound_body,
+            &body_bytes,
+            &prepared_body,
+            router.zstd_decompression_enabled,
+        );
         let upstream_path = claude_upstream_path(&path);
         let upstream_url = join_url(&candidate.base_url, &upstream_path) + &query;
         let mut request = upstream_client
@@ -9715,6 +9794,7 @@ async fn proxy_claude_request(
             Some(upstream_started_ms),
             None,
             None,
+            Some(request_body.clone()),
             None,
         ));
 
@@ -9756,6 +9836,7 @@ async fn proxy_claude_request(
                     Some(upstream_started_ms),
                     None,
                     None,
+                    Some(request_body.clone()),
                     Some(last_error.clone()),
                 ));
                 let pending = cancellation_guard.take();
@@ -9806,6 +9887,7 @@ async fn proxy_claude_request(
             Some(upstream_started_ms),
             Some(response_header_ms),
             upstream_request_id,
+            Some(request_body),
             if status.is_success() {
                 None
             } else {
@@ -10094,14 +10176,14 @@ async fn proxy_request_now(
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let body_bytes = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
+    let inbound_body = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
     };
     let body_bytes = match decoded_proxy_request_body(
         router.zstd_decompression_enabled,
         &headers,
-        &body_bytes,
+        &inbound_body,
     ) {
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
@@ -10173,6 +10255,13 @@ async fn proxy_request_now(
                 request_has_compaction_trigger(&prepared.body);
         }
         let upstream_url = join_url(&candidate.base_url, &prepared.path) + &prepared.query;
+        let request_body = request_body_info(
+            &headers,
+            &inbound_body,
+            &body_bytes,
+            &prepared.body,
+            router.zstd_decompression_enabled,
+        );
         let mut debug_capture = build_pending_debug_capture(
             router.debug_mode && path.trim_matches('/') == "responses",
             &route_request_id,
@@ -10185,6 +10274,7 @@ async fn proxy_request_now(
             upstream_url.clone(),
             &prepared.body,
             !router.zstd_decompression_enabled,
+            request_body.clone(),
         );
         let mut request = upstream_client
             .client
@@ -10224,6 +10314,7 @@ async fn proxy_request_now(
             Some(upstream_started_ms),
             None,
             None,
+            Some(request_body.clone()),
             debug_capture.clone(),
             None,
         ));
@@ -10267,6 +10358,7 @@ async fn proxy_request_now(
                     Some(upstream_started_ms),
                     None,
                     None,
+                    Some(request_body.clone()),
                     debug_capture.clone(),
                     Some(last_error.clone()),
                 ));
@@ -10323,6 +10415,7 @@ async fn proxy_request_now(
             Some(upstream_started_ms),
             Some(response_header_ms),
             upstream_request_id,
+            Some(request_body),
             debug_capture,
             if status.is_success() {
                 None
@@ -14445,6 +14538,48 @@ experimental_bearer_token = "secret-token"
     }
 
     #[test]
+    fn records_zstd_request_body_processing_details() {
+        let raw = br#"{"model":"gpt-5.6-sol","input":[]}"#;
+        let compressed = zstd::stream::encode_all(Cursor::new(raw), 0).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("identity, zstd"));
+        let upstream = br#"{"model":"upstream-model","input":[]}"#;
+
+        let enabled = request_body_info(&headers, &compressed, raw, upstream, true);
+        assert_eq!(
+            enabled.content_type.as_deref(),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(enabled.content_encoding.as_deref(), Some("identity, zstd"));
+        assert!(enabled.zstd_detected);
+        assert!(enabled.decompression_enabled);
+        assert!(enabled.decompressed);
+        assert_eq!(enabled.inbound_bytes, compressed.len());
+        assert_eq!(enabled.decoded_bytes, raw.len());
+        assert_eq!(enabled.upstream_bytes, upstream.len());
+
+        let disabled = request_body_info(
+            &HeaderMap::new(),
+            &compressed,
+            &compressed,
+            &compressed,
+            false,
+        );
+        assert_eq!(disabled.content_type, None);
+        assert_eq!(disabled.content_encoding, None);
+        assert!(disabled.zstd_detected);
+        assert!(!disabled.decompression_enabled);
+        assert!(!disabled.decompressed);
+        assert_eq!(disabled.inbound_bytes, compressed.len());
+        assert_eq!(disabled.decoded_bytes, compressed.len());
+        assert_eq!(disabled.upstream_bytes, compressed.len());
+    }
+
+    #[test]
     fn audits_remote_compaction_v2_without_storing_request_content() {
         let request = br#"{
             "model":"gpt-5.6-sol",
@@ -14708,6 +14843,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             model: "test-model".to_string(),
             remote_compaction_v2: RemoteCompactionV2Audit::default(),
             upstream_model: None,
+            request_body: None,
             provider_id: provider_id.to_string(),
             provider_name: provider_id.to_string(),
             provider_order: 1,
@@ -14751,6 +14887,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             model: "test-model".to_string(),
             remote_compaction_v2: RemoteCompactionV2Audit::default(),
             upstream_model: None,
+            request_body: None,
             provider_id: "provider-a".to_string(),
             provider_name: "Provider A".to_string(),
             provider_order: 1,
@@ -14823,12 +14960,14 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         object.remove("response_header_ms");
         object.remove("upstream_request_id");
         object.remove("slow_delay_ms");
+        object.remove("request_body");
 
         let decoded: RouteRequestLog = serde_json::from_value(value).expect("deserialize old log");
         assert_eq!(decoded.upstream_started_ms, None);
         assert_eq!(decoded.response_header_ms, None);
         assert_eq!(decoded.upstream_request_id, None);
         assert_eq!(decoded.slow_delay_ms, None);
+        assert!(decoded.request_body.is_none());
     }
 
     #[test]

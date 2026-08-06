@@ -261,6 +261,17 @@ type UsageSummary = {
   total_tokens: number;
 };
 
+type RequestBodyInfo = {
+  content_type?: string | null;
+  content_encoding?: string | null;
+  zstd_detected: boolean;
+  decompression_enabled: boolean;
+  decompressed: boolean;
+  inbound_bytes: number;
+  decoded_bytes: number;
+  upstream_bytes: number;
+};
+
 type RouteRequestLog = {
   id: string;
   started_at_ms: number;
@@ -277,6 +288,7 @@ type RouteRequestLog = {
     compaction_item_reused: boolean;
   } | null;
   upstream_model?: string | null;
+  request_body?: RequestBodyInfo | null;
   provider_id: string;
   provider_name: string;
   provider_order: number;
@@ -332,6 +344,7 @@ type RouteDebugCapture = {
   request_id: string;
   started_at_ms: number;
   provider_name: string;
+  request_body?: RequestBodyInfo | null;
   inbound_request: DebugRequestSnapshot;
   upstream_request: DebugRequestSnapshot;
   upstream_response: DebugResponseSnapshot;
@@ -3859,6 +3872,7 @@ function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () 
     () => formatDebugBodyText(activeDebug?.body.text || ""),
     [activeDebug],
   );
+  const requestBody = log.request_body || debugCapture?.request_body || null;
 
   return (
     <div
@@ -3905,6 +3919,40 @@ function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () 
               ) : null}
             </div>
           </section>
+
+          {requestBody ? (
+            <section className="request-detail-section">
+              <header><h3>请求体处理</h3></header>
+              <div className="request-detail-grid">
+                <div>
+                  <span>Content-Type</span>
+                  <strong>{requestBody.content_type || "未设置"}</strong>
+                </div>
+                <div>
+                  <span>Content-Encoding</span>
+                  <strong>{requestBody.content_encoding || "未设置"}</strong>
+                </div>
+                <div>
+                  <span>zstd 解压配置</span>
+                  <strong>{requestBody.decompression_enabled ? "开启" : "关闭"}</strong>
+                </div>
+                <div><span>zstd 识别</span><strong>{requestBody.zstd_detected ? "是" : "否"}</strong></div>
+                <div>
+                  <span>处理结果</span>
+                  <strong>
+                    {!requestBody.decompression_enabled
+                      ? "未处理"
+                      : requestBody.decompressed
+                        ? "已解压"
+                        : "无需解压"}
+                  </strong>
+                </div>
+                <div><span>入站原始</span><strong>{requestBody.inbound_bytes.toLocaleString()} bytes</strong></div>
+                <div><span>解压后</span><strong>{requestBody.decoded_bytes.toLocaleString()} bytes</strong></div>
+                <div><span>上游转发</span><strong>{requestBody.upstream_bytes.toLocaleString()} bytes</strong></div>
+              </div>
+            </section>
+          ) : null}
 
           <section className="request-detail-section">
             <header>
