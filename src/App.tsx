@@ -60,6 +60,7 @@ type RouterConfig = {
   debug_mode: boolean;
   force_disable_openai_auth: boolean;
   remote_compaction_enabled: boolean;
+  zstd_decompression_enabled: boolean;
   gpt56_long_context_enabled: boolean;
   model_provider: string;
   codex_model: string;
@@ -477,6 +478,7 @@ function defaultRouterConfig(): RouterConfig {
     debug_mode: false,
     force_disable_openai_auth: false,
     remote_compaction_enabled: false,
+    zstd_decompression_enabled: true,
     gpt56_long_context_enabled: false,
     model_provider: "custom",
     codex_model: "",
@@ -2834,6 +2836,19 @@ function LocalProxySettings({
         {slowModeError ? <small>{slowModeError}</small> : null}
       </div>
 
+      <div className="route-toggle-line debug-mode-toggle">
+        <div>
+          <strong>解压 zstd 请求体</strong>
+          <p>关闭后不检查或解压请求体，并保留 Content-Encoding 交给兼容上游处理。</p>
+        </div>
+        <Toggle
+          checked={routerDraft.zstd_decompression_enabled}
+          disabled={busy}
+          onChange={(zstd_decompression_enabled) =>
+            setRouterDraft({ ...routerDraft, zstd_decompression_enabled })
+          }
+        />
+      </div>
       <div className="route-toggle-line debug-mode-toggle">
         <div>
           <strong>Debug 模式（Responses API）</strong>

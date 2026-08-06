@@ -338,6 +338,8 @@ struct RouterConfig {
     force_disable_openai_auth: bool,
     #[serde(default)]
     remote_compaction_enabled: bool,
+    #[serde(default = "default_true")]
+    zstd_decompression_enabled: bool,
     #[serde(default)]
     gpt56_long_context_enabled: bool,
     #[serde(default = "default_router_model_provider")]
@@ -528,6 +530,7 @@ impl Default for RouterConfig {
             debug_mode: false,
             force_disable_openai_auth: false,
             remote_compaction_enabled: false,
+            zstd_decompression_enabled: true,
             gpt56_long_context_enabled: false,
             model_provider: default_router_model_provider(),
             codex_model: String::new(),
@@ -884,6 +887,8 @@ struct SaveRouterPayload {
     force_disable_openai_auth: bool,
     #[serde(default)]
     remote_compaction_enabled: bool,
+    #[serde(default = "default_true")]
+    zstd_decompression_enabled: bool,
     #[serde(default)]
     gpt56_long_context_enabled: bool,
     #[serde(default = "default_router_model_provider")]
@@ -6721,13 +6726,14 @@ fn debug_upstream_request_headers(
     inbound_headers: &HeaderMap,
     request_id: &str,
     body_len: usize,
+    preserve_content_encoding: bool,
 ) -> Vec<DebugHeader> {
     let mut headers = inbound_headers
         .iter()
         .filter(|(name, _)| {
             *name != AUTHORIZATION
                 && *name != HOST
-                && *name != CONTENT_ENCODING
+                && (preserve_content_encoding || *name != CONTENT_ENCODING)
                 && *name != CONTENT_LENGTH
                 && !name.as_str().eq_ignore_ascii_case("x-request-id")
                 && !is_hop_by_hop_header(name)
@@ -6768,6 +6774,7 @@ fn build_pending_debug_capture(
     inbound_body: &[u8],
     upstream_url: String,
     upstream_body: &[u8],
+    preserve_content_encoding: bool,
 ) -> Option<PendingDebugCapture> {
     enabled.then(|| PendingDebugCapture {
         request_id: request_id.to_string(),
@@ -6786,6 +6793,7 @@ fn build_pending_debug_capture(
                 inbound_headers,
                 request_id,
                 upstream_body.len(),
+                preserve_content_encoding,
             ),
             body: DebugBodyCapture::from_bytes(upstream_body),
         },
@@ -6883,7 +6891,15 @@ fn sse_event_contains_compaction_item(event: &str) -> bool {
         .any(|data| response_contains_compaction_item(data.as_bytes()))
 }
 
-fn decoded_proxy_request_body(headers: &HeaderMap, body: &[u8]) -> Result<Bytes, String> {
+fn decoded_proxy_request_body(
+    enabled: bool,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Bytes, String> {
+    if !enabled {
+        return Ok(Bytes::copy_from_slice(body));
+    }
+
     let encodings = headers
         .get(CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
@@ -9621,7 +9637,11 @@ async fn proxy_claude_request(
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
     };
-    let body_bytes = match decoded_proxy_request_body(&headers, &body_bytes) {
+    let body_bytes = match decoded_proxy_request_body(
+        router.zstd_decompression_enabled,
+        &headers,
+        &body_bytes,
+    ) {
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
@@ -9669,7 +9689,7 @@ async fn proxy_claude_request(
         for (name, value) in headers.iter() {
             if name == AUTHORIZATION
                 || name == HOST
-                || name == CONTENT_ENCODING
+                || (router.zstd_decompression_enabled && name == CONTENT_ENCODING)
                 || name == CONTENT_LENGTH
                 || name.as_str().eq_ignore_ascii_case("x-api-key")
                 || is_hop_by_hop_header(name)
@@ -9975,9 +9995,13 @@ async fn proxy_request(
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
     };
-    let streams = decoded_proxy_request_body(&headers, &body_bytes)
-        .ok()
-        .is_some_and(|decoded| request_body_streams(&decoded));
+    let streams = decoded_proxy_request_body(
+        state.router.zstd_decompression_enabled,
+        &headers,
+        &body_bytes,
+    )
+    .ok()
+    .is_some_and(|decoded| request_body_streams(&decoded));
     let delay_secs = selected_slow_delay_secs(&state.router);
     let slow_timing = RequestTiming {
         slow_delay_ms: Some(delay_secs.saturating_mul(1_000)),
@@ -10074,7 +10098,11 @@ async fn proxy_request_now(
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
     };
-    let body_bytes = match decoded_proxy_request_body(&headers, &body_bytes) {
+    let body_bytes = match decoded_proxy_request_body(
+        router.zstd_decompression_enabled,
+        &headers,
+        &body_bytes,
+    ) {
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
@@ -10156,6 +10184,7 @@ async fn proxy_request_now(
             &body_bytes,
             upstream_url.clone(),
             &prepared.body,
+            !router.zstd_decompression_enabled,
         );
         let mut request = upstream_client
             .client
@@ -10165,7 +10194,7 @@ async fn proxy_request_now(
         for (name, value) in headers.iter() {
             if name == AUTHORIZATION
                 || name == HOST
-                || name == CONTENT_ENCODING
+                || (router.zstd_decompression_enabled && name == CONTENT_ENCODING)
                 || name == CONTENT_LENGTH
                 || name.as_str().eq_ignore_ascii_case("x-request-id")
                 || is_hop_by_hop_header(name)
@@ -12508,6 +12537,7 @@ fn save_router_config(
         debug_mode: payload.debug_mode,
         force_disable_openai_auth: payload.force_disable_openai_auth,
         remote_compaction_enabled: payload.remote_compaction_enabled,
+        zstd_decompression_enabled: payload.zstd_decompression_enabled,
         gpt56_long_context_enabled: payload.gpt56_long_context_enabled,
         model_provider,
         codex_model,
@@ -13301,6 +13331,7 @@ mod tests {
         assert_eq!(router.slow_delay_max_secs, 0);
         assert!(!router.debug_mode);
         assert!(!router.force_disable_openai_auth);
+        assert!(router.zstd_decompression_enabled);
         assert!(!router.gpt56_long_context_enabled);
     }
 
@@ -14391,14 +14422,26 @@ experimental_bearer_token = "secret-token"
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
 
-        let decoded = decoded_proxy_request_body(&headers, &compressed).unwrap();
+        let decoded = decoded_proxy_request_body(true, &headers, &compressed).unwrap();
 
         assert_eq!(decoded.as_ref(), raw);
         assert_eq!(model_from_request_body(&decoded), "gpt-5.6-sol");
 
         let decoded_without_header =
-            decoded_proxy_request_body(&HeaderMap::new(), &compressed).unwrap();
+            decoded_proxy_request_body(true, &HeaderMap::new(), &compressed).unwrap();
         assert_eq!(decoded_without_header.as_ref(), raw);
+    }
+
+    #[test]
+    fn leaves_zstd_request_untouched_when_decompression_is_disabled() {
+        let raw = br#"{"model":"gpt-5.6-sol","input":[]}"#;
+        let compressed = zstd::stream::encode_all(Cursor::new(raw), 0).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+
+        let body = decoded_proxy_request_body(false, &headers, &compressed).unwrap();
+
+        assert_eq!(body.as_ref(), compressed.as_slice());
     }
 
     #[test]
