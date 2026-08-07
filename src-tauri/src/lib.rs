@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
@@ -38,6 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
+use tauri_plugin_autostart::ManagerExt;
 use tokio::sync::oneshot;
 use toml_edit::{Array, DocumentMut, Item, Value as TomlValue};
 
@@ -82,6 +84,7 @@ const DEFAULT_AUTO_DISABLE_RESET_DAY: u32 = 1;
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_SHOW_ID: &str = "show";
 const TRAY_QUIT_ID: &str = "quit";
+const AUTOSTART_ARG: &str = "--autostart";
 const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/Hlongyu/codex_helper/releases/latest";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
@@ -12126,6 +12129,27 @@ fn load_app_state(router_runtime: tauri::State<RouterRuntime>) -> Result<AppStat
 }
 
 #[tauri::command]
+fn get_autostart_enabled(app: tauri::AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|err| format!("读取开机自启状态失败: {err}"))
+}
+
+#[tauri::command]
+fn set_autostart_enabled(enabled: bool, app: tauri::AppHandle) -> Result<bool, String> {
+    let autostart = app.autolaunch();
+    let result = if enabled {
+        autostart.enable()
+    } else {
+        autostart.disable()
+    };
+    result.map_err(|err| format!("更新开机自启设置失败: {err}"))?;
+    autostart
+        .is_enabled()
+        .map_err(|err| format!("确认开机自启状态失败: {err}"))
+}
+
+#[tauri::command]
 async fn check_for_update() -> Result<UpdateCheckInfo, String> {
     update_check_info(&fetch_latest_github_release().await?)
 }
@@ -13354,9 +13378,26 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn launched_from_autostart_args<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    args.into_iter()
+        .any(|arg| arg.as_ref() == OsStr::new(AUTOSTART_ARG))
+}
+
+fn launched_from_autostart() -> bool {
+    launched_from_autostart_args(std::env::args_os())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![AUTOSTART_ARG]),
+        ))
         .manage(RouterRuntime::default())
         .setup(|app| {
             let show_item = MenuItem::with_id(app, TRAY_SHOW_ID, "显示主窗口", true, None::<&str>)?;
@@ -13386,6 +13427,14 @@ pub fn run() {
             }
             tray_builder.build(app)?;
 
+            if launched_from_autostart() {
+                if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                    if let Err(err) = window.hide() {
+                        eprintln!("开机自启时隐藏主窗口失败: {err}");
+                    }
+                }
+            }
+
             let mut state = load_state_file()?;
             match ensure_client_configs_applied(&mut state) {
                 Ok(true) => {
@@ -13414,6 +13463,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             load_app_state,
+            get_autostart_enabled,
+            set_autostart_enabled,
             check_for_update,
             install_update,
             select_provider,
@@ -13456,6 +13507,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_autostart_launch_argument() {
+        assert!(launched_from_autostart_args(["xxswitch", AUTOSTART_ARG]));
+        assert!(!launched_from_autostart_args(["xxswitch"]));
+    }
 
     fn test_provider_config(id: &str, status: ProviderStatus, enabled: bool) -> ProviderConfig {
         ProviderConfig {

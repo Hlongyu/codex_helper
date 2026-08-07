@@ -1348,6 +1348,8 @@ function App() {
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateConfirming, setUpdateConfirming] = useState(false);
   const [updateMessage, setUpdateMessage] = useState("");
+  const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
+  const [autostartBusy, setAutostartBusy] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorKind, setEditorKind] = useState<ProviderKind>("codex");
   const [editorTab, setEditorTab] = useState<EditorTab>("base");
@@ -1463,6 +1465,25 @@ function App() {
     }
   }
 
+  async function refreshAutostart() {
+    setAutostartEnabled(await callCommand<boolean>("get_autostart_enabled"));
+  }
+
+  async function updateAutostart(enabled: boolean) {
+    if (autostartBusy) return;
+    setAutostartBusy(true);
+    setError("");
+    try {
+      setAutostartEnabled(
+        await callCommand<boolean>("set_autostart_enabled", { enabled }),
+      );
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setAutostartBusy(false);
+    }
+  }
+
   useEffect(() => {
     refresh().catch((err) => setError(String(err)));
   }, []);
@@ -1503,6 +1524,11 @@ function App() {
     }, 5000);
     return () => window.clearInterval(timer);
   }, [requestAutoRefresh, requestFilter, screen]);
+
+  useEffect(() => {
+    if (screen !== "settings") return;
+    refreshAutostart().catch((err) => setError(String(err)));
+  }, [screen]);
 
   useEffect(() => {
     if (shellRef.current) shellRef.current.scrollTop = 0;
@@ -2420,6 +2446,18 @@ function App() {
                 </div>
               </div>
               <div className="settings-list">
+                <div className="settings-row application-setting-row">
+                  <div>
+                    <span>开机自启</span>
+                    <small>登录系统后在后台启动 XXSwitch</small>
+                  </div>
+                  <Toggle
+                    checked={autostartEnabled ?? false}
+                    disabled={autostartBusy || autostartEnabled === null}
+                    label="开机自启"
+                    onChange={(enabled) => void updateAutostart(enabled)}
+                  />
+                </div>
                 <div className="settings-row">
                   <span>当前版本</span>
                   <strong>{appState.app_version}</strong>

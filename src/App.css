@@ -1850,12 +1850,14 @@ button.danger {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
+.application-setting-row > div,
 .update-check-row > div,
 .update-result > div {
   display: grid;
   gap: 4px;
 }
 
+.application-setting-row small,
 .update-check-row small,
 .update-result span {
   color: #8390a4;
@@ -3179,6 +3181,7 @@ textarea::placeholder {
 }
 
 .settings-row span,
+.application-setting-row small,
 .update-check-row small,
 .update-result span,
 .settings-placeholder span {
