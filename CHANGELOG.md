@@ -1,5 +1,11 @@
 # 更新记录
 
+## v1.2.31 - 2026-08-13
+
+### 新增
+
+- 为 `deepseek-v4-pro` 增加 DeepSeek 官方 Codex capability 描述，支持文本输入、1M 上下文、`low` / `high` / `max` 推理等级、工具调用与联网搜索，并复用 bundled `gpt-5.6-sol` 的完整提示词。
+
 ## v1.2.30 - 2026-08-07
 
 ### 新增

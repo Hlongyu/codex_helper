@@ -6583,7 +6583,25 @@ fn load_codex_model_catalog_templates() -> Vec<Value> {
         .clone()
 }
 
-fn deepseek_v4_flash_catalog_entry(templates: &[Value]) -> Result<Value, String> {
+fn deepseek_v4_catalog_entry(model: &str, templates: &[Value]) -> Result<Value, String> {
+    let (slug, display_name, description, priority) =
+        if model.trim().eq_ignore_ascii_case("deepseek-v4-flash") {
+            (
+                "deepseek-v4-flash",
+                "DeepSeek-V4-Flash",
+                "Latest frontier agentic coding model.",
+                1,
+            )
+        } else if model.trim().eq_ignore_ascii_case("deepseek-v4-pro") {
+            (
+                "deepseek-v4-pro",
+                "DeepSeek-V4-Pro",
+                "Most capable frontier agentic coding model.",
+                2,
+            )
+        } else {
+            return Err(format!("不支持的 DeepSeek-V4 capability 模型: {model}"));
+        };
     let sol = templates
         .iter()
         .find(|entry| {
@@ -6593,8 +6611,7 @@ fn deepseek_v4_flash_catalog_entry(templates: &[Value]) -> Result<Value, String>
                 .is_some_and(|slug| slug.eq_ignore_ascii_case("gpt-5.6-sol"))
         })
         .ok_or_else(|| {
-            "Codex bundled 模型目录中缺少 gpt-5.6-sol，无法生成 DeepSeek-V4-Flash capability"
-                .to_string()
+            format!("Codex bundled 模型目录中缺少 gpt-5.6-sol，无法生成 {display_name} capability")
         })?;
     let base_instructions = sol
         .get("base_instructions")
@@ -6611,7 +6628,7 @@ fn deepseek_v4_flash_catalog_entry(templates: &[Value]) -> Result<Value, String>
 
     // Keep this object aligned with DeepSeek's published Codex models.json profile.
     Ok(json!({
-        "slug": "deepseek-v4-flash",
+        "slug": slug,
         "prefer_websockets": false,
         "support_verbosity": true,
         "default_verbosity": "low",
@@ -6633,8 +6650,8 @@ fn deepseek_v4_flash_catalog_entry(templates: &[Value]) -> Result<Value, String>
         "comp_hash": "3000",
         "reasoning_summary_format": "experimental",
         "default_reasoning_summary": "none",
-        "display_name": "DeepSeek-V4-Flash",
-        "description": "Latest frontier agentic coding model.",
+        "display_name": display_name,
+        "description": description,
         "default_reasoning_level": "high",
         "supported_reasoning_levels": [
             { "effort": "low", "description": "Fast responses with lighter reasoning" },
@@ -6647,7 +6664,7 @@ fn deepseek_v4_flash_catalog_entry(templates: &[Value]) -> Result<Value, String>
         "supported_in_api": true,
         "availability_nux": null,
         "upgrade": null,
-        "priority": 1,
+        "priority": priority,
         "model_messages": {
             "instructions_template": instructions_template,
             "instructions_variables": {
@@ -6666,8 +6683,11 @@ fn deepseek_v4_flash_catalog_entry(templates: &[Value]) -> Result<Value, String>
 }
 
 fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Result<Option<Value>, String> {
-    if model.trim().eq_ignore_ascii_case("deepseek-v4-flash") {
-        return deepseek_v4_flash_catalog_entry(templates).map(Some);
+    if ["deepseek-v4-flash", "deepseek-v4-pro"]
+        .iter()
+        .any(|candidate| model.trim().eq_ignore_ascii_case(candidate))
+    {
+        return deepseek_v4_catalog_entry(model, templates).map(Some);
     }
 
     let mut entry = templates
@@ -16977,6 +16997,33 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
+    fn codex_catalog_builds_official_deepseek_v4_pro_profile() {
+        let sol_prompt = "full bundled gpt-5.6-sol prompt\n".repeat(700);
+        let sol = json!({
+            "slug": "gpt-5.6-sol",
+            "base_instructions": sol_prompt.clone(),
+            "model_messages": { "instructions_template": sol_prompt }
+        });
+        let flash = codex_models_catalog_value_with_templates(
+            vec!["deepseek-v4-flash".to_string()],
+            std::slice::from_ref(&sol),
+        )
+        .expect("DeepSeek Flash catalog")["models"][0]
+            .clone();
+        let pro =
+            codex_models_catalog_value_with_templates(vec!["DEEPSEEK-V4-PRO".to_string()], &[sol])
+                .expect("DeepSeek Pro catalog")["models"][0]
+                .clone();
+
+        let mut expected = flash;
+        expected["slug"] = json!("deepseek-v4-pro");
+        expected["display_name"] = json!("DeepSeek-V4-Pro");
+        expected["description"] = json!("Most capable frontier agentic coding model.");
+        expected["priority"] = json!(2);
+        assert_eq!(pro, expected);
+    }
+
+    #[test]
     fn codex_catalog_omits_unknown_models() {
         let official = json!({
             "slug": "gpt-5.6-sol",
@@ -17002,13 +17049,20 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
 
     #[test]
     fn codex_catalog_requires_bundled_sol_for_deepseek_profile() {
-        let err = codex_models_catalog_value_with_templates(
-            vec!["deepseek-v4-flash".to_string()],
-            &[json!({ "slug": "gpt-5.6-terra" })],
-        )
-        .expect_err("DeepSeek profile must not use a fabricated fallback");
+        for model in ["deepseek-v4-flash", "deepseek-v4-pro"] {
+            let err = codex_models_catalog_value_with_templates(
+                vec![model.to_string()],
+                &[json!({ "slug": "gpt-5.6-terra" })],
+            )
+            .expect_err("DeepSeek profile must not use a fabricated fallback");
 
-        assert!(err.contains("gpt-5.6-sol"));
+            assert!(err.contains("gpt-5.6-sol"));
+            assert!(err.contains(if model.ends_with("pro") {
+                "DeepSeek-V4-Pro"
+            } else {
+                "DeepSeek-V4-Flash"
+            }));
+        }
     }
 
     #[test]
