@@ -4826,6 +4826,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "getrandom 0.3.4",
+ "http-body-util",
  "reqwest 0.12.28",
  "semver",
  "serde",

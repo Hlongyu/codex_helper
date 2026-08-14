@@ -61,7 +61,7 @@ const MAX_STREAM_IDLE_TIMEOUT_SECS: u64 = 3_600;
 const MAX_SLOW_DELAY_SECS: u64 = 3_600;
 const SLOW_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const SLOW_HEARTBEAT: &[u8] = b": slow-mode keep-alive\n\n";
-const MAX_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PROXY_ERROR_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DEBUG_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
 const GPT56_LONG_CONTEXT_WINDOW: i64 = 372_000;
@@ -7126,21 +7126,21 @@ fn decoded_proxy_request_body(
         ));
     }
 
-    let decoder = zstd::stream::read::Decoder::new(Cursor::new(body))
+    let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(body))
         .map_err(|err| format!("无法解压 zstd 请求体: {err}"))?;
-    let mut limited = decoder.take((MAX_PROXY_BODY_BYTES + 1) as u64);
     let mut decoded = Vec::new();
-    limited
+    decoder
         .read_to_end(&mut decoded)
         .map_err(|err| format!("无法读取 zstd 请求体: {err}"))?;
-    if decoded.len() > MAX_PROXY_BODY_BYTES {
-        return Err(format!(
-            "解压后的请求体超过 {} MiB 限制",
-            MAX_PROXY_BODY_BYTES / 1024 / 1024
-        ));
-    }
 
     Ok(Bytes::from(decoded))
+}
+
+async fn read_proxy_request_body(body: Body) -> Result<Bytes, String> {
+    http_body_util::BodyExt::collect(body)
+        .await
+        .map(|body| body.to_bytes())
+        .map_err(|err| format!("无法读取请求体: {err}"))
 }
 
 fn body_with_provider_overrides(
@@ -9704,7 +9704,7 @@ fn slow_stream_response(
                             if !status.is_success() {
                                 let body = axum::body::to_bytes(
                                     response.into_body(),
-                                    MAX_PROXY_BODY_BYTES,
+                                    MAX_PROXY_ERROR_BODY_BYTES,
                                 )
                                 .await
                                 .unwrap_or_default();
@@ -9835,9 +9835,9 @@ async fn proxy_claude_request(
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let inbound_body = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
+    let inbound_body = match read_proxy_request_body(body).await {
         Ok(bytes) => bytes,
-        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
+        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
     let body_bytes = match decoded_proxy_request_body(
         router.zstd_decompression_enabled,
@@ -10209,9 +10209,9 @@ async fn proxy_request(
         .await;
     }
 
-    let body_bytes = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
+    let body_bytes = match read_proxy_request_body(body).await {
         Ok(bytes) => bytes,
-        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
+        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
     let streams = decoded_proxy_request_body(
         state.router.zstd_decompression_enabled,
@@ -10312,9 +10312,9 @@ async fn proxy_request_now(
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let inbound_body = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
+    let inbound_body = match read_proxy_request_body(body).await {
         Ok(bytes) => bytes,
-        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, format!("无法读取请求体: {err}")),
+        Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
     let body_bytes = match decoded_proxy_request_body(
         router.zstd_decompression_enabled,
@@ -13795,7 +13795,7 @@ multi_agent = false
                 "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
             let upstream = async move { Response::new(Body::from(upstream_event)) }.boxed();
             let response = slow_stream_response(SlowStreamProtocol::Codex, upstream);
-            let body = axum::body::to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+            let body = axum::body::to_bytes(response.into_body(), MAX_PROXY_ERROR_BODY_BYTES)
                 .await
                 .unwrap();
             let expected = format!(
@@ -14713,6 +14713,31 @@ experimental_bearer_token = "secret-token"
         let decoded_without_header =
             decoded_proxy_request_body(true, &HeaderMap::new(), &compressed).unwrap();
         assert_eq!(decoded_without_header.as_ref(), raw);
+    }
+
+    #[test]
+    fn accepts_request_bodies_larger_than_the_previous_limit() {
+        let previous_limit = 32 * 1024 * 1024;
+        let expected_len = previous_limit + 1;
+        let large_body = vec![b'x'; expected_len];
+        let compressed = zstd::stream::encode_all(Cursor::new(&large_body), 0).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let body = runtime
+            .block_on(read_proxy_request_body(Body::from(large_body)))
+            .unwrap();
+        assert_eq!(body.len(), expected_len);
+        drop(body);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        let decoded = decoded_proxy_request_body(true, &headers, &compressed).unwrap();
+        assert_eq!(decoded.len(), expected_len);
+        assert_eq!(decoded.first(), Some(&b'x'));
+        assert_eq!(decoded.last(), Some(&b'x'));
     }
 
     #[test]
