@@ -62,6 +62,7 @@ type RouterConfig = {
   remote_compaction_enabled: boolean;
   zstd_decompression_enabled: boolean;
   gpt56_long_context_enabled: boolean;
+  gpt56_long_context_window: number;
   model_provider: string;
   codex_model: string;
   host: string;
@@ -470,6 +471,7 @@ const ROUTER_TIMEOUT_LIMITS = {
   stream_idle_timeout_secs: 3600,
 } as const;
 const MAX_SLOW_DELAY_SECS = 3600;
+const DEFAULT_GPT56_LONG_CONTEXT_WINDOW = 372_000;
 
 function defaultBalanceQuery(endpoint = ""): BalanceQueryConfig {
   return {
@@ -493,6 +495,7 @@ function defaultRouterConfig(): RouterConfig {
     remote_compaction_enabled: false,
     zstd_decompression_enabled: true,
     gpt56_long_context_enabled: false,
+    gpt56_long_context_window: DEFAULT_GPT56_LONG_CONTEXT_WINDOW,
     model_provider: "custom",
     codex_model: "",
     host: "127.0.0.1",
@@ -596,6 +599,17 @@ function routerSlowModeError(router: RouterConfig) {
     if (router.slow_delay_max_secs < router.slow_delay_secs) {
       return "随机延迟上限不能小于下限。";
     }
+  }
+  return "";
+}
+
+function routerLongContextWindowError(router: RouterConfig) {
+  if (!router.gpt56_long_context_enabled) return "";
+  if (
+    !Number.isSafeInteger(router.gpt56_long_context_window) ||
+    router.gpt56_long_context_window < 1
+  ) {
+    return "上下文大小必须是大于 0 的整数。";
   }
   return "";
 }
@@ -2167,6 +2181,7 @@ function App() {
     busy ||
     !routeDirty ||
     Boolean(routerModelProviderError(routerDraft)) ||
+    Boolean(routerLongContextWindowError(routerDraft)) ||
     Boolean(
       effectiveRouterCodexModelError(
         routerDraft,
@@ -2976,6 +2991,7 @@ function RouteScreen({
     appState.codex_models,
     appState.clients.codex.enabled,
   );
+  const longContextWindowError = routerLongContextWindowError(routerDraft);
 
   return (
     <section className="route-page">
@@ -3074,19 +3090,40 @@ function RouteScreen({
               }
             />
           </div>
-          <div className="route-toggle-line">
+          <div className="route-toggle-line long-context-setting">
             <div>
               <strong>GPT-5.6 长上下文</strong>
-              <p>将 Sol、Terra 和 Luna 的窗口从 272K 提升到 372K，有效上下文约 353K。</p>
+              <p>为 Sol、Terra 和 Luna 设置自定义上下文窗口。</p>
             </div>
-            <Toggle
-              checked={routerDraft.gpt56_long_context_enabled}
-              disabled={busy}
-              label="启用 GPT-5.6 长上下文"
-              onChange={(gpt56_long_context_enabled) =>
-                setRouterDraft({ ...routerDraft, gpt56_long_context_enabled })
-              }
-            />
+            <div className="long-context-controls">
+              <label className="compact-field">
+                <span>上下文大小（Token）</span>
+                <input
+                  aria-invalid={Boolean(longContextWindowError)}
+                  disabled={busy || !routerDraft.gpt56_long_context_enabled}
+                  inputMode="numeric"
+                  min={1}
+                  step={1000}
+                  type="number"
+                  value={routerDraft.gpt56_long_context_window}
+                  onChange={(event) =>
+                    setRouterDraft({
+                      ...routerDraft,
+                      gpt56_long_context_window: Number(event.currentTarget.value),
+                    })
+                  }
+                />
+                {longContextWindowError ? <small>{longContextWindowError}</small> : null}
+              </label>
+              <Toggle
+                checked={routerDraft.gpt56_long_context_enabled}
+                disabled={busy}
+                label="启用 GPT-5.6 长上下文"
+                onChange={(gpt56_long_context_enabled) =>
+                  setRouterDraft({ ...routerDraft, gpt56_long_context_enabled })
+                }
+              />
+            </div>
           </div>
           <div className="route-toggle-line">
             <div>

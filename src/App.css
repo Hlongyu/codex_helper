@@ -4144,6 +4144,26 @@ button.danger,
   border-color: var(--danger);
 }
 
+.long-context-controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.long-context-controls .compact-field {
+  width: 190px;
+  margin-top: 0;
+}
+
+.long-context-controls .compact-field small {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.long-context-controls input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
 .local-proxy-settings .route-form-grid {
   margin-top: 4px;
 }
@@ -4273,10 +4293,20 @@ button.danger,
 }
 
 @media (max-width: 680px) {
+  .long-context-setting,
   .local-proxy-settings .panel-head,
   .route-slow-heading {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .long-context-controls,
+  .long-context-controls .compact-field {
+    width: 100%;
+  }
+
+  .long-context-controls .switch {
+    flex: 0 0 auto;
   }
 
   .local-proxy-settings .route-form-grid {

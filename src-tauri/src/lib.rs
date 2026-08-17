@@ -64,7 +64,7 @@ const SLOW_HEARTBEAT: &[u8] = b": slow-mode keep-alive\n\n";
 const MAX_PROXY_ERROR_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DEBUG_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
-const GPT56_LONG_CONTEXT_WINDOW: i64 = 372_000;
+const DEFAULT_GPT56_LONG_CONTEXT_WINDOW: u64 = 372_000;
 const EMBEDDED_CODEX_MODEL_CATALOG_VERSION: &str = "0.146.1";
 const EMBEDDED_CODEX_MODEL_CATALOG_JSON: &str = include_str!("catalogs/codex-models.json");
 const CODEX_ROUTER_MODEL_CATALOG: &str = "config-manager/router-models.json";
@@ -345,6 +345,8 @@ struct RouterConfig {
     zstd_decompression_enabled: bool,
     #[serde(default)]
     gpt56_long_context_enabled: bool,
+    #[serde(default = "default_gpt56_long_context_window")]
+    gpt56_long_context_window: u64,
     #[serde(default = "default_router_model_provider")]
     model_provider: String,
     #[serde(default)]
@@ -535,6 +537,7 @@ impl Default for RouterConfig {
             remote_compaction_enabled: false,
             zstd_decompression_enabled: true,
             gpt56_long_context_enabled: false,
+            gpt56_long_context_window: default_gpt56_long_context_window(),
             model_provider: default_router_model_provider(),
             codex_model: String::new(),
             host: default_router_host(),
@@ -894,6 +897,8 @@ struct SaveRouterPayload {
     zstd_decompression_enabled: bool,
     #[serde(default)]
     gpt56_long_context_enabled: bool,
+    #[serde(default = "default_gpt56_long_context_window")]
+    gpt56_long_context_window: u64,
     #[serde(default = "default_router_model_provider")]
     model_provider: String,
     #[serde(default)]
@@ -1685,6 +1690,17 @@ fn default_response_header_timeout_secs() -> u64 {
 
 fn default_stream_idle_timeout_secs() -> u64 {
     DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+}
+
+fn default_gpt56_long_context_window() -> u64 {
+    DEFAULT_GPT56_LONG_CONTEXT_WINDOW
+}
+
+fn validate_gpt56_long_context(config: &RouterConfig) -> Result<(), String> {
+    if config.gpt56_long_context_enabled && config.gpt56_long_context_window == 0 {
+        return Err("GPT-5.6 上下文大小必须是大于 0 的整数".to_string());
+    }
+    Ok(())
 }
 
 fn normalize_router_model_provider(value: &str) -> Result<String, String> {
@@ -3132,6 +3148,9 @@ fn load_state_file() -> Result<ManagerState, String> {
 }
 
 fn normalize_state(mut state: ManagerState) -> ManagerState {
+    if state.router.gpt56_long_context_window == 0 {
+        state.router.gpt56_long_context_window = default_gpt56_long_context_window();
+    }
     for provider in &mut state.providers {
         provider.auto_disable_reset_weekday =
             normalize_auto_disable_reset_weekday(provider.auto_disable_reset_weekday);
@@ -5968,6 +5987,7 @@ fn ensure_codex_model_catalog_applied(state: &ManagerState) -> Result<bool, Stri
     let desired = codex_models_catalog_value(
         codex_catalog_models_for_state(state),
         state.router.gpt56_long_context_enabled,
+        state.router.gpt56_long_context_window,
     )?;
     if path.exists() {
         let current = fs::read_to_string(&path)
@@ -6712,25 +6732,35 @@ fn codex_models_catalog_value_with_templates(
     models: Vec<String>,
     templates: &[Value],
 ) -> Result<Value, String> {
-    codex_models_catalog_value_with_templates_and_context(models, templates, false)
+    codex_models_catalog_value_with_templates_and_context(
+        models,
+        templates,
+        false,
+        default_gpt56_long_context_window(),
+    )
 }
 
 fn codex_models_catalog_value_with_templates_and_context(
     models: Vec<String>,
     templates: &[Value],
     gpt56_long_context_enabled: bool,
+    gpt56_long_context_window: u64,
 ) -> Result<Value, String> {
     let mut catalog_models = Vec::new();
     for model in models {
         if let Some(mut entry) = codex_model_catalog_entry(&model, templates)? {
-            apply_gpt56_long_context(&mut entry, gpt56_long_context_enabled);
+            apply_gpt56_long_context(
+                &mut entry,
+                gpt56_long_context_enabled,
+                gpt56_long_context_window,
+            );
             catalog_models.push(entry);
         }
     }
     Ok(json!({ "models": catalog_models }))
 }
 
-fn apply_gpt56_long_context(entry: &mut Value, enabled: bool) {
+fn apply_gpt56_long_context(entry: &mut Value, enabled: bool, context_window: u64) {
     if !enabled {
         return;
     }
@@ -6749,13 +6779,10 @@ fn apply_gpt56_long_context(entry: &mut Value, enabled: bool) {
     if !is_gpt56 {
         return;
     }
-    object.insert(
-        "context_window".to_string(),
-        Value::from(GPT56_LONG_CONTEXT_WINDOW),
-    );
+    object.insert("context_window".to_string(), Value::from(context_window));
     object.insert(
         "max_context_window".to_string(),
-        Value::from(GPT56_LONG_CONTEXT_WINDOW),
+        Value::from(context_window),
     );
     object.insert("auto_compact_token_limit".to_string(), Value::Null);
 }
@@ -6763,12 +6790,14 @@ fn apply_gpt56_long_context(entry: &mut Value, enabled: bool) {
 fn codex_models_catalog_value(
     models: Vec<String>,
     gpt56_long_context_enabled: bool,
+    gpt56_long_context_window: u64,
 ) -> Result<Value, String> {
     let templates = load_codex_model_catalog_templates();
     codex_models_catalog_value_with_templates_and_context(
         models,
         &templates,
         gpt56_long_context_enabled,
+        gpt56_long_context_window,
     )
 }
 
@@ -6784,8 +6813,16 @@ fn models_response(models: Vec<String>) -> Response {
     json_response(openai_models_value(models))
 }
 
-fn codex_models_response(models: Vec<String>, gpt56_long_context_enabled: bool) -> Response {
-    match codex_models_catalog_value(models, gpt56_long_context_enabled) {
+fn codex_models_response(
+    models: Vec<String>,
+    gpt56_long_context_enabled: bool,
+    gpt56_long_context_window: u64,
+) -> Response {
+    match codex_models_catalog_value(
+        models,
+        gpt56_long_context_enabled,
+        gpt56_long_context_window,
+    ) {
         Ok(value) => json_response(value),
         Err(err) => proxy_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
@@ -10301,7 +10338,11 @@ async fn proxy_request_now(
         let models = configured_route_models(&candidates);
         if !models.is_empty() {
             return if codex_model_catalog_requested(uri.query()) {
-                codex_models_response(models, router.gpt56_long_context_enabled)
+                codex_models_response(
+                    models,
+                    router.gpt56_long_context_enabled,
+                    router.gpt56_long_context_window,
+                )
             } else {
                 models_response(models)
             };
@@ -12789,6 +12830,7 @@ fn save_router_config(
         remote_compaction_enabled: payload.remote_compaction_enabled,
         zstd_decompression_enabled: payload.zstd_decompression_enabled,
         gpt56_long_context_enabled: payload.gpt56_long_context_enabled,
+        gpt56_long_context_window: payload.gpt56_long_context_window,
         model_provider,
         codex_model,
         host: if host.is_empty() {
@@ -12811,6 +12853,7 @@ fn save_router_config(
     };
     validate_router_timeouts(&router)?;
     validate_router_slow_mode(&router)?;
+    validate_gpt56_long_context(&router)?;
     state.router = router;
     ensure_client_configs_applied(&mut state)?;
     save_state(&state)?;
@@ -13616,6 +13659,10 @@ mod tests {
         assert!(!router.force_disable_openai_auth);
         assert!(router.zstd_decompression_enabled);
         assert!(!router.gpt56_long_context_enabled);
+        assert_eq!(
+            router.gpt56_long_context_window,
+            DEFAULT_GPT56_LONG_CONTEXT_WINDOW
+        );
     }
 
     #[test]
@@ -13774,6 +13821,22 @@ multi_agent = false
         for _ in 0..32 {
             assert!((5..=10).contains(&selected_slow_delay_secs(&router)));
         }
+    }
+
+    #[test]
+    fn validates_gpt56_long_context_window() {
+        let mut router = RouterConfig {
+            gpt56_long_context_enabled: true,
+            gpt56_long_context_window: 0,
+            ..RouterConfig::default()
+        };
+
+        assert!(validate_gpt56_long_context(&router).is_err());
+        router.gpt56_long_context_window = 1_000_000;
+        assert!(validate_gpt56_long_context(&router).is_ok());
+        router.gpt56_long_context_enabled = false;
+        router.gpt56_long_context_window = 0;
+        assert!(validate_gpt56_long_context(&router).is_ok());
     }
 
     #[test]
@@ -16894,6 +16957,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             ],
             &templates,
             true,
+            1_000_000,
         )
         .expect("long-context catalog");
         let models = catalog
@@ -16904,11 +16968,11 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         for model in &models[..3] {
             assert_eq!(
                 model.get("context_window").and_then(Value::as_i64),
-                Some(GPT56_LONG_CONTEXT_WINDOW)
+                Some(1_000_000)
             );
             assert_eq!(
                 model.get("max_context_window").and_then(Value::as_i64),
-                Some(GPT56_LONG_CONTEXT_WINDOW)
+                Some(1_000_000)
             );
             assert_eq!(model.get("auto_compact_token_limit"), Some(&Value::Null));
         }
