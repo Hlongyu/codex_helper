@@ -15,6 +15,7 @@ type BalanceQueryType = "disabled" | "new_api" | "sub2_api" | "ai_gate";
 type NewApiBalanceTarget = "token_quota" | "account_balance";
 type BalanceAuthMode = "provider_token" | "separate_token";
 type ProviderWireApi = "responses" | "chat_completions";
+type ProviderServiceTier = "" | "priority" | "ultrafast";
 type ProviderStatus = "enabled" | "disabled" | "auto_disabled";
 type AutoDisableResetPeriod = "daily" | "weekly" | "monthly" | "never";
 type SlowMode = "off" | "fixed" | "random";
@@ -1379,7 +1380,7 @@ function App() {
   const [providerAutoDisableResetDay, setProviderAutoDisableResetDay] = useState(1);
   const [providerAutoDisableResetTime, setProviderAutoDisableResetTime] = useState("00:00");
   const [providerWireApi, setProviderWireApi] = useState<ProviderWireApi>("responses");
-  const [providerFastMode, setProviderFastMode] = useState(false);
+  const [providerServiceTier, setProviderServiceTier] = useState<ProviderServiceTier>("");
   const [providerTestModel, setProviderTestModel] = useState("");
   const [providerModels, setProviderModels] = useState<string[]>([]);
   const [allowedModels, setAllowedModels] = useState<string[]>([]);
@@ -1599,7 +1600,14 @@ function App() {
     setProviderAutoDisableResetDay(targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1);
     setProviderAutoDisableResetTime(targetFull.auto_disable_reset_time ?? summary?.auto_disable_reset_time ?? "00:00");
     setProviderWireApi(targetFull.wire_api ?? "responses");
-    setProviderFastMode(targetFull.service_tier?.trim().toLowerCase() === "priority");
+    const serviceTier = targetFull.service_tier?.trim().toLowerCase();
+    setProviderServiceTier(
+      serviceTier === "priority" || serviceTier === "fast"
+        ? "priority"
+        : serviceTier === "ultrafast"
+          ? "ultrafast"
+          : "",
+    );
     setProviderTestModel(targetFull.connection_test_model ?? "");
     setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
     setAllowedModels(targetFull.allowed_models ?? []);
@@ -1707,7 +1715,7 @@ function App() {
         config_toml: "",
         base_url: providerBaseUrl,
         wire_api: providerWireApi,
-        service_tier: providerFastMode ? "priority" : "",
+        service_tier: providerServiceTier,
         auto_disable_reset_period: providerAutoDisableResetPeriod,
         auto_disable_reset_weekday: providerAutoDisableResetWeekday,
         auto_disable_reset_day: providerAutoDisableResetDay,
@@ -2612,7 +2620,7 @@ function App() {
           providerAutoDisableResetWeekday={providerAutoDisableResetWeekday}
           providerAutoDisableResetDay={providerAutoDisableResetDay}
           providerAutoDisableResetTime={providerAutoDisableResetTime}
-          providerFastMode={providerFastMode}
+          providerServiceTier={providerServiceTier}
           providerWireApi={providerWireApi}
           secretVisible={secretVisible}
           setProviderApiKey={(value) => {
@@ -2637,7 +2645,7 @@ function App() {
           setProviderAutoDisableResetWeekday={setProviderAutoDisableResetWeekday}
           setProviderAutoDisableResetDay={setProviderAutoDisableResetDay}
           setProviderAutoDisableResetTime={setProviderAutoDisableResetTime}
-          setProviderFastMode={setProviderFastMode}
+          setProviderServiceTier={setProviderServiceTier}
           setProviderWireApi={setProviderWireApi}
           setSecretVisible={setSecretVisible}
           tab={editorTab}
@@ -4926,7 +4934,7 @@ function ProviderEditor(props: {
   providerAutoDisableResetWeekday: number;
   providerAutoDisableResetDay: number;
   providerAutoDisableResetTime: string;
-  providerFastMode: boolean;
+  providerServiceTier: ProviderServiceTier;
   providerWireApi: ProviderWireApi;
   secretVisible: boolean;
   setAllowedModels: (models: string[]) => void;
@@ -4939,7 +4947,7 @@ function ProviderEditor(props: {
   setProviderAutoDisableResetWeekday: (value: number) => void;
   setProviderAutoDisableResetDay: (value: number) => void;
   setProviderAutoDisableResetTime: (value: string) => void;
-  setProviderFastMode: (value: boolean) => void;
+  setProviderServiceTier: (value: ProviderServiceTier) => void;
   setProviderWireApi: (value: ProviderWireApi) => void;
   setSecretVisible: (value: boolean) => void;
   tab: EditorTab;
@@ -4968,7 +4976,7 @@ function ProviderEditor(props: {
     providerAutoDisableResetWeekday,
     providerAutoDisableResetDay,
     providerAutoDisableResetTime,
-    providerFastMode,
+    providerServiceTier,
     providerWireApi,
     secretVisible,
     setAllowedModels,
@@ -4981,7 +4989,7 @@ function ProviderEditor(props: {
     setProviderAutoDisableResetWeekday,
     setProviderAutoDisableResetDay,
     setProviderAutoDisableResetTime,
-    setProviderFastMode,
+    setProviderServiceTier,
     setProviderWireApi,
     setSecretVisible,
     tab,
@@ -5081,14 +5089,18 @@ function ProviderEditor(props: {
                 setResetTime={setProviderAutoDisableResetTime}
                 setResetWeekday={setProviderAutoDisableResetWeekday}
               />
-              <div className="provider-fast-mode-row">
-                <strong>强制启用 Fast 模式</strong>
-                <Toggle
-                  checked={providerFastMode}
-                  label="强制启用 Fast 模式"
-                  onChange={setProviderFastMode}
-                />
-              </div>
+              <label className="field">
+                <span>请求服务层级</span>
+                <select
+                  value={providerServiceTier}
+                  onChange={(event) => setProviderServiceTier(event.currentTarget.value as ProviderServiceTier)}
+                >
+                  <option value="">不强制</option>
+                  <option value="priority">Fast</option>
+                  <option value="ultrafast">Ultrafast</option>
+                </select>
+                <small>Ultrafast 需要上游授权，目前仅适用于 GPT-5.6 Sol</small>
+              </label>
             </>
           )}
 

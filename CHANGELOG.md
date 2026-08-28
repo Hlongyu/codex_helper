@@ -1,5 +1,15 @@
 # 更新记录
 
+## v1.2.34 - 2026-08-29
+
+### 新增
+
+- Codex 供应商的请求服务层级由 Fast 开关改为“不强制”“Fast”和“Ultrafast”三档选择，可按供应商强制发送 `service_tier: "priority"` 或 `service_tier: "ultrafast"`。
+
+### 兼容与行为
+
+- 旧配置中的 `fast` 会自动按 `priority` 读取；Ultrafast 需要上游权限，目前仅适用于 `gpt-5.6-sol`。
+
 ## v1.2.33 - 2026-08-17
 
 ### 新增

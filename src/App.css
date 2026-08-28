@@ -3822,22 +3822,6 @@ textarea::placeholder {
   padding: 22px 26px;
 }
 
-.provider-fast-mode-row {
-  display: flex;
-  min-height: 64px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-  padding: 14px 2px;
-}
-
-.provider-fast-mode-row strong {
-  color: var(--text);
-  font-size: 14px;
-}
-
 .secret-field button,
 .quota-box button,
 .balance-test-box button {

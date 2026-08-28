@@ -15901,6 +15901,19 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             Some("priority")
         );
         assert_eq!(prepared.path, "chat/completions");
+
+        provider.wire_api = ProviderWireApi::Responses;
+        provider.service_tier = "ultrafast".to_string();
+        let ultrafast_body = br#"{"model":"gpt-5.6-sol","input":"hello","service_tier":"default"}"#;
+        let prepared =
+            prepare_upstream_request(&provider, "responses", "", ultrafast_body, "gpt-5.6-sol")
+                .expect("ultrafast request prepares");
+        let value = serde_json::from_slice::<Value>(&prepared.body).expect("prepared body is json");
+
+        assert_eq!(
+            value.get("service_tier").and_then(Value::as_str),
+            Some("ultrafast")
+        );
     }
 
     #[test]
