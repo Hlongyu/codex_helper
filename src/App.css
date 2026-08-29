@@ -3588,6 +3588,30 @@ textarea::placeholder {
   font-size: 13px;
 }
 
+.request-detail-grid .service-tier-result {
+  width: fit-content;
+  border-radius: 4px;
+  padding: 2px 7px;
+  background: var(--surface-strong);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.request-detail-grid .service-tier-result.ok {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.request-detail-grid .service-tier-result.amber {
+  background: #fff5e5;
+  color: #9a5d08;
+}
+
+.request-detail-grid .service-tier-result.danger {
+  background: #fff0f0;
+  color: #a83838;
+}
+
 .request-timing-list {
   display: grid;
   gap: 11px;

@@ -291,6 +291,8 @@ type RouteRequestLog = {
   } | null;
   upstream_model?: string | null;
   request_body?: RequestBodyInfo | null;
+  requested_service_tier?: string | null;
+  actual_service_tier?: string | null;
   provider_id: string;
   provider_name: string;
   provider_order: number;
@@ -832,6 +834,31 @@ function remoteCompactionV2AuditLabel(log: RouteRequestLog) {
   return steps.join(" · ");
 }
 
+function normalizedServiceTier(value?: string | null) {
+  const tier = value?.trim().toLowerCase() || "";
+  return tier === "fast" ? "priority" : tier;
+}
+
+function serviceTierLabel(value?: string | null, emptyLabel = "未返回") {
+  const tier = normalizedServiceTier(value);
+  if (!tier) return emptyLabel;
+  if (tier === "priority") return "Fast (priority)";
+  if (tier === "ultrafast") return "Ultrafast";
+  if (tier === "default") return "标准 (default)";
+  if (tier === "flex") return "Flex";
+  if (tier === "auto") return "自动 (auto)";
+  return tier;
+}
+
+function serviceTierResult(log: RouteRequestLog) {
+  const requested = normalizedServiceTier(log.requested_service_tier);
+  const actual = normalizedServiceTier(log.actual_service_tier);
+  if (!requested) return { label: "未强制", tone: "neutral" } as const;
+  if (!actual) return { label: "未确认", tone: "amber" } as const;
+  if (requested === actual) return { label: "已生效", tone: "ok" } as const;
+  return { label: "未生效", tone: "danger" } as const;
+}
+
 function formatMs(value?: number | null) {
   if (value == null) return "-";
   if (value >= 1000) return `${(value / 1000).toFixed(value >= 10_000 ? 1 : 1)} s`;
@@ -991,6 +1018,9 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
     "状态",
     "模型",
     "供应商",
+    "请求服务层级",
+    "实际服务层级",
+    "服务层级结果",
     "V2 压缩审计",
     "Token",
     "首字延迟",
@@ -1003,6 +1033,9 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
     statusMeta(log.status).label,
     log.model,
     log.provider_name,
+    serviceTierLabel(log.requested_service_tier, "未强制"),
+    serviceTierLabel(log.actual_service_tier),
+    serviceTierResult(log).label,
     remoteCompactionV2AuditLabel(log),
     log.total_tokens,
     log.first_byte_ms ?? "",
@@ -3903,6 +3936,7 @@ function RequestLogsScreen({
 
 function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () => void }) {
   const status = statusMeta(log.status);
+  const tierResult = serviceTierResult(log);
   const phases = routeTimingPhases(log);
   const compactionAudit = remoteCompactionV2AuditLabel(log);
   const [debugCapture, setDebugCapture] = useState<RouteDebugCapture | null>(null);
@@ -3997,6 +4031,18 @@ function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () 
               <div><span>上游模型</span><strong>{log.upstream_model || log.model || "-"}</strong></div>
               <div><span>供应商</span><strong>{log.provider_name}</strong></div>
               <div><span>路由尝试</span><strong>{log.route_attempts} 次</strong></div>
+              <div>
+                <span>请求服务层级</span>
+                <strong>{serviceTierLabel(log.requested_service_tier, "未强制")}</strong>
+              </div>
+              <div>
+                <span>实际服务层级</span>
+                <strong>{serviceTierLabel(log.actual_service_tier)}</strong>
+              </div>
+              <div>
+                <span>服务层级验证</span>
+                <strong className={`service-tier-result ${tierResult.tone}`}>{tierResult.label}</strong>
+              </div>
               {log.slow_delay_ms != null ? (
                 <div><span>Slow 延迟</span><strong>{formatDuration(log.slow_delay_ms)}</strong></div>
               ) : null}

@@ -1191,6 +1191,10 @@ struct RouteRequestLog {
     upstream_model: Option<String>,
     #[serde(default)]
     request_body: Option<RequestBodyInfo>,
+    #[serde(default)]
+    requested_service_tier: Option<String>,
+    #[serde(default)]
+    actual_service_tier: Option<String>,
     provider_id: String,
     provider_name: String,
     provider_order: usize,
@@ -1529,6 +1533,8 @@ struct PendingRouteLog {
     remote_compaction_v2: RemoteCompactionV2Audit,
     upstream_model: Option<String>,
     request_body: Option<RequestBodyInfo>,
+    requested_service_tier: Option<String>,
+    actual_service_tier: Option<String>,
     provider_id: String,
     provider_name: String,
     provider_order: usize,
@@ -1613,11 +1619,12 @@ enum ResponsesStreamTerminal {
     Incomplete,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SseChunkMetadata {
     compaction_response_received: bool,
     terminal: Option<ResponsesStreamTerminal>,
     claude_message_stop: bool,
+    actual_service_tier: Option<String>,
 }
 
 struct ChatToResponsesStreamState {
@@ -1629,6 +1636,7 @@ struct ChatToResponsesStreamState {
     response_id: String,
     created_at: i64,
     model: String,
+    actual_service_tier: Option<String>,
     output_text: String,
     reasoning_content: String,
     output_index: usize,
@@ -8165,6 +8173,7 @@ fn chat_completion_to_responses_value(value: &Value, context: &CodexToolContext)
         "created_at": created_at,
         "status": "completed",
         "model": model,
+        "service_tier": service_tier_from_response_value(value),
         "output": output,
         "output_text": output_text,
         "usage": chat_usage_to_responses_usage(value.get("usage"))
@@ -8201,6 +8210,7 @@ fn chat_stream_response_completed_event(
     response_id: &str,
     created_at: i64,
     model: &str,
+    service_tier: Option<&str>,
     output_text: &str,
     completed_output: &[(usize, Value)],
     usage: &TokenUsage,
@@ -8227,6 +8237,7 @@ fn chat_stream_response_completed_event(
                 "instructions": null,
                 "max_output_tokens": null,
                 "model": model,
+                "service_tier": service_tier,
                 "usage": token_usage_to_responses_usage(usage),
                 "output": output,
                 "tools": []
@@ -8479,6 +8490,7 @@ fn chat_stream_events_to_responses(
     response_id: &mut String,
     created_at: &mut i64,
     model: &mut String,
+    actual_service_tier: &mut Option<String>,
     output_text: &mut String,
     reasoning_content: &mut String,
     output_index: &mut usize,
@@ -8525,6 +8537,9 @@ fn chat_stream_events_to_responses(
                     *model = model_value.to_string();
                 }
             }
+            if let Some(service_tier) = service_tier_from_response_value(&value) {
+                *actual_service_tier = Some(service_tier);
+            }
             if !*started {
                 *started = true;
                 *sequence_number += 1;
@@ -8539,6 +8554,7 @@ fn chat_stream_events_to_responses(
                             "created_at": *created_at,
                             "status": "in_progress",
                             "model": model,
+                            "service_tier": actual_service_tier.as_deref(),
                             "output": []
                         }
                     }),
@@ -8646,6 +8662,7 @@ fn chat_stream_events_to_responses(
                     response_id,
                     *created_at,
                     model,
+                    actual_service_tier.as_deref(),
                     output_text,
                     completed_output,
                     usage,
@@ -8663,6 +8680,61 @@ fn usage_from_response_value(value: &Value) -> TokenUsage {
         .or_else(|| value.pointer("/message/usage"))
         .map(usage_from_value)
         .unwrap_or_default()
+}
+
+fn normalize_service_tier(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        None
+    } else if value == "fast" {
+        Some("priority".to_string())
+    } else {
+        Some(value)
+    }
+}
+
+fn service_tier_from_response_value(value: &Value) -> Option<String> {
+    value
+        .get("service_tier")
+        .or_else(|| value.pointer("/response/service_tier"))
+        .and_then(Value::as_str)
+        .and_then(normalize_service_tier)
+}
+
+fn service_tier_from_request_body(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("service_tier")
+                .and_then(Value::as_str)
+                .and_then(normalize_service_tier)
+        })
+}
+
+fn service_tier_from_sse_event(event: &str) -> Option<String> {
+    let data = event
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("data:").map(str::trim))
+        .filter(|line| !line.is_empty() && *line != "[DONE]")
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str::<Value>(&data)
+        .ok()
+        .and_then(|value| service_tier_from_response_value(&value))
+}
+
+fn service_tier_from_response_text(text: &str) -> Option<String> {
+    if let Some(service_tier) = serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| service_tier_from_response_value(&value))
+    {
+        return Some(service_tier);
+    }
+
+    text.split("\n\n")
+        .chain(text.split("\r\n\r\n"))
+        .find_map(service_tier_from_sse_event)
 }
 
 fn merge_token_usage(usage: &mut TokenUsage, next: TokenUsage) {
@@ -8803,6 +8875,9 @@ fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) -
         if let Some(terminal) = responses_stream_terminal_from_sse_event(&event) {
             metadata.terminal = Some(terminal);
         }
+        if let Some(service_tier) = service_tier_from_sse_event(&event) {
+            metadata.actual_service_tier = Some(service_tier);
+        }
         metadata.claude_message_stop |= sse_event_has_type(&event, "message_stop");
         let next = usage_from_sse_event(&event);
         if !usage_is_zero(&next) {
@@ -8837,6 +8912,9 @@ fn route_stream_ingest(state: &mut RouteStreamState, bytes: &[u8]) {
     if metadata.terminal.is_some() {
         state.terminal = metadata.terminal;
     }
+    if metadata.actual_service_tier.is_some() {
+        state.pending.actual_service_tier = metadata.actual_service_tier;
+    }
     if metadata.compaction_response_received {
         state
             .pending
@@ -8854,11 +8932,15 @@ fn route_stream_finish_usage(state: &mut RouteStreamState) {
     let mut usage = std::mem::take(&mut state.usage);
     let compaction_response_received = sse_event_contains_compaction_item(&buffer);
     let terminal = responses_stream_terminal_from_sse_event(&buffer);
+    let actual_service_tier = service_tier_from_sse_event(&buffer);
     finish_sse_usage(&mut buffer, &mut usage);
     state.sse_buffer = buffer;
     state.usage = usage;
     if terminal.is_some() {
         state.terminal = terminal;
+    }
+    if actual_service_tier.is_some() {
+        state.pending.actual_service_tier = actual_service_tier;
     }
     if compaction_response_received {
         state
@@ -9070,6 +9152,8 @@ fn build_finished_route_log(
         remote_compaction_v2: pending.remote_compaction_v2,
         upstream_model: pending.upstream_model,
         request_body: pending.request_body,
+        requested_service_tier: pending.requested_service_tier,
+        actual_service_tier: pending.actual_service_tier,
         provider_id: pending.provider_id,
         provider_name: pending.provider_name,
         provider_order: pending.provider_order,
@@ -9115,6 +9199,7 @@ fn build_pending_route_log(
     response_header_ms: Option<u64>,
     upstream_request_id: Option<String>,
     request_body: Option<RequestBodyInfo>,
+    requested_service_tier: Option<String>,
     debug_capture: Option<PendingDebugCapture>,
     error: Option<String>,
 ) -> PendingRouteLog {
@@ -9127,6 +9212,8 @@ fn build_pending_route_log(
         remote_compaction_v2,
         upstream_model: upstream_model.map(str::to_string),
         request_body,
+        requested_service_tier,
+        actual_service_tier: None,
         provider_id: candidate.provider.id.clone(),
         provider_name: candidate.provider.name.clone(),
         provider_order: candidate.route_order,
@@ -9203,6 +9290,8 @@ fn build_pending_claude_route_log(
         remote_compaction_v2: RemoteCompactionV2Audit::default(),
         upstream_model: upstream_model.map(str::to_string),
         request_body,
+        requested_service_tier: None,
+        actual_service_tier: None,
         provider_id: candidate.provider.id.clone(),
         provider_name: candidate.provider.name.clone(),
         provider_order: candidate.route_order,
@@ -9303,6 +9392,7 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                     let mut response_id = std::mem::take(&mut self.response_id);
                     let mut created_at = self.created_at;
                     let mut model = std::mem::take(&mut self.model);
+                    let mut actual_service_tier = self.actual_service_tier.take();
                     let mut output_text = std::mem::take(&mut self.output_text);
                     let mut reasoning_content = std::mem::take(&mut self.reasoning_content);
                     let mut output_index = self.output_index;
@@ -9322,6 +9412,7 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                         &mut response_id,
                         &mut created_at,
                         &mut model,
+                        &mut actual_service_tier,
                         &mut output_text,
                         &mut reasoning_content,
                         &mut output_index,
@@ -9340,6 +9431,8 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                     self.response_id = response_id;
                     self.created_at = created_at;
                     self.model = model;
+                    self.pending.actual_service_tier = actual_service_tier.clone();
+                    self.actual_service_tier = actual_service_tier;
                     self.output_text = output_text;
                     self.reasoning_content = reasoning_content;
                     self.output_index = output_index;
@@ -9393,6 +9486,7 @@ impl futures_util::Stream for ChatToResponsesStreamState {
                             &self.response_id,
                             self.created_at,
                             &self.model,
+                            self.actual_service_tier.as_deref(),
                             &self.output_text,
                             &self.completed_output,
                             &self.usage,
@@ -10426,6 +10520,7 @@ async fn proxy_request_now(
                     return proxy_error(StatusCode::BAD_REQUEST, err);
                 }
             };
+        let requested_service_tier = service_tier_from_request_body(&prepared.body);
         let mut candidate_compaction_audit = remote_compaction_v2_audit.clone();
         if candidate_compaction_audit.trigger_received {
             candidate_compaction_audit.trigger_forwarded =
@@ -10492,6 +10587,7 @@ async fn proxy_request_now(
             None,
             None,
             Some(request_body.clone()),
+            requested_service_tier.clone(),
             debug_capture.clone(),
             None,
         ));
@@ -10536,6 +10632,7 @@ async fn proxy_request_now(
                     None,
                     None,
                     Some(request_body.clone()),
+                    requested_service_tier.clone(),
                     debug_capture.clone(),
                     Some(last_error.clone()),
                 ));
@@ -10593,6 +10690,7 @@ async fn proxy_request_now(
             Some(response_header_ms),
             upstream_request_id,
             Some(request_body),
+            requested_service_tier,
             debug_capture,
             if status.is_success() {
                 None
@@ -10653,6 +10751,7 @@ async fn proxy_request_now(
                         response_id: "resp_chatcmpl".to_string(),
                         created_at: 0,
                         model: String::new(),
+                        actual_service_tier: None,
                         output_text: String::new(),
                         reasoning_content: String::new(),
                         output_index: 0,
@@ -10701,6 +10800,8 @@ async fn proxy_request_now(
             }
         };
         let mut pending = cancellation_guard.take();
+        pending.actual_service_tier =
+            service_tier_from_response_text(&String::from_utf8_lossy(&bytes));
         if let Some(capture) = pending.debug_capture.as_mut() {
             capture.upstream_response_body.append(&bytes);
         }
@@ -13969,6 +14070,7 @@ multi_agent = false
         response_id: String,
         created_at: i64,
         model: String,
+        actual_service_tier: Option<String>,
         output_text: String,
         reasoning_content: String,
         output_index: usize,
@@ -13991,6 +14093,7 @@ multi_agent = false
                 response_id: "resp_chatcmpl".to_string(),
                 created_at: 0,
                 model: String::new(),
+                actual_service_tier: None,
                 output_text: String::new(),
                 reasoning_content: String::new(),
                 output_index: 0,
@@ -14014,6 +14117,7 @@ multi_agent = false
                 &mut self.response_id,
                 &mut self.created_at,
                 &mut self.model,
+                &mut self.actual_service_tier,
                 &mut self.output_text,
                 &mut self.reasoning_content,
                 &mut self.output_index,
@@ -14997,7 +15101,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert!(usage_is_zero(&usage));
         assert_eq!(first_metadata.terminal, None);
 
-        let usage_event = b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":123,\"input_tokens_details\":{\"cached_tokens\":45},\"output_tokens\":67,\"output_tokens_details\":{\"reasoning_tokens\":8},\"total_tokens\":190}}}\r\n\r\n";
+        let usage_event = b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"ultrafast\",\"usage\":{\"input_tokens\":123,\"input_tokens_details\":{\"cached_tokens\":45},\"output_tokens\":67,\"output_tokens_details\":{\"reasoning_tokens\":8},\"total_tokens\":190}}}\r\n\r\n";
         let split = 80;
         let partial_metadata = ingest_sse_chunk(&mut buffer, &mut usage, &usage_event[..split]);
         assert!(usage_is_zero(&usage));
@@ -15013,6 +15117,14 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(
             completed_metadata.terminal,
             Some(ResponsesStreamTerminal::Completed)
+        );
+        assert_eq!(
+            completed_metadata.actual_service_tier.as_deref(),
+            Some("ultrafast")
+        );
+        assert_eq!(
+            service_tier_from_request_body(br#"{"service_tier":"fast"}"#).as_deref(),
+            Some("priority")
         );
     }
 
@@ -15122,6 +15234,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             remote_compaction_v2: RemoteCompactionV2Audit::default(),
             upstream_model: None,
             request_body: None,
+            requested_service_tier: None,
+            actual_service_tier: None,
             provider_id: provider_id.to_string(),
             provider_name: provider_id.to_string(),
             provider_order: 1,
@@ -15166,6 +15280,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             remote_compaction_v2: RemoteCompactionV2Audit::default(),
             upstream_model: None,
             request_body: None,
+            requested_service_tier: None,
+            actual_service_tier: None,
             provider_id: "provider-a".to_string(),
             provider_name: "Provider A".to_string(),
             provider_order: 1,
@@ -15239,6 +15355,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         object.remove("upstream_request_id");
         object.remove("slow_delay_ms");
         object.remove("request_body");
+        object.remove("requested_service_tier");
+        object.remove("actual_service_tier");
 
         let decoded: RouteRequestLog = serde_json::from_value(value).expect("deserialize old log");
         assert_eq!(decoded.upstream_started_ms, None);
@@ -15246,6 +15364,20 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(decoded.upstream_request_id, None);
         assert_eq!(decoded.slow_delay_ms, None);
         assert!(decoded.request_body.is_none());
+        assert!(decoded.requested_service_tier.is_none());
+        assert!(decoded.actual_service_tier.is_none());
+    }
+
+    #[test]
+    fn finished_route_log_keeps_requested_and_actual_service_tiers() {
+        let mut pending = pending_route_log_for_test(Some(200));
+        pending.requested_service_tier = Some("priority".to_string());
+        pending.actual_service_tier = Some("default".to_string());
+
+        let log = build_finished_route_log(pending, "success", TokenUsage::default(), Some(25));
+
+        assert_eq!(log.requested_service_tier.as_deref(), Some("priority"));
+        assert_eq!(log.actual_service_tier.as_deref(), Some("default"));
     }
 
     #[test]
@@ -16042,6 +16174,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             "id": "chatcmpl-1",
             "created": 123,
             "model": "deepseek-chat",
+            "service_tier": "priority",
             "choices": [{
                 "message": { "role": "assistant", "content": "你好" },
                 "finish_reason": "stop"
@@ -16068,6 +16201,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(
             value.get("output_text").and_then(Value::as_str),
             Some("你好")
+        );
+        assert_eq!(
+            value.get("service_tier").and_then(Value::as_str),
+            Some("priority")
         );
         assert_eq!(
             value.pointer("/usage/input_tokens").and_then(Value::as_i64),
@@ -16468,8 +16605,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
 
     #[test]
     fn converts_chat_stream_chunk_to_responses_sse() {
-        let chunk = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
-        let usage_chunk = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n";
+        let chunk = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"service_tier\":\"priority\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+        let usage_chunk = b"data: {\"id\":\"chatcmpl-1\",\"created\":123,\"model\":\"deepseek-chat\",\"service_tier\":\"priority\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n";
         let mut state = ChatStreamTestState::new(CodexToolContext::default());
 
         let first = state.ingest(chunk);
@@ -16484,6 +16621,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert!(text.contains("\"delta\":\"hi\""));
         assert!(text.contains("\"text\":\"hi\""));
         assert!(text.contains("response.completed"));
+        assert!(text.contains("\"service_tier\":\"priority\""));
+        assert_eq!(state.actual_service_tier.as_deref(), Some("priority"));
         assert_eq!(state.usage.input_tokens, 2);
         assert_eq!(state.usage.output_tokens, 1);
     }
