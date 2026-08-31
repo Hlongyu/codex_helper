@@ -7223,6 +7223,12 @@ fn body_with_provider_overrides(
         .unwrap_or_else(|_| Bytes::copy_from_slice(body))
 }
 
+fn provider_service_tier_for_path<'a>(provider: &'a ProviderConfig, path: &str) -> Option<&'a str> {
+    let service_tier = provider.service_tier.trim();
+    (!service_tier.is_empty() && matches!(path.trim_matches('/'), "responses" | "chat/completions"))
+        .then_some(service_tier)
+}
+
 fn prepare_upstream_request(
     provider: &ProviderConfig,
     path: &str,
@@ -7231,12 +7237,12 @@ fn prepare_upstream_request(
     requested_model: &str,
 ) -> Result<PreparedUpstreamRequest, String> {
     let upstream_model = mapped_model_for_provider(provider, requested_model);
-    let service_tier = provider.service_tier.as_str();
+    let service_tier = provider_service_tier_for_path(provider, path);
     if provider.wire_api == ProviderWireApi::ChatCompletions
         && path.trim_matches('/') == "responses"
     {
         let (body, tool_context) =
-            responses_to_chat_request_body(body, upstream_model.as_deref(), Some(service_tier))?;
+            responses_to_chat_request_body(body, upstream_model.as_deref(), service_tier)?;
         Ok(PreparedUpstreamRequest {
             path: "chat/completions".to_string(),
             query: String::new(),
@@ -7249,7 +7255,7 @@ fn prepare_upstream_request(
         Ok(PreparedUpstreamRequest {
             path: path.to_string(),
             query: query.to_string(),
-            body: body_with_provider_overrides(body, upstream_model.as_deref(), Some(service_tier)),
+            body: body_with_provider_overrides(body, upstream_model.as_deref(), service_tier),
             adapter: ResponseAdapter::Passthrough,
             upstream_model,
             tool_context: CodexToolContext::default(),
@@ -14850,7 +14856,8 @@ experimental_bearer_token = "secret-token"
 
     #[test]
     fn forwards_remote_compaction_with_the_original_model_name() {
-        let provider = test_provider_config("provider-a", ProviderStatus::Enabled, true);
+        let mut provider = test_provider_config("provider-a", ProviderStatus::Enabled, true);
+        provider.service_tier = "priority".to_string();
         let body = br#"{"model":"gpt-5.6-sol","input":[],"parallel_tool_calls":false}"#;
 
         let prepared =
@@ -14863,6 +14870,7 @@ experimental_bearer_token = "secret-token"
             forwarded.get("model").and_then(Value::as_str),
             Some("gpt-5.6-sol")
         );
+        assert!(forwarded.get("service_tier").is_none());
     }
 
     #[test]
@@ -15988,7 +15996,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
-    fn forces_provider_service_tier_on_forwarded_requests() {
+    fn injects_provider_service_tier_only_on_supported_requests() {
         let mut provider = ProviderConfig {
             id: "provider-a".to_string(),
             name: "Provider A".to_string(),
@@ -16012,7 +16020,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             balance_status: None,
             connection_status: None,
         };
-        let body = br#"{"model":"gpt-5.2","input":"hello","service_tier":"default"}"#;
+        let body = br#"{"model":"gpt-5.2","input":"hello","service_tier":"default","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}"#;
 
         let prepared = prepare_upstream_request(&provider, "responses", "", body, "gpt-5.2")
             .expect("request prepares");
@@ -16021,6 +16029,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert_eq!(
             value.get("service_tier").and_then(Value::as_str),
             Some("priority")
+        );
+        assert_eq!(
+            value.pointer("/tools/0/name").and_then(Value::as_str),
+            Some("lookup")
         );
 
         provider.wire_api = ProviderWireApi::ChatCompletions;
@@ -16034,7 +16046,31 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         );
         assert_eq!(prepared.path, "chat/completions");
 
+        let chat_body = br#"{"model":"gpt-5.2","messages":[],"service_tier":"default"}"#;
+        let prepared =
+            prepare_upstream_request(&provider, "chat/completions", "", chat_body, "gpt-5.2")
+                .expect("direct chat request prepares");
+        let value = serde_json::from_slice::<Value>(&prepared.body).expect("prepared body is json");
+        assert_eq!(
+            value.get("service_tier").and_then(Value::as_str),
+            Some("priority")
+        );
+
         provider.wire_api = ProviderWireApi::Responses;
+        for unsupported_path in ["responses/compact", "responses/input_tokens"] {
+            let prepared =
+                prepare_upstream_request(&provider, unsupported_path, "", body, "gpt-5.2")
+                    .expect("unsupported service tier request prepares");
+            let value =
+                serde_json::from_slice::<Value>(&prepared.body).expect("prepared body is json");
+
+            assert_eq!(
+                value.get("service_tier").and_then(Value::as_str),
+                Some("default"),
+                "provider service tier must not override {unsupported_path}"
+            );
+        }
+
         provider.service_tier = "ultrafast".to_string();
         let ultrafast_body = br#"{"model":"gpt-5.6-sol","input":"hello","service_tier":"default"}"#;
         let prepared =
