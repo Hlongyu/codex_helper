@@ -19,8 +19,10 @@ const rawCatalog = execFileSync(codex, ["debug", "models", "--bundled"], {
 const catalog = JSON.parse(rawCatalog);
 const models = Array.isArray(catalog.models) ? catalog.models : [];
 
-if (!models.some((model) => model?.slug === "gpt-5.6-sol")) {
-  throw new Error("Codex bundled catalog does not contain gpt-5.6-sol");
+for (const requiredModel of ["gpt-6-astra", "gpt-5.6-sol"]) {
+  if (!models.some((model) => model?.slug === requiredModel)) {
+    throw new Error(`Codex bundled catalog does not contain ${requiredModel}`);
+  }
 }
 
 const catalogDirectory = path.join(root, "src-tauri/src/catalogs");

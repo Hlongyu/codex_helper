@@ -11,6 +11,7 @@ XXSwitch 只记录实际经过本地路由的生成调用及其 Token、延迟�
 - **模型配置**：从上游拉取模型，选择参与路由的模型，并配置客户端模型到上游模型的映射。
 - **协议兼容**：Codex 供应商可选择 Responses API 或 Chat Completions 兼容模式。
 - **Fast 模式**：Codex 供应商可强制使用 `service_tier: "priority"`。
+- **上下文接力**：可启用 Codex 实验性的 Token Budget，并使用内置 Notes/History 在上下文窗口之间接续任务。
 - **真实模型测速**：选择实际模型和同步或流式请求，使用自定义内容发起生成请求，并查看延迟与完整回复。
 - **故障切换**：按供应商顺序路由；连续三次供应商故障后自动停用，并在下一个本地自然日恢复。
 - **系统代理**：上游请求、模型测试、余额查询和应用更新自动使用 Windows 或 macOS 的系统 HTTP/HTTPS 代理，并兼容代理环境变量。
@@ -45,6 +46,8 @@ XXSwitch 只维护各客户端中由自己接管的字段，并在关闭接管�
 配置文件：`~/.codex/config.toml`
 
 XXSwitch 将 `model_provider` 指向本地 `custom` provider，维护其 Base URL、本地访问令牌和名称，并根据设置同步 `features.remote_compaction_v2`。接管期间会合并设置 `http_headers = { "x-openai-actor-authorization" = "local-image-extension" }`，让当前 `custom` provider 暴露 Codex 内置 `image_gen`。同时，XXSwitch 只判断是否已配置 ChatGPT 登录态：已配置时设置 `requires_openai_auth = true`，未配置时设置为 `false`；不会检查凭据是否过期，也不会主动刷新或联网验证。用户可通过“强制不使用 OpenAI 登录态”将该字段固定为 `false`。该 header 只是自定义 provider 的能力标记，不是 ChatGPT 凭证；接管请求仍使用本地访问令牌并转发到当前供应商。关闭接管后会恢复这些字段的原值。
+
+启用“实验性上下文接力”时，XXSwitch 同步设置 `features.token_budget.enabled` 和 `features.token_budget.use_history_notes_extension`，具体提醒阈值、兜底缓冲和提示模板继续使用当前模型目录提供的默认值。该功能与远程压缩独立配置。
 
 ### Claude Code
 

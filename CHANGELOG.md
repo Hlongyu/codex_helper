@@ -1,5 +1,18 @@
 # 更新记录
 
+## v1.2.37 - 2026-09-05
+
+### 新增
+
+- 内置 Codex CLI `0.153.4` 的 bundled 模型目录并加入 `gpt-6-astra`，支持 Astra 的模型能力、推理等级、实验性工具描述及可配置长上下文；目录更新脚本会同时校验 Astra 与 `gpt-5.6-sol`，避免生成不完整目录。
+- Codex 路由增加“实验性上下文接力”开关，同步启用 Token Budget 与 Notes/History 扩展；提醒阈值、兜底缓冲和提示模板继续使用模型目录默认值，并与远程压缩独立配置。
+
+### 兼容与行为
+
+- GPT-6 Astra 请求会移除当前模型不支持的采样、日志概率和扩展缓存参数，将 `none` / `minimal` 推理等级规范为 `low`，同时保留支持的加密推理内容选项。
+- Responses Lite 的 `additional_tools` 可转换为 Chat Completions 工具定义；GPT-6 Astra 工具调用、`configuration_update` 和异步工具调用仅路由到 Responses API 供应商，避免兼容转换丢失语义。
+- Codex 接管会完整备份并恢复用户原有的 `features.token_budget`，兼容旧版布尔配置和新版配置表，升级已有接管备份时也会保留当前设置。
+
 ## v1.2.36 - 2026-08-31
 
 ### 修复

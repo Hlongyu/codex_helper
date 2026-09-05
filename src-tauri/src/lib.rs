@@ -65,10 +65,10 @@ const MAX_PROXY_ERROR_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DEBUG_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
 const DEFAULT_GPT56_LONG_CONTEXT_WINDOW: u64 = 372_000;
-const EMBEDDED_CODEX_MODEL_CATALOG_VERSION: &str = "0.146.1";
+const EMBEDDED_CODEX_MODEL_CATALOG_VERSION: &str = "0.153.4";
 const EMBEDDED_CODEX_MODEL_CATALOG_JSON: &str = include_str!("catalogs/codex-models.json");
 const CODEX_ROUTER_MODEL_CATALOG: &str = "config-manager/router-models.json";
-const ROUTER_BACKUP_SCHEMA_VERSION: u8 = 2;
+const ROUTER_BACKUP_SCHEMA_VERSION: u8 = 3;
 const PI_PROVIDER_ID: &str = "xxswitch";
 const LEGACY_PI_PROVIDER_ID: &str = "codex-helper";
 const PI_PROVIDER_API: &str = "openai-responses";
@@ -341,6 +341,8 @@ struct RouterConfig {
     force_disable_openai_auth: bool,
     #[serde(default)]
     remote_compaction_enabled: bool,
+    #[serde(default)]
+    token_budget_enabled: bool,
     #[serde(default = "default_true")]
     zstd_decompression_enabled: bool,
     #[serde(default)]
@@ -535,6 +537,7 @@ impl Default for RouterConfig {
             debug_mode: false,
             force_disable_openai_auth: false,
             remote_compaction_enabled: false,
+            token_budget_enabled: false,
             zstd_decompression_enabled: true,
             gpt56_long_context_enabled: false,
             gpt56_long_context_window: default_gpt56_long_context_window(),
@@ -605,6 +608,8 @@ struct RouterApplyBackup {
     custom_name: RouterFieldBackup,
     #[serde(default)]
     remote_compaction_v2: RouterFieldBackup,
+    #[serde(default)]
+    token_budget: RouterFieldBackup,
     #[serde(default)]
     custom_base_url: RouterFieldBackup,
     #[serde(default)]
@@ -893,6 +898,8 @@ struct SaveRouterPayload {
     force_disable_openai_auth: bool,
     #[serde(default)]
     remote_compaction_enabled: bool,
+    #[serde(default)]
+    token_budget_enabled: bool,
     #[serde(default = "default_true")]
     zstd_decompression_enabled: bool,
     #[serde(default)]
@@ -5370,7 +5377,7 @@ fn router_provider_path(provider_name: &str, field: &str) -> String {
     format!("model_providers.{provider_name}.{field}")
 }
 
-fn router_managed_paths(router: &RouterConfig) -> [String; 9] {
+fn router_managed_paths(router: &RouterConfig) -> [String; 11] {
     let provider_name = normalize_router_model_provider(&router.model_provider)
         .unwrap_or_else(|_| default_router_model_provider());
     [
@@ -5386,6 +5393,8 @@ fn router_managed_paths(router: &RouterConfig) -> [String; 9] {
             &format!("http_headers.{OPENAI_ACTOR_AUTHORIZATION_HEADER}"),
         ),
         "features.remote_compaction_v2".to_string(),
+        "features.token_budget.enabled".to_string(),
+        "features.token_budget.use_history_notes_extension".to_string(),
     ]
 }
 
@@ -5409,6 +5418,7 @@ fn capture_router_backup(doc: &DocumentMut, provider_name: &str) -> RouterApplyB
         model_catalog_json: capture_toml_field(doc, "model_catalog_json"),
         custom_name: capture_toml_field(doc, &router_provider_path(provider_name, "name")),
         remote_compaction_v2: capture_toml_field(doc, "features.remote_compaction_v2"),
+        token_budget: capture_toml_field(doc, "features.token_budget"),
         custom_base_url: capture_toml_field(doc, &router_provider_path(provider_name, "base_url")),
         custom_token: capture_toml_field(
             doc,
@@ -5466,6 +5476,7 @@ fn restore_router_backup(
             "features.remote_compaction_v2",
             &backup.remote_compaction_v2,
         )?;
+        restore_toml_field(&mut doc, "features.token_budget", &backup.token_budget)?;
         restore_toml_field(
             &mut doc,
             &router_provider_path(&provider_name, "base_url"),
@@ -5513,10 +5524,13 @@ fn prepare_router_patch(
     if let Some(backup) = backup {
         if router_backup_provider_name(backup) == provider_name {
             let mut backup = backup.clone();
-            if backup.schema_version < ROUTER_BACKUP_SCHEMA_VERSION {
+            if backup.schema_version < 2 {
                 backup.model = capture_toml_field(&doc, "model");
-                backup.schema_version = ROUTER_BACKUP_SCHEMA_VERSION;
             }
+            if backup.schema_version < 3 {
+                backup.token_budget = capture_toml_field(&doc, "features.token_budget");
+            }
+            backup.schema_version = ROUTER_BACKUP_SCHEMA_VERSION;
             let current_model_catalog = capture_toml_field(&doc, "model_catalog_json");
             let managed_model_catalog = Value::String(CODEX_ROUTER_MODEL_CATALOG.to_string());
             if !backup.model_catalog_json.existed
@@ -5596,6 +5610,19 @@ fn render_router_patch_toml(
         "features.remote_compaction_v2",
         &Value::Bool(router.remote_compaction_enabled),
     )?;
+    if toml_path_value(&doc, "features.token_budget").is_some_and(|value| !value.is_object()) {
+        remove_toml_path(&mut doc, "features.token_budget");
+    }
+    set_toml_path(
+        &mut doc,
+        "features.token_budget.enabled",
+        &Value::Bool(router.token_budget_enabled),
+    )?;
+    set_toml_path(
+        &mut doc,
+        "features.token_budget.use_history_notes_extension",
+        &Value::Bool(router.token_budget_enabled),
+    )?;
 
     let mut raw = doc.to_string();
     if !marker_present && !raw.contains(MARKER) {
@@ -5653,7 +5680,13 @@ fn router_patch_desired(router: &RouterConfig, requires_openai_auth: bool) -> Va
     );
     root.insert(
         "features".to_string(),
-        json!({ "remote_compaction_v2": router.remote_compaction_enabled }),
+        json!({
+            "remote_compaction_v2": router.remote_compaction_enabled,
+            "token_budget": {
+                "enabled": router.token_budget_enabled,
+                "use_history_notes_extension": router.token_budget_enabled,
+            }
+        }),
     );
     Value::Object(root)
 }
@@ -6545,12 +6578,14 @@ fn codex_cli_version(candidate: &Path) -> Option<Version> {
     parse_codex_cli_version_output(&output.stdout)
 }
 
-fn catalog_has_deepseek_base_model(templates: &[Value]) -> bool {
-    templates.iter().any(|entry| {
-        entry
-            .get("slug")
-            .and_then(Value::as_str)
-            .is_some_and(|slug| slug.eq_ignore_ascii_case("gpt-5.6-sol"))
+fn catalog_has_required_models(templates: &[Value]) -> bool {
+    ["gpt-6-astra", "gpt-5.6-sol"].iter().all(|model| {
+        templates.iter().any(|entry| {
+            entry
+                .get("slug")
+                .and_then(Value::as_str)
+                .is_some_and(|slug| slug.eq_ignore_ascii_case(model))
+        })
     })
 }
 
@@ -6559,8 +6594,8 @@ fn embedded_codex_model_catalog_templates() -> Vec<Value> {
         .expect("embedded Codex model catalog must be valid JSON");
     let templates = codex_model_catalog_templates_from_value(&value);
     assert!(
-        catalog_has_deepseek_base_model(&templates),
-        "embedded Codex model catalog must contain gpt-5.6-sol"
+        catalog_has_required_models(&templates),
+        "embedded Codex model catalog must contain gpt-6-astra and gpt-5.6-sol"
     );
     templates
 }
@@ -6568,7 +6603,7 @@ fn embedded_codex_model_catalog_templates() -> Vec<Value> {
 fn external_codex_catalog_is_eligible(version: &Version, templates: &[Value]) -> bool {
     let embedded_version = Version::parse(EMBEDDED_CODEX_MODEL_CATALOG_VERSION)
         .expect("embedded Codex model catalog version must be valid semver");
-    version >= &embedded_version && catalog_has_deepseek_base_model(templates)
+    version >= &embedded_version && catalog_has_required_models(templates)
 }
 
 fn load_bundled_codex_model_catalog_templates() -> Vec<Value> {
@@ -6757,7 +6792,7 @@ fn codex_models_catalog_value_with_templates_and_context(
     let mut catalog_models = Vec::new();
     for model in models {
         if let Some(mut entry) = codex_model_catalog_entry(&model, templates)? {
-            apply_gpt56_long_context(
+            apply_codex_long_context(
                 &mut entry,
                 gpt56_long_context_enabled,
                 gpt56_long_context_window,
@@ -6768,23 +6803,23 @@ fn codex_models_catalog_value_with_templates_and_context(
     Ok(json!({ "models": catalog_models }))
 }
 
-fn apply_gpt56_long_context(entry: &mut Value, enabled: bool, context_window: u64) {
+fn apply_codex_long_context(entry: &mut Value, enabled: bool, context_window: u64) {
     if !enabled {
         return;
     }
     let Some(object) = entry.as_object_mut() else {
         return;
     };
-    let is_gpt56 = object
+    let supports_custom_context = object
         .get("slug")
         .and_then(Value::as_str)
         .is_some_and(|slug| {
             matches!(
                 slug.to_ascii_lowercase().as_str(),
-                "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+                "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
             )
         });
-    if !is_gpt56 {
+    if !supports_custom_context {
         return;
     }
     object.insert("context_window".to_string(), Value::from(context_window));
@@ -7071,6 +7106,87 @@ fn reasoning_effort_from_request_body(body: &[u8]) -> Option<String> {
         .filter(|effort| !effort.is_empty())
 }
 
+fn is_gpt6_astra_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model == "gpt-6-astra" || model.starts_with("gpt-6-astra-")
+}
+
+fn normalize_gpt6_reasoning_effort(value: &mut Value) -> bool {
+    let Some(effort) = value.as_str() else {
+        return false;
+    };
+    if effort.eq_ignore_ascii_case("none") || effort.eq_ignore_ascii_case("minimal") {
+        *value = Value::String("low".to_string());
+        return true;
+    }
+    false
+}
+
+fn gpt6_compatible_request_body(body: &[u8], path: &str) -> Bytes {
+    let path = path.trim_matches('/');
+    if !matches!(path, "responses" | "chat/completions") {
+        return Bytes::copy_from_slice(body);
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return Bytes::copy_from_slice(body);
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Bytes::copy_from_slice(body);
+    };
+    if !object
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(is_gpt6_astra_model)
+    {
+        return Bytes::copy_from_slice(body);
+    }
+
+    let mut changed = false;
+    for parameter in ["temperature", "top_p", "top_logprobs"] {
+        changed |= object.remove(parameter).is_some();
+    }
+    if path == "chat/completions" {
+        changed |= object.remove("logprobs").is_some();
+        if let Some(effort) = object.get_mut("reasoning_effort") {
+            changed |= normalize_gpt6_reasoning_effort(effort);
+        }
+    } else {
+        if let Some(effort) = object
+            .get_mut("reasoning")
+            .and_then(Value::as_object_mut)
+            .and_then(|reasoning| reasoning.get_mut("effort"))
+        {
+            changed |= normalize_gpt6_reasoning_effort(effort);
+        }
+        if let Some(include) = object.get_mut("include").and_then(Value::as_array_mut) {
+            let original_len = include.len();
+            include.retain(|item| item.as_str() != Some("message.output_text.logprobs"));
+            changed |= include.len() != original_len;
+        }
+        if object.remove("prompt_cache_retention").is_some() {
+            changed = true;
+            let options = object
+                .entry("prompt_cache_options".to_string())
+                .or_insert_with(|| json!({}));
+            if !options.is_object() {
+                *options = json!({});
+            }
+            if let Some(options) = options.as_object_mut() {
+                options
+                    .entry("ttl".to_string())
+                    .or_insert_with(|| Value::String("30m".to_string()));
+            }
+        }
+    }
+
+    if !changed {
+        return Bytes::copy_from_slice(body);
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| Bytes::copy_from_slice(body))
+}
+
 fn reasoning_effort_requires_responses(effort: Option<&str>) -> bool {
     effort.is_some_and(|effort| {
         effort.eq_ignore_ascii_case("max") || effort.eq_ignore_ascii_case("ultra")
@@ -7083,6 +7199,93 @@ fn provider_supports_reasoning_effort(
 ) -> bool {
     !reasoning_effort_requires_responses(reasoning_effort)
         || provider.wire_api == ProviderWireApi::Responses
+}
+
+fn value_contains_type(value: &Value, expected_type: &str) -> bool {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .any(|item| value_contains_type(item, expected_type)),
+        Value::Object(object) => {
+            object.get("type").and_then(Value::as_str) == Some(expected_type)
+                || object
+                    .values()
+                    .any(|item| value_contains_type(item, expected_type))
+        }
+        _ => false,
+    }
+}
+
+fn tools_contain_async(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(tools_contain_async),
+        Value::Object(object) => {
+            object.get("async").and_then(Value::as_bool) == Some(true)
+                || object.values().any(tools_contain_async)
+        }
+        _ => false,
+    }
+}
+
+fn response_input_contains_async_tools(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(response_input_contains_async_tools),
+        Value::Object(object) => {
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("additional_tools" | "tool_search_output")
+            ) && object.get("tools").is_some_and(tools_contain_async)
+            {
+                return true;
+            }
+            object.values().any(response_input_contains_async_tools)
+        }
+        _ => false,
+    }
+}
+
+fn request_uses_async_tools(value: &Value) -> bool {
+    value.get("tools").is_some_and(tools_contain_async)
+        || value
+            .get("input")
+            .is_some_and(response_input_contains_async_tools)
+}
+
+fn responses_provider_requirement(body: &[u8], upstream_model: &str) -> Option<&'static str> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    if value.get("previous_response_id").is_some() {
+        return Some("previous_response_id");
+    }
+    if value
+        .get("input")
+        .is_some_and(|input| value_contains_type(input, "configuration_update"))
+    {
+        return Some("configuration_update");
+    }
+    if request_uses_async_tools(&value) {
+        return Some("异步工具调用");
+    }
+    if is_gpt6_astra_model(upstream_model)
+        && !build_codex_tool_context_from_request(&value)
+            .chat_tools()
+            .is_empty()
+    {
+        return Some("GPT-6 Astra 工具调用");
+    }
+    None
+}
+
+fn provider_responses_requirement(
+    provider: &ProviderConfig,
+    path: &str,
+    body: &[u8],
+    requested_model: &str,
+) -> Option<&'static str> {
+    if provider.wire_api == ProviderWireApi::Responses || path.trim_matches('/') != "responses" {
+        return None;
+    }
+    let upstream_model = mapped_model_for_provider(provider, requested_model);
+    responses_provider_requirement(body, upstream_model.as_deref().unwrap_or(requested_model))
 }
 
 fn request_has_compaction_trigger(body: &[u8]) -> bool {
@@ -7252,10 +7455,11 @@ fn prepare_upstream_request(
             tool_context,
         })
     } else {
+        let body = body_with_provider_overrides(body, upstream_model.as_deref(), service_tier);
         Ok(PreparedUpstreamRequest {
             path: path.to_string(),
             query: query.to_string(),
-            body: body_with_provider_overrides(body, upstream_model.as_deref(), service_tier),
+            body: gpt6_compatible_request_body(&body, path),
             adapter: ResponseAdapter::Passthrough,
             upstream_model,
             tool_context: CodexToolContext::default(),
@@ -7535,7 +7739,10 @@ fn collect_tool_search_output_tools(value: &Value, context: &mut CodexToolContex
             }
         }
         Value::Object(object) => {
-            if object.get("type").and_then(Value::as_str) == Some("tool_search_output") {
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("additional_tools" | "tool_search_output")
+            ) {
                 if let Some(tools) = object.get("tools").and_then(Value::as_array) {
                     for tool in tools {
                         context.add_response_tool(tool);
@@ -7777,6 +7984,9 @@ fn responses_input_to_chat_messages(
 
             for item in items {
                 let item_type = responses_input_item_type(item);
+                if item_type == "additional_tools" {
+                    continue;
+                }
                 if item_type == "reasoning" {
                     if let Some(reasoning_content) = responses_reasoning_item_text(item) {
                         pending_reasoning_content = Some(reasoning_content);
@@ -7896,6 +8106,9 @@ fn responses_to_chat_request_body(
         .and_then(Value::as_str)
         .ok_or_else(|| "Responses 请求缺少 model".to_string())?
         .to_string();
+    if let Some(requirement) = responses_provider_requirement(body, &model) {
+        return Err(format!("{requirement} 需要使用 Responses API 上游"));
+    }
     let missing_reasoning_fallback = chat_model_requires_reasoning_content_fallback(&model);
 
     let input = object
@@ -7961,6 +8174,13 @@ fn responses_to_chat_request_body(
     if let Some(value) = object.get("parallel_tool_calls") {
         chat.insert("parallel_tool_calls".to_string(), value.clone());
     }
+    if let Some(value) = object
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+    {
+        chat.insert("reasoning_effort".to_string(), value.clone());
+    }
     if !chat
         .get("tools")
         .and_then(Value::as_array)
@@ -7971,7 +8191,12 @@ fn responses_to_chat_request_body(
     }
 
     serde_json::to_vec(&Value::Object(chat))
-        .map(|bytes| (Bytes::from(bytes), tool_context))
+        .map(|bytes| {
+            (
+                gpt6_compatible_request_body(&bytes, "chat/completions"),
+                tool_context,
+            )
+        })
         .map_err(|err| format!("无法生成 Chat Completions 请求: {err}"))
 }
 
@@ -10478,11 +10703,16 @@ async fn proxy_request_now(
         .iter()
         .filter(|candidate| provider_accepts_model(&candidate.provider, &model))
         .collect::<Vec<_>>();
+    let responses_requirement = model_candidates.iter().find_map(|candidate| {
+        provider_responses_requirement(&candidate.provider, &path, &body_bytes, &model)
+    });
     let candidates = model_candidates
         .iter()
         .copied()
         .filter(|candidate| {
             provider_supports_reasoning_effort(&candidate.provider, reasoning_effort.as_deref())
+                && provider_responses_requirement(&candidate.provider, &path, &body_bytes, &model)
+                    .is_none()
         })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
@@ -10495,6 +10725,12 @@ async fn proxy_request_now(
                     "推理强度 {} 需要使用 Responses API 上游",
                     reasoning_effort.as_deref().unwrap_or_default()
                 ),
+            );
+        }
+        if let Some(requirement) = responses_requirement {
+            return proxy_error(
+                StatusCode::BAD_REQUEST,
+                format!("{requirement} 需要使用 Responses API 上游"),
             );
         }
         let auto_disabled_supports_model = !model.trim().is_empty()
@@ -12935,6 +13171,7 @@ fn save_router_config(
         debug_mode: payload.debug_mode,
         force_disable_openai_auth: payload.force_disable_openai_auth,
         remote_compaction_enabled: payload.remote_compaction_enabled,
+        token_budget_enabled: payload.token_budget_enabled,
         zstd_decompression_enabled: payload.zstd_decompression_enabled,
         gpt56_long_context_enabled: payload.gpt56_long_context_enabled,
         gpt56_long_context_window: payload.gpt56_long_context_window,
@@ -13764,6 +14001,7 @@ mod tests {
         assert_eq!(router.slow_delay_max_secs, 0);
         assert!(!router.debug_mode);
         assert!(!router.force_disable_openai_auth);
+        assert!(!router.token_budget_enabled);
         assert!(router.zstd_decompression_enabled);
         assert!(!router.gpt56_long_context_enabled);
         assert_eq!(
@@ -14550,6 +14788,10 @@ multi_agent = false
     fn legacy_router_backup_captures_an_unmanaged_model_catalog() {
         let doc = r#"model = "gpt-5.6-sol"
 model_catalog_json = "user-models.json"
+
+[features.token_budget]
+enabled = false
+use_history_notes_extension = false
 "#
         .parse::<DocumentMut>()
         .unwrap();
@@ -14572,6 +14814,22 @@ model_catalog_json = "user-models.json"
         assert_eq!(
             migrated_backup.model_catalog_json.value,
             Some(Value::String("user-models.json".to_string()))
+        );
+        assert_eq!(
+            migrated_backup
+                .token_budget
+                .value
+                .as_ref()
+                .and_then(|value| value.pointer("/enabled")),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            migrated_backup
+                .token_budget
+                .value
+                .as_ref()
+                .and_then(|value| value.pointer("/use_history_notes_extension")),
+            Some(&Value::Bool(false))
         );
     }
 
@@ -14764,6 +15022,89 @@ x-custom-header = "kept"
         );
         assert_eq!(
             toml_path_value(&restored, "features.remote_compaction_v2"),
+            Some(Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn token_budget_uses_model_defaults_and_restores_existing_settings() {
+        let doc = r#"[features.token_budget]
+enabled = false
+use_history_notes_extension = false
+reminder_threshold_tokens = 12000
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let router = RouterConfig {
+            enabled: true,
+            token_budget_enabled: true,
+            local_token: "local-token".to_string(),
+            ..RouterConfig::default()
+        };
+        let backup = capture_router_backup(&doc, &router.model_provider);
+
+        let patched = render_router_patch_toml(doc, false, &router, false)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            toml_path_value(&patched, "features.token_budget.enabled"),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            toml_path_value(
+                &patched,
+                "features.token_budget.use_history_notes_extension"
+            ),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            toml_path_value(&patched, "features.token_budget.reminder_threshold_tokens"),
+            Some(Value::from(12_000))
+        );
+        assert_eq!(
+            router_patch_desired(&router, false).pointer("/features/token_budget/enabled"),
+            Some(&Value::Bool(true))
+        );
+
+        let restored = restore_router_backup(patched, Some(&backup), &router, false)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            toml_path_value(&restored, "features.token_budget.enabled"),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            toml_path_value(
+                &restored,
+                "features.token_budget.use_history_notes_extension"
+            ),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            toml_path_value(&restored, "features.token_budget.reminder_threshold_tokens"),
+            Some(Value::from(12_000))
+        );
+
+        let legacy = "[features]\ntoken_budget = false\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let backup = capture_router_backup(&legacy, &router.model_provider);
+        let patched = render_router_patch_toml(legacy, false, &router, false)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            toml_path_value(&patched, "features.token_budget.enabled"),
+            Some(Value::Bool(true))
+        );
+        let restored = restore_router_backup(patched, Some(&backup), &router, false)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            toml_path_value(&restored, "features.token_budget"),
             Some(Value::Bool(false))
         );
     }
@@ -16132,6 +16473,169 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
+    fn converts_responses_lite_tools_for_chat_mappings() {
+        let body = json!({
+            "model": "gpt-6-astra",
+            "input": [
+                {
+                    "id": "at_test",
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "Local tools",
+                        "tools": [{
+                            "type": "function",
+                            "name": "lookup",
+                            "description": "Lookup data",
+                            "parameters": { "type": "object", "properties": {} }
+                        }]
+                    }]
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{ "type": "input_text", "text": "Be concise." }]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "hello" }]
+                }
+            ]
+        })
+        .to_string();
+
+        let (converted, _) =
+            responses_to_chat_request_body(body.as_bytes(), Some("deepseek-chat"), None)
+                .expect("Responses Lite request converts after model mapping");
+        let value = serde_json::from_slice::<Value>(&converted).expect("converted json");
+
+        assert_eq!(
+            value
+                .pointer("/tools/0/function/name")
+                .and_then(Value::as_str),
+            Some("functions__lookup")
+        );
+        assert_eq!(
+            value.pointer("/messages/0/role").and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            value.pointer("/messages/1/role").and_then(Value::as_str),
+            Some("user")
+        );
+    }
+
+    #[test]
+    fn requires_responses_for_gpt6_tools_and_new_response_items() {
+        let gpt6_tools = json!({
+            "model": "gpt-6-astra",
+            "input": "hello",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": { "type": "object" }
+            }]
+        })
+        .to_string();
+        let err = responses_to_chat_request_body(gpt6_tools.as_bytes(), None, None)
+            .expect_err("GPT-6 tools must not use Chat Completions");
+        assert!(err.contains("GPT-6 Astra 工具调用"));
+        assert_eq!(
+            responses_provider_requirement(gpt6_tools.as_bytes(), "gpt-6-astra"),
+            Some("GPT-6 Astra 工具调用")
+        );
+
+        let configuration_update = json!({
+            "model": "gpt-6-astra",
+            "input": [{
+                "type": "configuration_update",
+                "reasoning": { "effort": "high" }
+            }]
+        })
+        .to_string();
+        assert_eq!(
+            responses_provider_requirement(configuration_update.as_bytes(), "gpt-6-astra"),
+            Some("configuration_update")
+        );
+
+        let async_tool = json!({
+            "model": "gpt-5.6-sol",
+            "input": "hello",
+            "tools": [{
+                "type": "function",
+                "name": "slow_lookup",
+                "async": true,
+                "parameters": { "type": "object" }
+            }]
+        })
+        .to_string();
+        assert_eq!(
+            responses_provider_requirement(async_tool.as_bytes(), "gpt-5.6-sol"),
+            Some("异步工具调用")
+        );
+    }
+
+    #[test]
+    fn normalizes_gpt6_request_parameters() {
+        let body = json!({
+            "model": "gpt-6-astra",
+            "input": "hello",
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_logprobs": 3,
+            "reasoning": { "effort": "minimal" },
+            "include": ["reasoning.encrypted_content", "message.output_text.logprobs"],
+            "prompt_cache_retention": "24h",
+            "prompt_cache_options": { "mode": "extended" }
+        })
+        .to_string();
+        let normalized = gpt6_compatible_request_body(body.as_bytes(), "responses");
+        let value = serde_json::from_slice::<Value>(&normalized).expect("normalized json");
+
+        for parameter in [
+            "temperature",
+            "top_p",
+            "top_logprobs",
+            "prompt_cache_retention",
+        ] {
+            assert!(!value.as_object().unwrap().contains_key(parameter));
+        }
+        assert_eq!(
+            value.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("low")
+        );
+        assert_eq!(
+            value
+                .pointer("/prompt_cache_options/ttl")
+                .and_then(Value::as_str),
+            Some("30m")
+        );
+        assert_eq!(
+            value
+                .pointer("/prompt_cache_options/mode")
+                .and_then(Value::as_str),
+            Some("extended")
+        );
+        assert_eq!(
+            value.get("include"),
+            Some(&json!(["reasoning.encrypted_content"]))
+        );
+
+        let chat = br#"{"model":"gpt-6-astra","messages":[],"reasoning_effort":"none","logprobs":true,"temperature":1}"#;
+        let normalized = gpt6_compatible_request_body(chat, "chat/completions");
+        let value = serde_json::from_slice::<Value>(&normalized).expect("normalized chat json");
+        assert_eq!(
+            value.get("reasoning_effort").and_then(Value::as_str),
+            Some("low")
+        );
+        assert!(value.get("logprobs").is_none());
+        assert!(value.get("temperature").is_none());
+    }
+
+    #[test]
     fn maps_responses_developer_role_for_chat_completions() {
         let body = json!({
             "model": "gpt-5.5",
@@ -17112,8 +17616,14 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
-    fn codex_catalog_expands_gpt56_context_when_enabled() {
+    fn codex_catalog_expands_gpt6_and_gpt56_context_when_enabled() {
         let templates = [
+            json!({
+                "slug": "gpt-6-astra",
+                "context_window": 272_000,
+                "max_context_window": 872_000,
+                "auto_compact_token_limit": 244_800
+            }),
             json!({
                 "slug": "gpt-5.6-sol",
                 "context_window": 272_000,
@@ -17138,6 +17648,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         ];
         let catalog = codex_models_catalog_value_with_templates_and_context(
             vec![
+                "gpt-6-astra".to_string(),
                 "gpt-5.6-sol".to_string(),
                 "gpt-5.6-terra".to_string(),
                 "gpt-5.6-luna".to_string(),
@@ -17153,7 +17664,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             .and_then(Value::as_array)
             .expect("catalog models");
 
-        for model in &models[..3] {
+        for model in &models[..4] {
             assert_eq!(
                 model.get("context_window").and_then(Value::as_i64),
                 Some(1_000_000)
@@ -17165,11 +17676,11 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             assert_eq!(model.get("auto_compact_token_limit"), Some(&Value::Null));
         }
         assert_eq!(
-            models[3].get("context_window").and_then(Value::as_i64),
+            models[4].get("context_window").and_then(Value::as_i64),
             Some(272_000)
         );
         assert_eq!(
-            models[3].get("max_context_window").and_then(Value::as_i64),
+            models[4].get("max_context_window").and_then(Value::as_i64),
             Some(272_000)
         );
     }
@@ -17356,9 +17867,33 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
-    fn embedded_codex_catalog_contains_deepseek_base_model() {
+    fn embedded_codex_catalog_contains_gpt6_and_deepseek_base_model() {
         let templates = embedded_codex_model_catalog_templates();
-        assert_eq!(templates.len(), 8);
+        assert_eq!(templates.len(), 11);
+        let astra = templates
+            .iter()
+            .find(|entry| entry.get("slug").and_then(Value::as_str) == Some("gpt-6-astra"))
+            .expect("embedded gpt-6-astra");
+        assert_eq!(
+            astra.get("shell_type").and_then(Value::as_str),
+            Some("unified_exec")
+        );
+        assert_eq!(
+            astra.get("use_responses_lite").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            astra.get("experimental_supported_tools"),
+            Some(&json!(["send_user_message_async", "clock"]))
+        );
+        assert_eq!(
+            astra.get("max_context_window").and_then(Value::as_i64),
+            Some(872_000)
+        );
+        assert_eq!(
+            astra.pointer("/service_tiers/0/id").and_then(Value::as_str),
+            Some("priority")
+        );
         let sol = templates
             .iter()
             .find(|entry| entry.get("slug").and_then(Value::as_str) == Some("gpt-5.6-sol"))
@@ -17370,18 +17905,21 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
-    fn external_codex_catalog_requires_current_version_and_sol() {
-        let templates = vec![json!({ "slug": "gpt-5.6-sol" })];
+    fn external_codex_catalog_requires_current_version_gpt6_and_sol() {
+        let templates = vec![
+            json!({ "slug": "gpt-6-astra" }),
+            json!({ "slug": "gpt-5.6-sol" }),
+        ];
         assert!(!external_codex_catalog_is_eligible(
-            &Version::new(0, 146, 0),
+            &Version::new(0, 153, 3),
             &templates
         ));
         assert!(external_codex_catalog_is_eligible(
-            &Version::new(0, 146, 1),
+            &Version::new(0, 153, 4),
             &templates
         ));
         assert!(!external_codex_catalog_is_eligible(
-            &Version::new(0, 147, 0),
+            &Version::new(0, 154, 0),
             &[json!({ "slug": "gpt-5.6-terra" })]
         ));
     }

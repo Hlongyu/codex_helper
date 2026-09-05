@@ -61,6 +61,7 @@ type RouterConfig = {
   debug_mode: boolean;
   force_disable_openai_auth: boolean;
   remote_compaction_enabled: boolean;
+  token_budget_enabled: boolean;
   zstd_decompression_enabled: boolean;
   gpt56_long_context_enabled: boolean;
   gpt56_long_context_window: number;
@@ -496,6 +497,7 @@ function defaultRouterConfig(): RouterConfig {
     debug_mode: false,
     force_disable_openai_auth: false,
     remote_compaction_enabled: false,
+    token_budget_enabled: false,
     zstd_decompression_enabled: true,
     gpt56_long_context_enabled: false,
     gpt56_long_context_window: DEFAULT_GPT56_LONG_CONTEXT_WINDOW,
@@ -3131,10 +3133,24 @@ function RouteScreen({
               }
             />
           </div>
+          <div className="route-toggle-line">
+            <div>
+              <strong>实验性上下文接力</strong>
+              <p>启用 Token Budget，使用 Notes 保存进度并在新窗口通过 History 恢复。</p>
+            </div>
+            <Toggle
+              checked={routerDraft.token_budget_enabled}
+              disabled={busy}
+              label="启用实验性上下文接力"
+              onChange={(token_budget_enabled) =>
+                setRouterDraft({ ...routerDraft, token_budget_enabled })
+              }
+            />
+          </div>
           <div className="route-toggle-line long-context-setting">
             <div>
-              <strong>GPT-5.6 长上下文</strong>
-              <p>为 Sol、Terra 和 Luna 设置自定义上下文窗口。</p>
+              <strong>GPT-6 / GPT-5.6 长上下文</strong>
+              <p>为 Astra、Sol、Terra 和 Luna 设置自定义上下文窗口。</p>
             </div>
             <div className="long-context-controls">
               <label className="compact-field">
@@ -3159,7 +3175,7 @@ function RouteScreen({
               <Toggle
                 checked={routerDraft.gpt56_long_context_enabled}
                 disabled={busy}
-                label="启用 GPT-5.6 长上下文"
+                label="启用 GPT-6 / GPT-5.6 长上下文"
                 onChange={(gpt56_long_context_enabled) =>
                   setRouterDraft({ ...routerDraft, gpt56_long_context_enabled })
                 }
