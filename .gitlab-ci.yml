@@ -18,14 +18,8 @@ default:
 .macos-runner:
   resource_group: xxswitch-macos-shell
   tags:
-    - shell
-    - node
-    - macos
-    - docker-compose
-    - m1
-    - arm
-    - nvm
-    - xcode-latest
+    - arm64
+    - m3
 
 .macos-node:
   extends: .macos-runner
