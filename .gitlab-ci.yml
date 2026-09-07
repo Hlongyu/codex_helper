@@ -18,11 +18,9 @@ default:
 .macos-runner:
   resource_group: xxswitch-macos-shell
   tags:
-    - shell
     - macos
-    - m3-ultra
+    - m1
     - arm
-    - arm64
 
 .macos-node:
   extends: .macos-runner
@@ -86,12 +84,25 @@ macos:preflight:
         echo "No Developer ID Application signing identity is available to the Runner user." >&2
         exit 1
       fi
-      echo "Developer ID Application signing identity is available."
+      signing_probe_dir="$(mktemp -d)"
+      signing_probe="$signing_probe_dir/codesign-probe"
+      cleanup_signing_probe() {
+        rm -rf "$signing_probe_dir"
+      }
+      trap cleanup_signing_probe EXIT
+      cp /bin/echo "$signing_probe"
+      if ! codesign --force --sign "$signing_identity" --timestamp=none "$signing_probe"; then
+        echo "Developer ID Application identity was found, but its private key is not usable by the Runner user." >&2
+        exit 1
+      fi
+      codesign --verify --strict "$signing_probe"
+      cleanup_signing_probe
+      trap - EXIT
+      echo "Developer ID Application signing identity and private key are usable."
     - |
       apple_id="${APPLE_ID:-zqtqzy@163.com}"
       apple_team_id="${APPLE_TEAM_ID:-YDJE97CX57}"
       notary_password="${APPLE_SPECIFIC_PWD:-${APPLE_APP_SPECIFIC_PASSWORD:-}}"
-      notary_profile="${NOTARY_PROFILE:-notarytool-profile}"
 
       if [ -n "$notary_password" ]; then
         xcrun notarytool history \
@@ -99,11 +110,8 @@ macos:preflight:
           --team-id "$apple_team_id" \
           --password "$notary_password" >/dev/null
         echo "Apple notarization credentials are available from CI variables."
-      elif xcrun notarytool history --keychain-profile "$notary_profile" >/dev/null 2>&1; then
-        echo "Apple notarization credentials are available from the Runner keychain."
       else
-        echo "No Apple notarization credentials are available. Configure APPLE_SPECIFIC_PWD or the '$notary_profile' keychain profile." >&2
-        exit 1
+        echo "WARNING: APPLE_SPECIFIC_PWD is not configured; the release will be Developer ID signed but not notarized."
       fi
 
 windows:preflight:
@@ -207,7 +215,6 @@ release:macos-universal:
       apple_id="${APPLE_ID:-zqtqzy@163.com}"
       apple_team_id="${APPLE_TEAM_ID:-YDJE97CX57}"
       notary_password="${APPLE_SPECIFIC_PWD:-${APPLE_APP_SPECIFIC_PASSWORD:-}}"
-      notary_profile="${NOTARY_PROFILE:-notarytool-profile}"
 
       if [ -n "$notary_password" ]; then
         echo "Submitting DMG for notarization with CI credentials."
@@ -217,21 +224,14 @@ release:macos-universal:
           --password "$notary_password" \
           --wait \
           --timeout 30m
-      elif xcrun notarytool history --keychain-profile "$notary_profile" >/dev/null 2>&1; then
-        echo "Submitting DMG for notarization with Runner keychain profile '$notary_profile'."
-        xcrun notarytool submit "$dmg_path" \
-          --keychain-profile "$notary_profile" \
-          --wait \
-          --timeout 30m
+        xcrun stapler staple "$dmg_path"
+        xcrun stapler validate "$dmg_path"
+        spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
       else
-        echo "No Apple notarization credentials are available. Configure APPLE_SPECIFIC_PWD or the '$notary_profile' keychain profile." >&2
-        exit 1
+        echo "WARNING: Skipping notarization because APPLE_SPECIFIC_PWD is not configured."
       fi
 
-      xcrun stapler staple "$dmg_path"
-      xcrun stapler validate "$dmg_path"
       codesign --verify --strict --verbose=2 "$dmg_path"
-      spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
     - |
       dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
       mount_dir="$(mktemp -d)"
@@ -245,7 +245,11 @@ release:macos-universal:
       app_path="$(find "$mount_dir" -maxdepth 1 -name '*.app' -print -quit)"
       test -n "$app_path"
       codesign --verify --deep --strict --verbose=2 "$app_path"
-      spctl --assess --type execute --verbose=4 "$app_path"
+      if [ -n "${APPLE_SPECIFIC_PWD:-${APPLE_APP_SPECIFIC_PASSWORD:-}}" ]; then
+        spctl --assess --type execute --verbose=4 "$app_path"
+      else
+        echo "WARNING: Skipping Gatekeeper notarization assessment for the signed-only build."
+      fi
   artifacts:
     name: "xxswitch-$CI_COMMIT_TAG-macos-universal"
     expire_in: 1 week

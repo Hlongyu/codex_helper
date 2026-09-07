@@ -1,5 +1,13 @@
 # 更新记录
 
+## v1.2.40 - 2026-09-07
+
+### CI/CD
+
+- GitLab macOS 测试、环境预检与发布任务切回 `macos`、`m1`、`arm` Runner 标签，与已验证可用的 M1 构建环境保持一致。
+- macOS 环境预检改为实际签名临时 Mach-O 文件，确保 Developer ID 证书私钥确实可由 Runner 使用，不再只根据证书列表误判。
+- 参考 Quasar Installer 的发布行为：配置 `APPLE_SPECIFIC_PWD` 时继续执行 Apple 公证、票据装订和 Gatekeeper 校验；未配置时明确警告并发布 Developer ID 已签名但未公证的 DMG，不再因缺少本机 `notarytool-profile` 阻断流水线。
+
 ## v1.2.39 - 2026-09-06
 
 ### CI/CD
