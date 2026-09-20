@@ -1,5 +1,17 @@
 # 更新记录
 
+## v1.2.41 - 2026-09-20
+
+### 新增
+
+- Codex 模型目录增加 `deepseek-flash`、`deepseek-v4.1-flash` 和兼容名称 `deepseek-v4-flash-vision-exp`，显示为 DeepSeek-V4.1-Flash，保留各自模型 ID，支持文本、图片输入与原始图片精度声明。
+- Chat Completions 适配支持将用户消息中的 `input_image` 转换为 `image_url`，保留图片 URL、Base64 data URL、精度参数和图文顺序，支持纯图片输入。
+
+### 兼容与行为
+
+- 保留现有 DeepSeek V4 Flash、V4 Pro 模型配置；新名称沿用现有 1M 上下文和推理等级配置。
+- 工具输出、非用户消息中的图片及 `file_id` 图片要求 Responses API 上游，避免将图片错误转换为工具输出文本或不受支持的 Chat Completions 消息。
+
 ## v1.2.40 - 2026-09-07
 
 ### CI/CD

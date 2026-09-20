@@ -6647,24 +6647,34 @@ fn load_codex_model_catalog_templates() -> Vec<Value> {
 }
 
 fn deepseek_v4_catalog_entry(model: &str, templates: &[Value]) -> Result<Value, String> {
-    let (slug, display_name, description, priority) =
-        if model.trim().eq_ignore_ascii_case("deepseek-v4-flash") {
-            (
-                "deepseek-v4-flash",
-                "DeepSeek-V4-Flash",
-                "Latest frontier agentic coding model.",
-                1,
-            )
-        } else if model.trim().eq_ignore_ascii_case("deepseek-v4-pro") {
-            (
-                "deepseek-v4-pro",
-                "DeepSeek-V4-Pro",
-                "Most capable frontier agentic coding model.",
-                2,
-            )
-        } else {
-            return Err(format!("不支持的 DeepSeek-V4 capability 模型: {model}"));
-        };
+    let normalized_model = model.trim().to_ascii_lowercase();
+    let (slug, display_name, description, priority) = if matches!(
+        normalized_model.as_str(),
+        "deepseek-flash" | "deepseek-v4.1-flash" | "deepseek-v4-flash-vision-exp"
+    ) {
+        (
+            normalized_model.as_str(),
+            "DeepSeek-V4.1-Flash",
+            "Latest frontier agentic coding model.",
+            1,
+        )
+    } else if model.trim().eq_ignore_ascii_case("deepseek-v4-flash") {
+        (
+            "deepseek-v4-flash",
+            "DeepSeek-V4-Flash",
+            "Latest frontier agentic coding model.",
+            1,
+        )
+    } else if model.trim().eq_ignore_ascii_case("deepseek-v4-pro") {
+        (
+            "deepseek-v4-pro",
+            "DeepSeek-V4-Pro",
+            "Most capable frontier agentic coding model.",
+            2,
+        )
+    } else {
+        return Err(format!("不支持的 DeepSeek-V4 capability 模型: {model}"));
+    };
     let sol = templates
         .iter()
         .find(|entry| {
@@ -6697,8 +6707,8 @@ fn deepseek_v4_catalog_entry(model: &str, templates: &[Value]) -> Result<Value, 
         "default_verbosity": "low",
         "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text",
-        "input_modalities": ["text"],
-        "supports_image_detail_original": false,
+        "input_modalities": if display_name == "DeepSeek-V4.1-Flash" { json!(["text", "image"]) } else { json!(["text"]) },
+        "supports_image_detail_original": display_name == "DeepSeek-V4.1-Flash",
         "truncation_policy": { "mode": "tokens", "limit": 10000 },
         "supports_parallel_tool_calls": true,
         "tool_mode": null,
@@ -6746,9 +6756,15 @@ fn deepseek_v4_catalog_entry(model: &str, templates: &[Value]) -> Result<Value, 
 }
 
 fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Result<Option<Value>, String> {
-    if ["deepseek-v4-flash", "deepseek-v4-pro"]
-        .iter()
-        .any(|candidate| model.trim().eq_ignore_ascii_case(candidate))
+    if [
+        "deepseek-flash",
+        "deepseek-v4.1-flash",
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+    ]
+    .iter()
+    .any(|candidate| model.trim().eq_ignore_ascii_case(candidate))
     {
         return deepseek_v4_catalog_entry(model, templates).map(Some);
     }
@@ -7253,6 +7269,29 @@ fn request_uses_async_tools(value: &Value) -> bool {
 
 fn responses_provider_requirement(body: &[u8], upstream_model: &str) -> Option<&'static str> {
     let value = serde_json::from_slice::<Value>(body).ok()?;
+    if let Some(items) = value.get("input").and_then(Value::as_array) {
+        for item in items {
+            if value_contains_type(item, "input_image") {
+                if responses_input_item_type(item) != "message"
+                    || item.get("role").and_then(Value::as_str).unwrap_or("user") != "user"
+                {
+                    return Some("非用户消息中的图片");
+                }
+                if item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("input_image")
+                                && part.get("file_id").is_some()
+                        })
+                    })
+                {
+                    return Some("file_id 图片");
+                }
+            }
+        }
+    }
     if value.get("previous_response_id").is_some() {
         return Some("previous_response_id");
     }
@@ -7922,11 +7961,48 @@ fn responses_input_item_to_chat_message(
                 .map(responses_role_to_chat_role)
                 .unwrap_or("user")
                 .to_string();
-            let content = item
-                .get("content")
-                .and_then(json_string_content)
-                .or_else(|| item.get("text").and_then(Value::as_str).map(str::to_string))
-                .ok_or_else(|| "Chat Completions 适配暂只支持文本 input".to_string())?;
+            let content = if let Some(parts) =
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .filter(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("input_image")
+                        })
+                    }) {
+                let mut converted = Vec::new();
+                for part in parts {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("input_image") => {
+                            let url = part
+                                .get("image_url")
+                                .and_then(Value::as_str)
+                                .filter(|url| !url.is_empty())
+                                .ok_or_else(|| "input_image 缺少 image_url".to_string())?;
+                            let mut image = json!({ "url": url });
+                            if let Some(detail) = part.get("detail") {
+                                image["detail"] = detail.clone();
+                            }
+                            converted.push(json!({ "type": "image_url", "image_url": image }));
+                        }
+                        Some("input_text" | "text") => {
+                            let text = part
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| "文本内容块缺少 text".to_string())?;
+                            converted.push(json!({ "type": "text", "text": text }));
+                        }
+                        _ => return Err("Chat Completions 适配不支持该图文内容块".to_string()),
+                    }
+                }
+                Value::Array(converted)
+            } else {
+                Value::String(
+                    item.get("content")
+                        .and_then(json_string_content)
+                        .or_else(|| item.get("text").and_then(Value::as_str).map(str::to_string))
+                        .ok_or_else(|| "Chat Completions 适配不支持该 input 内容".to_string())?,
+                )
+            };
             Ok(json!({ "role": role, "content": content }))
         }
         "function_call" | "custom_tool_call" | "tool_search_call" => {
@@ -17782,6 +17858,84 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             Some("0.144.0")
         );
         assert_eq!(model.get("default_service_tier"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn codex_catalog_includes_deepseek_v41_flash_names() {
+        let sol = json!({
+            "slug": "gpt-5.6-sol",
+            "base_instructions": "bundled prompt",
+            "model_messages": { "instructions_template": "bundled template" }
+        });
+        let catalog = codex_models_catalog_value_with_templates(
+            vec![
+                " DEEPSEEK-FLASH ".to_string(),
+                "DEEPSEEK-V4.1-FLASH".to_string(),
+                "deepseek-v4-flash-vision-exp".to_string(),
+            ],
+            &[sol],
+        )
+        .expect("V4.1 Flash catalog");
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 3);
+        for (entry, slug) in models.iter().zip([
+            "deepseek-flash",
+            "deepseek-v4.1-flash",
+            "deepseek-v4-flash-vision-exp",
+        ]) {
+            assert_eq!(entry["slug"], slug);
+            assert_eq!(entry["display_name"], "DeepSeek-V4.1-Flash");
+            assert_eq!(entry["base_instructions"], "bundled prompt");
+            assert_eq!(entry["input_modalities"], json!(["text", "image"]));
+            assert_eq!(entry["supports_image_detail_original"], true);
+        }
+    }
+
+    #[test]
+    fn converts_vision_user_input_without_losing_images() {
+        for model in ["deepseek-flash", "deepseek-v4.1-flash"] {
+            for url in [
+                "https://example.com/image.png",
+                "data:image/png;base64,aGVsbG8=",
+            ] {
+                for with_text in [true, false] {
+                    let mut content = vec![
+                        json!({"type": "input_image", "image_url": url, "detail": "original"}),
+                    ];
+                    let mut expected = vec![
+                        json!({"type": "image_url", "image_url": {"url": url, "detail": "original"}}),
+                    ];
+                    if with_text {
+                        content.insert(0, json!({"type": "input_text", "text": "Describe this"}));
+                        expected.insert(0, json!({"type": "text", "text": "Describe this"}));
+                    }
+                    let body =
+                        json!({"model": model, "input": [{"role": "user", "content": content}]})
+                            .to_string();
+                    assert_eq!(responses_provider_requirement(body.as_bytes(), model), None);
+                    let (converted, _) =
+                        responses_to_chat_request_body(body.as_bytes(), None, None).unwrap();
+                    let converted: Value = serde_json::from_slice(&converted).unwrap();
+                    assert_eq!(converted["messages"][0]["content"], json!(expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vision_tool_outputs_and_file_ids_require_responses() {
+        for item in [
+            json!({"type": "function_call_output", "call_id": "call_1", "output": [{"type": "input_image", "image_url": "https://example.com/image.png"}]}),
+            json!({"type": "custom_tool_call_output", "call_id": "call_1", "output": [{"type": "input_image", "image_url": "https://example.com/image.png"}]}),
+            json!({"role": "developer", "content": [{"type": "input_image", "image_url": "https://example.com/image.png"}]}),
+            json!({"role": "user", "content": [{"type": "input_image", "file_id": "file-api-123"}]}),
+        ] {
+            let body = json!({"model": "deepseek-flash", "input": [item]}).to_string();
+            assert!(responses_provider_requirement(body.as_bytes(), "deepseek-flash").is_some());
+            assert!(responses_to_chat_request_body(body.as_bytes(), None, None)
+                .unwrap_err()
+                .contains("需要使用 Responses API 上游"));
+        }
     }
 
     #[test]
