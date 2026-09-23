@@ -6589,6 +6589,28 @@ fn catalog_has_required_models(templates: &[Value]) -> bool {
     })
 }
 
+fn supplement_codex_model_catalog_templates(mut templates: Vec<Value>) -> Vec<Value> {
+    // The live official catalog can include released models missing from CLI bundles.
+    // Keep a native CLI entry when available, otherwise supply the captured profile.
+    let supplemental: Value = serde_json::from_str(include_str!("catalogs/codex-models-gpt6.json"))
+        .expect("supplemental Codex model catalog must be valid JSON");
+    for entry in codex_model_catalog_templates_from_value(&supplemental) {
+        let slug = entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .expect("supplemental model slug");
+        if !templates.iter().any(|template| {
+            template
+                .get("slug")
+                .and_then(Value::as_str)
+                .is_some_and(|existing| existing.eq_ignore_ascii_case(slug))
+        }) {
+            templates.push(entry);
+        }
+    }
+    templates
+}
+
 fn embedded_codex_model_catalog_templates() -> Vec<Value> {
     let value = serde_json::from_str::<Value>(EMBEDDED_CODEX_MODEL_CATALOG_JSON)
         .expect("embedded Codex model catalog must be valid JSON");
@@ -6597,7 +6619,7 @@ fn embedded_codex_model_catalog_templates() -> Vec<Value> {
         catalog_has_required_models(&templates),
         "embedded Codex model catalog must contain gpt-6-astra and gpt-5.6-sol"
     );
-    templates
+    supplement_codex_model_catalog_templates(templates)
 }
 
 fn external_codex_catalog_is_eligible(version: &Version, templates: &[Value]) -> bool {
@@ -6632,7 +6654,7 @@ fn load_bundled_codex_model_catalog_templates() -> Vec<Value> {
         };
         let templates = codex_model_catalog_templates_from_value(&value);
         if external_codex_catalog_is_eligible(&version, &templates) {
-            return templates;
+            return supplement_codex_model_catalog_templates(templates);
         }
         return embedded;
     }
@@ -6832,7 +6854,12 @@ fn apply_codex_long_context(entry: &mut Value, enabled: bool, context_window: u6
         .is_some_and(|slug| {
             matches!(
                 slug.to_ascii_lowercase().as_str(),
-                "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+                "gpt-6-astra"
+                    | "gpt-6-sol"
+                    | "gpt-6-luna"
+                    | "gpt-5.6-sol"
+                    | "gpt-5.6-terra"
+                    | "gpt-5.6-luna"
             )
         });
     if !supports_custom_context {
@@ -7127,11 +7154,23 @@ fn is_gpt6_astra_model(model: &str) -> bool {
     model == "gpt-6-astra" || model.starts_with("gpt-6-astra-")
 }
 
-fn normalize_gpt6_reasoning_effort(value: &mut Value) -> bool {
+fn is_gpt6_sol_or_luna_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    ["gpt-6-sol", "gpt-6-luna"].iter().any(|name| {
+        model == *name
+            || model
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    })
+}
+
+fn normalize_gpt6_reasoning_effort(value: &mut Value, supports_none: bool) -> bool {
     let Some(effort) = value.as_str() else {
         return false;
     };
-    if effort.eq_ignore_ascii_case("none") || effort.eq_ignore_ascii_case("minimal") {
+    if (!supports_none && effort.eq_ignore_ascii_case("none"))
+        || effort.eq_ignore_ascii_case("minimal")
+    {
         *value = Value::String("low".to_string());
         return true;
     }
@@ -7149,22 +7188,38 @@ fn gpt6_compatible_request_body(body: &[u8], path: &str) -> Bytes {
     let Some(object) = value.as_object_mut() else {
         return Bytes::copy_from_slice(body);
     };
-    if !object
+    let model = object
         .get("model")
         .and_then(Value::as_str)
-        .is_some_and(is_gpt6_astra_model)
-    {
+        .unwrap_or_default();
+    let supports_none = is_gpt6_sol_or_luna_model(model);
+    if !is_gpt6_astra_model(model) && !supports_none {
         return Bytes::copy_from_slice(body);
     }
+    let effort = if path == "chat/completions" {
+        object.get("reasoning_effort")
+    } else {
+        object
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+    };
+    let reasoning_disabled = supports_none
+        && effort
+            .and_then(Value::as_str)
+            .is_some_and(|effort| effort.eq_ignore_ascii_case("none"));
 
     let mut changed = false;
-    for parameter in ["temperature", "top_p", "top_logprobs"] {
-        changed |= object.remove(parameter).is_some();
+    if !reasoning_disabled {
+        for parameter in ["temperature", "top_p", "top_logprobs"] {
+            changed |= object.remove(parameter).is_some();
+        }
     }
     if path == "chat/completions" {
-        changed |= object.remove("logprobs").is_some();
+        if !reasoning_disabled {
+            changed |= object.remove("logprobs").is_some();
+        }
         if let Some(effort) = object.get_mut("reasoning_effort") {
-            changed |= normalize_gpt6_reasoning_effort(effort);
+            changed |= normalize_gpt6_reasoning_effort(effort, supports_none);
         }
     } else {
         if let Some(effort) = object
@@ -7172,11 +7227,13 @@ fn gpt6_compatible_request_body(body: &[u8], path: &str) -> Bytes {
             .and_then(Value::as_object_mut)
             .and_then(|reasoning| reasoning.get_mut("effort"))
         {
-            changed |= normalize_gpt6_reasoning_effort(effort);
+            changed |= normalize_gpt6_reasoning_effort(effort, supports_none);
         }
         if let Some(include) = object.get_mut("include").and_then(Value::as_array_mut) {
             let original_len = include.len();
-            include.retain(|item| item.as_str() != Some("message.output_text.logprobs"));
+            include.retain(|item| {
+                reasoning_disabled || item.as_str() != Some("message.output_text.logprobs")
+            });
             changed |= include.len() != original_len;
         }
         if object.remove("prompt_cache_retention").is_some() {
@@ -7304,12 +7361,22 @@ fn responses_provider_requirement(body: &[u8], upstream_model: &str) -> Option<&
     if request_uses_async_tools(&value) {
         return Some("异步工具调用");
     }
-    if is_gpt6_astra_model(upstream_model)
+    let requires_responses_tools = is_gpt6_astra_model(upstream_model)
+        || (is_gpt6_sol_or_luna_model(upstream_model)
+            && !value
+                .pointer("/reasoning/effort")
+                .and_then(Value::as_str)
+                .is_some_and(|effort| effort.eq_ignore_ascii_case("none")));
+    if requires_responses_tools
         && !build_codex_tool_context_from_request(&value)
             .chat_tools()
             .is_empty()
     {
-        return Some("GPT-6 Astra 工具调用");
+        return Some(if is_gpt6_astra_model(upstream_model) {
+            "GPT-6 Astra 工具调用"
+        } else {
+            "GPT-6 Sol/Luna 推理工具调用"
+        });
     }
     None
 }
@@ -16712,6 +16779,106 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
+    fn gpt6_sol_luna_preserve_none_and_normalize_reasoning_requests() {
+        for model in ["gpt-6-sol", "gpt-6-luna", "GPT-6-SOL-2026-09-22"] {
+            for path in ["responses", "chat/completions"] {
+                for effort in ["none", "minimal", "high"] {
+                    let mut body = json!({
+                        "model": model, "temperature": 0.7, "top_p": 0.9,
+                        "top_logprobs": 2
+                    });
+                    if path == "responses" {
+                        body["reasoning"] = json!({"effort": effort});
+                        body["include"] = json!([
+                            "reasoning.encrypted_content",
+                            "message.output_text.logprobs"
+                        ]);
+                        body["prompt_cache_retention"] = json!("24h");
+                    } else {
+                        body["reasoning_effort"] = json!(effort);
+                        body["logprobs"] = json!(true);
+                    }
+                    let normalized = gpt6_compatible_request_body(body.to_string().as_bytes(), path);
+                    let value: Value = serde_json::from_slice(&normalized).unwrap();
+                    let effort_path = if path == "responses" {
+                        "/reasoning/effort"
+                    } else {
+                        "/reasoning_effort"
+                    };
+                    assert_eq!(
+                        value.pointer(effort_path),
+                        Some(&json!(if effort == "minimal" { "low" } else { effort }))
+                    );
+                    for parameter in ["temperature", "top_p", "top_logprobs"] {
+                        assert_eq!(value.get(parameter).is_some(), effort == "none");
+                    }
+                    if path == "responses" {
+                        assert_eq!(
+                            value["include"].as_array().unwrap().len(),
+                            if effort == "none" { 2 } else { 1 }
+                        );
+                        assert_eq!(
+                            value.pointer("/prompt_cache_options/ttl"),
+                            Some(&json!("30m"))
+                        );
+                        assert!(value.get("prompt_cache_retention").is_none());
+                    } else {
+                        assert_eq!(value.get("logprobs").is_some(), effort == "none");
+                    }
+                }
+            }
+        }
+        for model in ["gpt-5.6-sol", "gpt-6-solar", "gpt-6-lunatic"] {
+            let body = json!({"model": model, "temperature": 1, "reasoning": {"effort": "minimal"}})
+                .to_string();
+            assert_eq!(
+                gpt6_compatible_request_body(body.as_bytes(), "responses").as_ref(),
+                body.as_bytes()
+            );
+        }
+        let body = br#"{"model":"gpt-6-sol","temperature":1}"#;
+        assert_eq!(
+            gpt6_compatible_request_body(body, "responses/compact").as_ref(),
+            body
+        );
+    }
+
+    #[test]
+    fn gpt6_sol_luna_chat_tools_require_explicit_none_after_model_mapping() {
+        for model in ["gpt-6-sol", "gpt-6-luna", "gpt-6-luna-2026-09-22"] {
+            for effort in [None, Some("none"), Some("minimal"), Some("high")] {
+                let mut body = json!({
+                    "model": "public-alias", "input": "hello",
+                    "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+                });
+                if let Some(effort) = effort {
+                    body["reasoning"] = json!({"effort": effort});
+                }
+                let raw = body.to_string();
+                assert_eq!(
+                    responses_provider_requirement(raw.as_bytes(), model).is_some(),
+                    effort != Some("none")
+                );
+                let converted = responses_to_chat_request_body(raw.as_bytes(), Some(model), None);
+                if effort == Some("none") {
+                    let (bytes, _) = converted.expect("non-reasoning tools can use chat");
+                    let chat: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(chat["model"], model);
+                    assert_eq!(chat["reasoning_effort"], "none");
+                    assert_eq!(
+                        chat.pointer("/tools/0/function/name"),
+                        Some(&json!("lookup"))
+                    );
+                } else {
+                    assert!(converted.unwrap_err().contains("GPT-6 Sol/Luna"));
+                }
+                body.as_object_mut().unwrap().remove("tools");
+                assert!(responses_provider_requirement(body.to_string().as_bytes(), model).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn maps_responses_developer_role_for_chat_completions() {
         let body = json!({
             "model": "gpt-5.5",
@@ -17700,6 +17867,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 "max_context_window": 872_000,
                 "auto_compact_token_limit": 244_800
             }),
+            json!({"slug": "gpt-6-sol", "context_window": 272_000}),
+            json!({"slug": "gpt-6-luna", "context_window": 272_000}),
             json!({
                 "slug": "gpt-5.6-sol",
                 "context_window": 272_000,
@@ -17725,6 +17894,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         let catalog = codex_models_catalog_value_with_templates_and_context(
             vec![
                 "gpt-6-astra".to_string(),
+                "gpt-6-sol".to_string(),
+                "gpt-6-luna".to_string(),
                 "gpt-5.6-sol".to_string(),
                 "gpt-5.6-terra".to_string(),
                 "gpt-5.6-luna".to_string(),
@@ -17740,7 +17911,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             .and_then(Value::as_array)
             .expect("catalog models");
 
-        for model in &models[..4] {
+        for model in &models[..6] {
             assert_eq!(
                 model.get("context_window").and_then(Value::as_i64),
                 Some(1_000_000)
@@ -17752,11 +17923,11 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             assert_eq!(model.get("auto_compact_token_limit"), Some(&Value::Null));
         }
         assert_eq!(
-            models[4].get("context_window").and_then(Value::as_i64),
+            models[6].get("context_window").and_then(Value::as_i64),
             Some(272_000)
         );
         assert_eq!(
-            models[4].get("max_context_window").and_then(Value::as_i64),
+            models[6].get("max_context_window").and_then(Value::as_i64),
             Some(272_000)
         );
     }
@@ -18023,7 +18194,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     #[test]
     fn embedded_codex_catalog_contains_gpt6_and_deepseek_base_model() {
         let templates = embedded_codex_model_catalog_templates();
-        assert_eq!(templates.len(), 11);
+        assert_eq!(templates.len(), 13);
         let astra = templates
             .iter()
             .find(|entry| entry.get("slug").and_then(Value::as_str) == Some("gpt-6-astra"))
@@ -18056,6 +18227,48 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             .get("base_instructions")
             .and_then(Value::as_str)
             .is_some_and(|value| value.len() > 1_000));
+    }
+
+    #[test]
+    fn gpt6_supplement_exposes_official_profiles_without_replacing_native_entries() {
+        let templates = embedded_codex_model_catalog_templates();
+        let catalog = codex_models_catalog_value_with_templates(
+            vec!["gpt-6-sol".into(), "gpt-6-luna".into()],
+            &templates,
+        )
+        .unwrap();
+        assert_eq!(catalog["models"].as_array().unwrap().len(), 2);
+        for model in catalog["models"].as_array().unwrap() {
+            assert_eq!(model["shell_type"], "unified_exec");
+            assert_eq!(model["context_window"], 272_000);
+            assert_eq!(model["max_context_window"], 872_000);
+            assert_eq!(model["default_reasoning_level"], "medium");
+            assert_eq!(model["input_modalities"], json!(["text", "image"]));
+            assert!(model["base_instructions"].as_str().unwrap().len() > 1_000);
+            assert!(
+                model
+                    .pointer("/model_messages/instructions_template")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .len()
+                    > 1_000
+            );
+            let has_ultra = model["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|level| level["effort"] == "ultra");
+            assert_eq!(has_ultra, model["slug"] == "gpt-6-sol");
+        }
+        let native = json!({"slug": "GPT-6-SOL", "description": "new native profile"});
+        let merged = supplement_codex_model_catalog_templates(vec![native.clone()]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], native);
+        assert_eq!(merged[1]["slug"], "gpt-6-luna");
+        assert_eq!(
+            supplement_codex_model_catalog_templates(merged.clone()),
+            merged
+        );
     }
 
     #[test]
