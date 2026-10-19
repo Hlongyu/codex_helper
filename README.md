@@ -49,6 +49,14 @@ XXSwitch 将 `model_provider` 指向本地 `custom` provider，维护其 Base UR
 
 启用“实验性上下文接力”时，XXSwitch 同步设置 `features.token_budget.enabled` 和 `features.token_budget.use_history_notes_extension`，具体提醒阈值、兜底缓冲和提示模板继续使用当前模型目录提供的默认值。该功能与远程压缩独立配置。
 
+### 供应商融合模式
+
+在 Codex 或 Claude 供应商的编辑页开启「融合模式」，并在模型配置中选定要发布的模型。客户端模型列表将显示「模型名（供应商名）」。Codex 需要彻底退出后重新打开以加载更新的目录。
+
+融合模型使用供应商固定 ID 路由：只发往对应供应商，不参与跨供应商故障切换；普通、不带供应商的模型请求会排除所有开启融合模式的供应商。关闭融合、停用或删除供应商后，旧融合模型不会回落到其他线路。供应商改名只影响显示名称。
+
+模型能力与默认模板统一来自维护者发布的目录，程序只按模型 ID 筛选并添加供应商标识。未收录模型使用目录中的默认模板，不在程序中推导能力。现有模型映射仍在发送上游之前生效。
+
 ### Claude Code
 
 配置文件：`~/.claude/settings.json`
@@ -170,3 +178,17 @@ pnpm tauri build
 - [文档索引](./docs/README.md)
 - [架构决策记录](./docs/adr/)
 - [历史界面设计稿](./docs/design/)
+
+## 本机模型能力目录服务
+
+运行 `npm run catalog:serve`，在 `http://127.0.0.1:18081/catalog.json` 提供静态 JSON（仅监听本机）。维护文件是 `model-catalog/catalog.json`，修改后下次请求立即生效，无需重启服务。
+
+在 XXSwitch「设置 → 应用 → 模型能力目录」点击「更新模型能力」。程序不携带供应商凭据，下载并校验完整目录后保存至 `~/.codex/config-manager/capability-catalog.json`，然后按供应商选定模型重新生成 `router-models.json`。失败保留原缓存；首次离线使用同一目录随安装包附带的快照。目录更新后需彻底重启 Codex。
+
+目录仅包含 `schema_version`、发布 `version`、`openai` 模型数组、`deepseek` 模型数组和 `default` 完整模型条目。上下文、基础指令、思考档位、工具等字段由维护者直接维护；用户没有自定义目录入口。当前初始目录来自项目已有能力快照，未重新抓取上游最新版。显式开启的 GPT-5.6 及以上长上下文设置（按主、次版本号识别，例如 5.10、6、6.1）优先于远端目录，普通和融合模型均生效；未开启时沿用目录参数。
+
+测试服务地址固定在 `src-tauri/src/model_catalog.rs` 的 `URL` 常量中；迁移 Cloudflare 时替换为正式 HTTPS 地址即可，服务端文件不必改格式。
+
+本机端到端测试：先启动目录服务，再运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib local_capability_service_round_trip -- --ignored`。测试在临时目录保存缓存，不修改真实用户配置。
+
+请求体始终在本地解压读取路由信息。「以未压缩 JSON 转发」关闭时，未修改的 zstd 请求原字节透传；融合 ID、模型映射、协议或参数修改后重新压缩，发送正确的 Content-Encoding，并重新计算长度。开启时发送解压后的 JSON。

@@ -171,6 +171,7 @@ type ProviderConfig = {
   name: string;
   status: ProviderStatus;
   enabled: boolean;
+  fusion_enabled: boolean;
   consecutive_failure_count: number;
   auto_disabled_day?: string | null;
   auto_disable_reset_period: AutoDisableResetPeriod;
@@ -195,6 +196,7 @@ type ClaudeProviderConfig = {
   name: string;
   status: ProviderStatus;
   enabled: boolean;
+  fusion_enabled: boolean;
   consecutive_failure_count: number;
   auto_disabled_day?: string | null;
   auto_disable_reset_period: AutoDisableResetPeriod;
@@ -456,6 +458,8 @@ type AppState = {
   diffs: Array<{ path: string; action: string }>;
   router: RouterConfig;
   codex_models: string[];
+  capability_version: string;
+  capability_updated_at?: string | null;
   clients: ClientConfigs;
   multi_agent_enabled: boolean;
   router_status: RouterStatus;
@@ -608,6 +612,7 @@ function routerSlowModeError(router: RouterConfig) {
   return "";
 }
 
+
 function routerLongContextWindowError(router: RouterConfig) {
   if (!router.gpt56_long_context_enabled) return "";
   if (
@@ -618,6 +623,7 @@ function routerLongContextWindowError(router: RouterConfig) {
   }
   return "";
 }
+
 
 function defaultClientConfigs(): ClientConfigs {
   return {
@@ -841,6 +847,20 @@ function normalizedServiceTier(value?: string | null) {
   return tier === "fast" ? "priority" : tier;
 }
 
+function requestModelLabel(model: string): string {
+  const match = /^xxswitch-([0-9a-f]+)\/(.+)$/.exec(model)
+    ?? /^xxswitch-claude-([0-9a-f]+)--(.+)$/.exec(model);
+  return match ? match[2] : model;
+}
+
+function fusionModelLabel(model: string, providers: ProviderSummary[]): string {
+  const match = /^xxswitch-([0-9a-f]+)\/(.+)$/.exec(model)
+    ?? /^xxswitch-claude-([0-9a-f]+)--(.+)$/.exec(model);
+  if (!match) return model;
+  const provider = providers.find((p) => Array.from(new TextEncoder().encode(p.id), (byte) => byte.toString(16).padStart(2, "0")).join("") === match[1]);
+  return `${match[2]}（${provider?.name ?? "供应商已移除"}）`;
+}
+
 function serviceTierLabel(value?: string | null, emptyLabel = "未返回") {
   const tier = normalizedServiceTier(value);
   if (!tier) return emptyLabel;
@@ -1033,7 +1053,7 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
   const rows = logs.map((log) => [
     new Date(log.started_at_ms).toLocaleString("zh-CN"),
     statusMeta(log.status).label,
-    log.model,
+    requestModelLabel(log.model),
     log.provider_name,
     serviceTierLabel(log.requested_service_tier, "未强制"),
     serviceTierLabel(log.actual_service_tier),
@@ -1409,6 +1429,10 @@ function App() {
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerApiKeyDirty, setProviderApiKeyDirty] = useState(false);
   const [providerEnabled, setProviderEnabled] = useState(true);
+  const [capabilityBusy, setCapabilityBusy] = useState(false);
+  const [capabilityMessage, setCapabilityMessage] = useState("");
+  const [fusionEnabled, setFusionEnabled] = useState(false);
+  const [modelListCleared, setModelListCleared] = useState(false);
   const [providerEnabledDirty, setProviderEnabledDirty] = useState(false);
   const [providerAutoDisableResetPeriod, setProviderAutoDisableResetPeriod] = useState<AutoDisableResetPeriod>("daily");
   const [providerAutoDisableResetWeekday, setProviderAutoDisableResetWeekday] = useState(1);
@@ -1446,18 +1470,25 @@ function App() {
     }
   }
 
+  const logRequestSequence = useRef(0);
+  const usageRequestSequence = useRef(0);
+  const logRequestsInFlight = useRef(0);
+
   async function refreshRouteUsage(filter = usageFilter) {
-    const usage = await callCommand<RouteUsageStats>("load_route_usage_stats", {
-      payload: { filter },
-    });
-    setRouteUsageStats(usage);
+    const sequence = ++usageRequestSequence.current;
+    const usage = await callCommand<RouteUsageStats>("load_route_usage_stats", { payload: { filter } });
+    if (sequence === usageRequestSequence.current) setRouteUsageStats(usage);
   }
 
   async function refreshRouteLogs(filter = requestFilter) {
-    const logs = await callCommand<RouteLogsResponse>("load_route_logs", {
-      payload: { filter },
-    });
-    setRouteLogs(logs);
+    const sequence = ++logRequestSequence.current;
+    logRequestsInFlight.current += 1;
+    try {
+      const logs = await callCommand<RouteLogsResponse>("load_route_logs", { payload: { filter } });
+      if (sequence === logRequestSequence.current) setRouteLogs(logs);
+    } finally {
+      logRequestsInFlight.current -= 1;
+    }
   }
 
   async function refreshAppState() {
@@ -1475,7 +1506,8 @@ function App() {
   async function refresh() {
     await refreshAppState();
     try {
-      await Promise.all([refreshRouteUsage(), refreshRouteLogs()]);
+      if (screen === "requests") await refreshRouteLogs();
+      else if (screen === "dashboard" || screen === "usage") await refreshRouteUsage();
     } catch {
       setRouteUsageStats(null);
       setRouteLogs(null);
@@ -1570,6 +1602,7 @@ function App() {
   useEffect(() => {
     if (screen !== "requests" || !requestAutoRefresh) return;
     const timer = window.setInterval(() => {
+      if (logRequestsInFlight.current > 0) return;
       refreshRouteLogs(requestFilter).catch((err) => setError(String(err)));
     }, 5000);
     return () => window.clearInterval(timer);
@@ -1630,6 +1663,8 @@ function App() {
     setProviderApiKeyDirty(false);
     setProviderEnabled((summary?.status ?? targetFull.status) === "enabled");
     setProviderEnabledDirty(false);
+    setFusionEnabled(targetFull.fusion_enabled ?? false);
+    setModelListCleared(false);
     setProviderAutoDisableResetPeriod(targetFull.auto_disable_reset_period ?? summary?.auto_disable_reset_period ?? "daily");
     setProviderAutoDisableResetWeekday(targetFull.auto_disable_reset_weekday ?? summary?.auto_disable_reset_weekday ?? 1);
     setProviderAutoDisableResetDay(targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1);
@@ -1670,6 +1705,8 @@ function App() {
     setProviderApiKeyDirty(false);
     setProviderEnabled((summary?.status ?? targetFull.status) === "enabled");
     setProviderEnabledDirty(false);
+    setFusionEnabled(targetFull.fusion_enabled ?? false);
+    setModelListCleared(false);
     setProviderAutoDisableResetPeriod(targetFull.auto_disable_reset_period ?? summary?.auto_disable_reset_period ?? "daily");
     setProviderAutoDisableResetWeekday(targetFull.auto_disable_reset_weekday ?? summary?.auto_disable_reset_weekday ?? 1);
     setProviderAutoDisableResetDay(targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1);
@@ -1737,9 +1774,26 @@ function App() {
     });
   }
 
+  async function updateModelCapabilities() {
+    setCapabilityBusy(true);
+    setCapabilityMessage("");
+    try {
+      const state = await callCommand<AppState>("update_model_capabilities");
+      setAppState(state);
+      setCapabilityMessage(`能力目录已更新为 ${state.capability_version}，请彻底重启 Codex 以刷新模型列表。`);
+    } catch (error) {
+      setCapabilityMessage(`更新失败：${String(error)}。继续使用已有能力目录。`);
+    } finally {
+      setCapabilityBusy(false);
+    }
+  }
+
   async function saveProvider() {
     if (!editingId) return;
     await run(async () => {
+      if (modelListCleared && allowedModels.length === 0) {
+        throw new Error("模型列表已清空，请重新获取或手动添加模型后保存；如需停止使用供应商，请将其停用。");
+      }
       const nextBalance = {
         ...balanceQuery,
         endpoint: balanceQuery.endpoint || endpointFromBaseUrl(providerBaseUrl),
@@ -1759,6 +1813,7 @@ function App() {
         balance_status: balanceTestStatus,
         connection_test_model: providerTestModel,
         allowed_models: allowedModels,
+        fusion_enabled: fusionEnabled,
         model_mappings: modelMappings,
       };
       if (providerApiKeyDirty) {
@@ -1778,6 +1833,9 @@ function App() {
   async function saveClaudeProvider() {
     if (!editingId) return;
     await run(async () => {
+      if (modelListCleared && allowedModels.length === 0) {
+        throw new Error("模型列表已清空，请重新获取或手动添加模型后保存；如需停止使用供应商，请将其停用。");
+      }
       const payload: Record<string, unknown> = {
         provider_id: editingId,
         provider_name: providerName,
@@ -1788,6 +1846,7 @@ function App() {
         base_url: providerBaseUrl,
         connection_test_model: providerTestModel,
         allowed_models: allowedModels,
+        fusion_enabled: fusionEnabled,
         model_mappings: modelMappings,
       };
       if (providerApiKeyDirty) {
@@ -2224,7 +2283,6 @@ function App() {
     busy ||
     !routeDirty ||
     Boolean(routerModelProviderError(routerDraft)) ||
-    Boolean(routerLongContextWindowError(routerDraft)) ||
     Boolean(
       effectiveRouterCodexModelError(
         routerDraft,
@@ -2522,6 +2580,17 @@ function App() {
                 </div>
                 <div className="settings-row update-check-row">
                   <div>
+                    <span>模型能力目录</span>
+                    <small>OpenAI · DeepSeek · 默认模板 / {appState.capability_version}</small>
+                    <small>{appState.capability_updated_at ? `上次获取：${appState.capability_updated_at}` : "正在使用安装包目录快照"}</small>
+                    {capabilityMessage && <small role="status">{capabilityMessage}</small>}
+                  </div>
+                  <button className="ghost" disabled={capabilityBusy || busy} onClick={() => void updateModelCapabilities()} type="button">
+                    {capabilityBusy ? "正在获取…" : "更新模型能力"}
+                  </button>
+                </div>
+                <div className="settings-row update-check-row">
+                  <div>
                     <span>远端更新</span>
                     <small>从 GitHub Release 获取最新稳定版本</small>
                   </div>
@@ -2637,6 +2706,14 @@ function App() {
           balanceTestStatus={balanceTestStatus}
           balanceTokenVisible={balanceTokenVisible}
           busy={busy}
+          modelListCleared={modelListCleared}
+          onClearModels={() => {
+            setAllowedModels([]);
+            setProviderModels([]);
+            setModelListCleared(true);
+          }}
+          fusionEnabled={fusionEnabled}
+          setFusionEnabled={setFusionEnabled}
           allowedModels={allowedModels}
           modelMappings={modelMappings}
           onBalanceTokenVisible={setBalanceTokenVisible}
@@ -2688,6 +2765,14 @@ function App() {
       )}
       {editorOpen && editorKind === "claude" && (
         <ClaudeProviderEditor
+          modelListCleared={modelListCleared}
+          onClearModels={() => {
+            setAllowedModels([]);
+            setProviderModels([]);
+            setModelListCleared(true);
+          }}
+          fusionEnabled={fusionEnabled}
+          setFusionEnabled={setFusionEnabled}
           allowedModels={allowedModels}
           busy={busy}
           modelMappings={modelMappings}
@@ -2947,8 +3032,8 @@ function LocalProxySettings({
 
       <div className="route-toggle-line debug-mode-toggle">
         <div>
-          <strong>解压 zstd 请求体</strong>
-          <p>关闭后不检查或解压请求体，并保留 Content-Encoding 交给兼容上游处理。</p>
+          <strong>以未压缩 JSON 转发</strong>
+          <p>始终本地解压读取模型。关闭时保留 zstd 压缩传输，改写请求后重新压缩；开启时向上游发送未压缩 JSON。</p>
         </div>
         <Toggle
           checked={routerDraft.zstd_decompression_enabled}
@@ -3029,12 +3114,12 @@ function RouteScreen({
     routerDraft,
     appState.codex_models,
   );
+  const longContextWindowError = routerLongContextWindowError(routerDraft);
   const codexModelError = effectiveRouterCodexModelError(
     routerDraft,
     appState.codex_models,
     appState.clients.codex.enabled,
   );
-  const longContextWindowError = routerLongContextWindowError(routerDraft);
 
   return (
     <section className="route-page">
@@ -3098,7 +3183,7 @@ function RouteScreen({
               ) : null}
               {appState.codex_models.map((model) => (
                 <option key={model} value={model}>
-                  {model}
+                  {fusionModelLabel(model, appState.providers)}
                 </option>
               ))}
             </select>
@@ -3149,8 +3234,8 @@ function RouteScreen({
           </div>
           <div className="route-toggle-line long-context-setting">
             <div>
-              <strong>GPT-6 / GPT-5.6 长上下文</strong>
-              <p>为 Astra、Sol、Terra 和 Luna 设置自定义上下文窗口。</p>
+              <strong>GPT-5.6 及以上长上下文</strong>
+              <p>按模型版本号识别 GPT-5.6 及以上模型，包含模型后缀和融合条目。</p>
             </div>
             <div className="long-context-controls">
               <label className="compact-field">
@@ -3175,13 +3260,14 @@ function RouteScreen({
               <Toggle
                 checked={routerDraft.gpt56_long_context_enabled}
                 disabled={busy}
-                label="启用 GPT-6 / GPT-5.6 长上下文"
+                label="启用 GPT-5.6 及以上长上下文"
                 onChange={(gpt56_long_context_enabled) =>
                   setRouterDraft({ ...routerDraft, gpt56_long_context_enabled })
                 }
               />
             </div>
           </div>
+
           <div className="route-toggle-line">
             <div>
               <strong>强制不使用 OpenAI 登录态</strong>
@@ -3697,7 +3783,7 @@ function UsageScreen({
           {(stats?.details ?? []).slice(0, 8).map((log) => (
             <div key={log.id}>
               <span>{formatLogTime(log.started_at_ms)}</span>
-              <strong>{log.model}</strong>
+              <strong>{requestModelLabel(log.model)}</strong>
               <span>{log.provider_name}</span>
               <span>{formatTokenCount(log.uncached_input_tokens)}</span>
               <span>{formatTokenCount(log.cached_input_tokens)}</span>
@@ -3920,7 +4006,7 @@ function RequestLogsScreen({
                   <b className={`${status.tone}-text`}>{status.label}</b>
                 </div>
                 <strong>{formatLogTime(log.started_at_ms)}</strong>
-                <strong>{log.model}</strong>
+                <strong>{requestModelLabel(log.model)}</strong>
                 <strong>{log.provider_name}</strong>
                 <span>{formatTokenTriplet(log)}</span>
                 <b>{formatMs(log.first_byte_ms)}</b>
@@ -4043,8 +4129,8 @@ function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () 
             <div className="request-detail-grid">
               <div><span>请求</span><strong>{log.method} {log.path}</strong></div>
               <div><span>状态码</span><strong>{log.status_code ?? "-"}</strong></div>
-              <div><span>模型</span><strong>{log.model || "-"}</strong></div>
-              <div><span>上游模型</span><strong>{log.upstream_model || log.model || "-"}</strong></div>
+              <div><span>模型</span><strong>{requestModelLabel(log.model) || "-"}</strong></div>
+              <div><span>上游模型</span><strong>{requestModelLabel(log.upstream_model || log.model) || "-"}</strong></div>
               <div><span>供应商</span><strong>{log.provider_name}</strong></div>
               <div><span>路由尝试</span><strong>{log.route_attempts} 次</strong></div>
               <div>
@@ -4078,7 +4164,7 @@ function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () 
                   <strong>{requestBody.content_encoding || "未设置"}</strong>
                 </div>
                 <div>
-                  <span>zstd 解压配置</span>
+                  <span>本地解析</span>
                   <strong>{requestBody.decompression_enabled ? "开启" : "关闭"}</strong>
                 </div>
                 <div><span>zstd 识别</span><strong>{requestBody.zstd_detected ? "是" : "否"}</strong></div>
@@ -4973,6 +5059,10 @@ function AutoDisableResetFields(props: {
 }
 
 function ProviderEditor(props: {
+  modelListCleared: boolean;
+  onClearModels: () => void;
+  fusionEnabled: boolean;
+  setFusionEnabled: (enabled: boolean) => void;
   allowedModels: string[];
   balanceAccountOptions: AiGateBalanceAccount[];
   balanceQuery: BalanceQueryConfig;
@@ -5015,6 +5105,10 @@ function ProviderEditor(props: {
   tab: EditorTab;
 }) {
   const {
+    modelListCleared,
+    onClearModels,
+    fusionEnabled,
+    setFusionEnabled,
     allowedModels,
     balanceAccountOptions,
     balanceQuery,
@@ -5063,7 +5157,7 @@ function ProviderEditor(props: {
   const visibleModelOptions = allowedModelOptions.filter((model) =>
     model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
   );
-  const allModelsAllowed = allowedModels.length === 0;
+  const allModelsAllowed = allowedModels.length === 0 && !modelListCleared;
   const selectedAiGateAccountId = balanceQuery.ai_gate_account_id ?? null;
   const selectedAiGateAccountMissing = selectedAiGateAccountId !== null
     && !balanceAccountOptions.some((account) => account.account_id === selectedAiGateAccountId);
@@ -5141,6 +5235,14 @@ function ProviderEditor(props: {
                 </select>
                 <small>上游不支持 Responses API 时选择 Chat Completions 兼容模式</small>
               </label>
+              <label className="field">
+                <span className="fusion-toggle"><input type="checkbox" checked={fusionEnabled} onChange={(event) => {
+                  const enabled = event.currentTarget.checked;
+                  setFusionEnabled(enabled);
+                  if (enabled && allowedModels.length === 0) setAllowedModels(providerModels);
+                }} /> 融合模式</span>
+                <small>选定的模型将显示供应商名称，并仅发往此供应商。普通模型请求不会使用此供应商。请在模型配置中选择要发布的模型；Codex 需重启以刷新列表。</small>
+              </label>
               <AutoDisableResetFields
                 period={providerAutoDisableResetPeriod}
                 resetDay={providerAutoDisableResetDay}
@@ -5199,6 +5301,7 @@ function ProviderEditor(props: {
                     <strong>启用模型</strong>
                     <p>取消不希望参与路由的模型；修改会在保存供应商后生效。</p>
                   </div>
+              <div className="model-list-actions">
                   <button
                     className="ghost small"
                     disabled={allowedModelOptions.length === 0}
@@ -5207,6 +5310,19 @@ function ProviderEditor(props: {
                   >
                     全部启用
                   </button>
+                <button
+                  className="ghost small"
+                  disabled={busy || allowedModelOptions.length === 0}
+                  onClick={() => {
+                    onClearModels();
+                    setModelSearch("");
+                    setCustomAllowedModel("");
+                  }}
+                  type="button"
+                >
+                  一键清空
+                </button>
+              </div>
                 </div>
                 <label className="model-search-field">
                   <span aria-hidden="true" />
@@ -5493,6 +5609,10 @@ function ProviderEditor(props: {
 }
 
 function ClaudeProviderEditor(props: {
+  modelListCleared: boolean;
+  onClearModels: () => void;
+  fusionEnabled: boolean;
+  setFusionEnabled: (enabled: boolean) => void;
   allowedModels: string[];
   busy: boolean;
   modelMappings: ModelMapping[];
@@ -5522,6 +5642,10 @@ function ClaudeProviderEditor(props: {
   setSecretVisible: (value: boolean) => void;
 }) {
   const {
+    modelListCleared,
+    onClearModels,
+    fusionEnabled,
+    setFusionEnabled,
     allowedModels,
     busy,
     modelMappings,
@@ -5558,7 +5682,7 @@ function ClaudeProviderEditor(props: {
   const visibleModelOptions = allowedModelOptions.filter((model) =>
     model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
   );
-  const allModelsAllowed = allowedModels.length === 0;
+  const allModelsAllowed = allowedModels.length === 0 && !modelListCleared;
   const toggleAllowedModel = (model: string, checked: boolean) => {
     const currentModels = allModelsAllowed ? allowedModelOptions : allowedModels;
     updateAllowedModels(
@@ -5616,6 +5740,14 @@ function ClaudeProviderEditor(props: {
               </button>
             </div>
           </label>
+          <label className="field">
+            <span className="fusion-toggle"><input type="checkbox" checked={fusionEnabled} onChange={(event) => {
+              const enabled = event.currentTarget.checked;
+              setFusionEnabled(enabled);
+              if (enabled && allowedModels.length === 0) setAllowedModels(providerModels);
+            }} /> 融合模式</span>
+            <small>选定的模型将显示供应商名称，并仅发往此供应商。普通模型请求不会使用此供应商。请在模型配置中选择要发布的模型。</small>
+          </label>
           <AutoDisableResetFields
             period={providerAutoDisableResetPeriod}
             resetDay={providerAutoDisableResetDay}
@@ -5641,8 +5773,9 @@ function ClaudeProviderEditor(props: {
             <div className="mapping-box-head">
               <div>
                 <strong>启用模型</strong>
-                <p>{allowedModels.length ? `已启用 ${allowedModels.length} 个 Claude 模型` : "当前兼容任意 Claude 模型"}</p>
+                <p>{allowedModels.length ? `已启用 ${allowedModels.length} 个 Claude 模型` : modelListCleared ? "已清空，请重新获取或添加模型" : "当前兼容任意 Claude 模型"}</p>
               </div>
+              <div className="model-list-actions">
               <button
                 className="ghost small"
                 disabled={allowedModelOptions.length === 0}
@@ -5651,6 +5784,19 @@ function ClaudeProviderEditor(props: {
               >
                 全部启用
               </button>
+                <button
+                  className="ghost small"
+                  disabled={busy || allowedModelOptions.length === 0}
+                  onClick={() => {
+                    onClearModels();
+                    setModelSearch("");
+                    setCustomAllowedModel("");
+                  }}
+                  type="button"
+                >
+                  一键清空
+                </button>
+              </div>
             </div>
             <label className="model-search-field">
               <span aria-hidden="true" />

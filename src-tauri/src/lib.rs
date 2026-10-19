@@ -1,3 +1,5 @@
+mod model_catalog;
+
 use axum::{
     body::{Body, Bytes},
     extract::{Path as AxumPath, State as AxumState},
@@ -24,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -65,7 +67,9 @@ const MAX_PROXY_ERROR_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DEBUG_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_MODEL_CONTEXT_WINDOW: i64 = 256_000;
 const DEFAULT_GPT56_LONG_CONTEXT_WINDOW: u64 = 372_000;
+#[cfg(test)]
 const EMBEDDED_CODEX_MODEL_CATALOG_VERSION: &str = "0.153.4";
+#[cfg(test)]
 const EMBEDDED_CODEX_MODEL_CATALOG_JSON: &str = include_str!("catalogs/codex-models.json");
 const CODEX_ROUTER_MODEL_CATALOG: &str = "config-manager/router-models.json";
 const ROUTER_BACKUP_SCHEMA_VERSION: u8 = 3;
@@ -99,6 +103,8 @@ struct ProviderConfig {
     #[serde(default)]
     status: ProviderStatus,
     enabled: bool,
+    #[serde(default)]
+    fusion_enabled: bool,
     #[serde(default)]
     consecutive_failure_count: u32,
     #[serde(default)]
@@ -141,6 +147,8 @@ struct ClaudeProviderConfig {
     #[serde(default)]
     status: ProviderStatus,
     enabled: bool,
+    #[serde(default)]
+    fusion_enabled: bool,
     #[serde(default)]
     consecutive_failure_count: u32,
     #[serde(default)]
@@ -750,6 +758,8 @@ struct AppState {
     marker_present: bool,
     router: RouterConfig,
     codex_models: Vec<String>,
+    capability_version: String,
+    capability_updated_at: Option<String>,
     clients: ClientConfigs,
     multi_agent_enabled: bool,
     router_status: RouterStatus,
@@ -801,6 +811,7 @@ struct SaveProviderPayload {
     balance_query: Option<BalanceQueryConfig>,
     balance_status: Option<BalanceStatus>,
     connection_test_model: Option<String>,
+    fusion_enabled: Option<bool>,
     allowed_models: Option<Vec<String>>,
     model_mappings: Option<Vec<ModelMapping>>,
     wire_api: Option<ProviderWireApi>,
@@ -826,6 +837,7 @@ struct SaveClaudeProviderPayload {
     base_url: Option<String>,
     api_key: Option<String>,
     connection_test_model: Option<String>,
+    fusion_enabled: Option<bool>,
     allowed_models: Option<Vec<String>>,
     model_mappings: Option<Vec<ModelMapping>>,
 }
@@ -3581,9 +3593,78 @@ fn normalize_model_names(models: Vec<String>) -> Vec<String> {
     normalized
 }
 
+fn new_provider_id() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|err| format!("无法生成供应商 ID: {err}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+const FUSION_PREFIX: &str = "xxswitch-";
+const LEGACY_FUSION_PREFIX: &str = "xxswitch-claude-";
+
+fn fusion_provider_key(provider_id: &str) -> String {
+    provider_id.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn fusion_model_id(provider_id: &str, model: &str) -> String {
+    format!("{FUSION_PREFIX}{}/{model}", fusion_provider_key(provider_id))
+}
+
+fn claude_fusion_model_id(provider_id: &str, model: &str) -> String {
+    format!("{LEGACY_FUSION_PREFIX}{}--{model}", fusion_provider_key(provider_id))
+}
+
+fn fusion_model_parts(model: &str) -> Option<(&str, &str)> {
+    let (key, model) = if let Some(rest) = model.strip_prefix(LEGACY_FUSION_PREFIX) {
+        rest.split_once("--")?
+    } else {
+        model.strip_prefix(FUSION_PREFIX)?.split_once('/')?
+    };
+    (!key.is_empty() && !model.is_empty()).then_some((key, model))
+}
+
+fn fusion_requested_model<'a>(id: &str, enabled: bool, requested: &'a str) -> Option<&'a str> {
+    if requested.starts_with(FUSION_PREFIX) {
+        let (key, model) = fusion_model_parts(requested)?;
+        (enabled && fusion_provider_key(id) == key).then_some(model)
+    } else {
+        (!enabled).then_some(requested)
+    }
+}
+
+fn decorate_fusion_catalog<'a>(
+    catalog: &mut Value,
+    providers: impl Iterator<Item = (&'a str, &'a str)>,
+) {
+    let names: Vec<_> = providers.collect();
+    for entry in catalog["models"].as_array_mut().into_iter().flatten() {
+        let Some(slug) = entry["slug"].as_str() else {
+            continue;
+        };
+        let Some((_, model)) = fusion_model_parts(slug) else {
+            continue;
+        };
+        if let Some((_, name)) = names
+            .iter()
+            .find(|(id, _)| fusion_requested_model(id, true, slug).is_some())
+        {
+            let display = entry["display_name"].as_str().unwrap_or(model);
+            entry["display_name"] = json!(format!("{display}（{name}）"));
+        }
+    }
+}
+
 fn provider_accepts_model(provider: &ProviderConfig, requested_model: &str) -> bool {
-    let requested = requested_model.trim();
-    if requested.is_empty() || requested == "未知模型" || provider.allowed_models.is_empty() {
+    let Some(requested) = fusion_requested_model(
+        &provider.id,
+        provider.fusion_enabled,
+        requested_model.trim(),
+    ) else {
+        return false;
+    };
+    if !provider.fusion_enabled
+        && (requested.is_empty() || requested == "未知模型" || provider.allowed_models.is_empty())
+    {
         return true;
     }
     provider
@@ -3593,7 +3674,15 @@ fn provider_accepts_model(provider: &ProviderConfig, requested_model: &str) -> b
 }
 
 fn mapped_model_for_provider(provider: &ProviderConfig, requested_model: &str) -> Option<String> {
-    let requested = requested_model.trim();
+    let requested = if requested_model.trim().starts_with(FUSION_PREFIX) {
+        fusion_requested_model(
+            &provider.id,
+            provider.fusion_enabled,
+            requested_model.trim(),
+        )?
+    } else {
+        requested_model.trim()
+    };
     if requested.is_empty() || requested == "未知模型" {
         return None;
     }
@@ -3603,11 +3692,20 @@ fn mapped_model_for_provider(provider: &ProviderConfig, requested_model: &str) -
         .find(|mapping| mapping.source.trim() == requested)
         .map(|mapping| mapping.target.trim().to_string())
         .filter(|target| !target.is_empty() && target != requested)
+        .or_else(|| (requested != requested_model.trim()).then(|| requested.to_string()))
 }
 
 fn claude_provider_accepts_model(provider: &ClaudeProviderConfig, requested_model: &str) -> bool {
-    let requested = requested_model.trim();
-    if requested.is_empty() || requested == "未知模型" || provider.allowed_models.is_empty() {
+    let Some(requested) = fusion_requested_model(
+        &provider.id,
+        provider.fusion_enabled,
+        requested_model.trim(),
+    ) else {
+        return false;
+    };
+    if !provider.fusion_enabled
+        && (requested.is_empty() || requested == "未知模型" || provider.allowed_models.is_empty())
+    {
         return true;
     }
     provider
@@ -3620,7 +3718,15 @@ fn mapped_model_for_claude_provider(
     provider: &ClaudeProviderConfig,
     requested_model: &str,
 ) -> Option<String> {
-    let requested = requested_model.trim();
+    let requested = if requested_model.trim().starts_with(FUSION_PREFIX) {
+        fusion_requested_model(
+            &provider.id,
+            provider.fusion_enabled,
+            requested_model.trim(),
+        )?
+    } else {
+        requested_model.trim()
+    };
     if requested.is_empty() || requested == "未知模型" {
         return None;
     }
@@ -3630,6 +3736,7 @@ fn mapped_model_for_claude_provider(
         .find(|mapping| mapping.source.trim() == requested)
         .map(|mapping| mapping.target.trim().to_string())
         .filter(|target| !target.is_empty() && target != requested)
+        .or_else(|| (requested != requested_model.trim()).then(|| requested.to_string()))
 }
 
 fn redact_model_provider_tokens(value: &mut Value) {
@@ -4452,6 +4559,7 @@ fn claude_model_base_id(model: &str) -> String {
 }
 
 fn claude_model_supports_long_context(model: &str) -> bool {
+    let model = fusion_model_parts(model).map(|(_, base)| base).unwrap_or(model);
     let base = claude_model_base_id(model);
     CLAUDE_LONG_CONTEXT_MODELS
         .iter()
@@ -6025,11 +6133,12 @@ fn codex_catalog_models_for_state(state: &ManagerState) -> Vec<String> {
 
 fn ensure_codex_model_catalog_applied(state: &ManagerState) -> Result<bool, String> {
     let path = codex_router_model_catalog_path()?;
-    let desired = codex_models_catalog_value(
+    let mut desired = codex_models_catalog_value(
         codex_catalog_models_for_state(state),
         state.router.gpt56_long_context_enabled,
         state.router.gpt56_long_context_window,
     )?;
+    decorate_fusion_catalog(&mut desired, state.providers.iter().map(|p| (p.id.as_str(), p.name.as_str())));
     if path.exists() {
         let current = fs::read_to_string(&path)
             .ok()
@@ -6443,6 +6552,11 @@ fn configured_route_models(candidates: &[UpstreamCandidate]) -> Vec<String> {
             if model.is_empty() || model.eq_ignore_ascii_case("gpt-image-2") {
                 continue;
             }
+            let model = if candidate.provider.fusion_enabled {
+                fusion_model_id(&candidate.provider.id, model)
+            } else {
+                model.to_string()
+            };
             let key = model.to_lowercase();
             if !seen.insert(key) {
                 continue;
@@ -6479,6 +6593,7 @@ fn openai_models_value(models: Vec<String>) -> Value {
     json!({ "object": "list", "data": data })
 }
 
+#[cfg(test)]
 fn codex_model_catalog_templates_from_value(value: &Value) -> Vec<Value> {
     value
         .get("models")
@@ -6559,6 +6674,7 @@ fn codex_cli_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+#[cfg(test)]
 fn parse_codex_cli_version_output(output: &[u8]) -> Option<Version> {
     std::str::from_utf8(output)
         .ok()?
@@ -6567,17 +6683,9 @@ fn parse_codex_cli_version_output(output: &[u8]) -> Option<Version> {
         .find_map(|value| Version::parse(value.trim_start_matches('v')).ok())
 }
 
-fn codex_cli_version(candidate: &Path) -> Option<Version> {
-    let output = background_command(candidate)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_codex_cli_version_output(&output.stdout)
-}
 
+
+#[cfg(test)]
 fn catalog_has_required_models(templates: &[Value]) -> bool {
     ["gpt-6-astra", "gpt-5.6-sol"].iter().all(|model| {
         templates.iter().any(|entry| {
@@ -6589,6 +6697,7 @@ fn catalog_has_required_models(templates: &[Value]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn supplement_codex_model_catalog_templates(mut templates: Vec<Value>) -> Vec<Value> {
     // The live official catalog can include released models missing from CLI bundles.
     // Keep a native CLI entry when available, otherwise supply the captured profile.
@@ -6611,6 +6720,7 @@ fn supplement_codex_model_catalog_templates(mut templates: Vec<Value>) -> Vec<Va
     templates
 }
 
+#[cfg(test)]
 fn embedded_codex_model_catalog_templates() -> Vec<Value> {
     let value = serde_json::from_str::<Value>(EMBEDDED_CODEX_MODEL_CATALOG_JSON)
         .expect("embedded Codex model catalog must be valid JSON");
@@ -6622,52 +6732,25 @@ fn embedded_codex_model_catalog_templates() -> Vec<Value> {
     supplement_codex_model_catalog_templates(templates)
 }
 
+#[cfg(test)]
 fn external_codex_catalog_is_eligible(version: &Version, templates: &[Value]) -> bool {
     let embedded_version = Version::parse(EMBEDDED_CODEX_MODEL_CATALOG_VERSION)
         .expect("embedded Codex model catalog version must be valid semver");
     version >= &embedded_version && catalog_has_required_models(templates)
 }
 
-fn load_bundled_codex_model_catalog_templates() -> Vec<Value> {
-    let embedded = embedded_codex_model_catalog_templates();
-    for candidate in codex_cli_candidates() {
-        let Some(version) = codex_cli_version(&candidate) else {
-            continue;
-        };
-        if version
-            < Version::parse(EMBEDDED_CODEX_MODEL_CATALOG_VERSION)
-                .expect("embedded Codex model catalog version must be valid semver")
-        {
-            return embedded;
-        }
-        let Ok(output) = background_command(&candidate)
-            .args(["debug", "models", "--bundled"])
-            .output()
-        else {
-            return embedded;
-        };
-        if !output.status.success() {
-            return embedded;
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
-            return embedded;
-        };
-        let templates = codex_model_catalog_templates_from_value(&value);
-        if external_codex_catalog_is_eligible(&version, &templates) {
-            return supplement_codex_model_catalog_templates(templates);
-        }
-        return embedded;
-    }
-    embedded
+
+
+fn capability_catalog_path() -> Result<PathBuf, String> {
+    Ok(manager_dir()?.join("capability-catalog.json"))
 }
 
 fn load_codex_model_catalog_templates() -> Vec<Value> {
-    static TEMPLATES: OnceLock<Vec<Value>> = OnceLock::new();
-    TEMPLATES
-        .get_or_init(load_bundled_codex_model_catalog_templates)
-        .clone()
+    capability_catalog_path().and_then(|path| model_catalog::load(&path))
+        .unwrap_or_else(|_| model_catalog::bundled()).rows()
 }
 
+#[cfg(test)]
 fn deepseek_v4_catalog_entry(model: &str, templates: &[Value]) -> Result<Value, String> {
     let normalized_model = model.trim().to_ascii_lowercase();
     let (slug, display_name, description, priority) = if matches!(
@@ -6777,6 +6860,7 @@ fn deepseek_v4_catalog_entry(model: &str, templates: &[Value]) -> Result<Value, 
     }))
 }
 
+#[cfg(test)]
 fn codex_model_catalog_entry(model: &str, templates: &[Value]) -> Result<Option<Value>, String> {
     if [
         "deepseek-flash",
@@ -6821,6 +6905,58 @@ fn codex_models_catalog_value_with_templates(
     )
 }
 
+// Unknown fusion models still need a complete catalog row. Preserve the parser
+// schema, but do not advertise the template model's specialized capabilities.
+#[cfg(test)]
+fn generic_fusion_catalog_entry(model: &str, templates: &[Value]) -> Result<Value, String> {
+    let mut entry = templates
+        .first()
+        .cloned()
+        .ok_or("缺少 Codex 模型目录模板")?;
+    let object = entry.as_object_mut().ok_or("Codex 模型目录模板无效")?;
+    for key in [
+        "model_messages",
+        "tools",
+        "apply_patch_tool_type",
+        "web_search_tool_type",
+        "multi_agent_version",
+    ] {
+        object.remove(key);
+    }
+    for (key, value) in [
+        ("slug", json!(model)),
+        ("display_name", json!(model)),
+        ("description", json!("自定义模型（通用能力配置）")),
+        (
+            "base_instructions",
+            json!(
+                "You are a coding assistant. Help the user complete tasks in the shared workspace."
+            ),
+        ),
+        ("context_window", json!(128_000)),
+        ("max_context_window", json!(128_000)),
+        ("auto_compact_token_limit", json!(115_200)),
+        ("input_modalities", json!(["text"])),
+        ("shell_type", json!("shell_command")),
+        ("supports_parallel_tool_calls", json!(false)),
+        ("supports_reasoning_summaries", json!(false)),
+        ("default_reasoning_level", json!("none")),
+        (
+            "supported_reasoning_levels",
+            json!([{ "effort": "none", "description": "Default" }]),
+        ),
+        ("service_tiers", json!([])),
+        ("additional_speed_tiers", json!([])),
+        ("upgrade", Value::Null),
+        ("availability_nux", Value::Null),
+        ("use_responses_lite", json!(false)),
+    ] {
+        object.insert(key.to_string(), value);
+    }
+    Ok(entry)
+}
+
+#[cfg(test)]
 fn codex_models_catalog_value_with_templates_and_context(
     models: Vec<String>,
     templates: &[Value],
@@ -6829,16 +6965,47 @@ fn codex_models_catalog_value_with_templates_and_context(
 ) -> Result<Value, String> {
     let mut catalog_models = Vec::new();
     for model in models {
-        if let Some(mut entry) = codex_model_catalog_entry(&model, templates)? {
+        let base_model = fusion_model_parts(&model)
+            .map(|(_, base)| base)
+            .unwrap_or(&model);
+        let entry = codex_model_catalog_entry(base_model, templates)?;
+        let entry = if entry.is_none() && fusion_model_parts(&model).is_some() {
+            Some(generic_fusion_catalog_entry(base_model, templates)?)
+        } else {
+            entry
+        };
+        if let Some(mut entry) = entry {
             apply_codex_long_context(
                 &mut entry,
                 gpt56_long_context_enabled,
                 gpt56_long_context_window,
             );
+            if fusion_model_parts(&model).is_some() {
+                entry["slug"] = json!(model);
+                entry["visibility"] = json!("list");
+                entry["supported_in_api"] = json!(true);
+            }
             catalog_models.push(entry);
         }
     }
     Ok(json!({ "models": catalog_models }))
+}
+
+fn supports_gpt_long_context(model: &str) -> bool {
+    let model = fusion_model_parts(model).map(|(_, base)| base).unwrap_or(model);
+    let model = model.to_ascii_lowercase();
+    let Some(rest) = model.strip_prefix("gpt-") else { return false };
+    let version = rest.split('-').next().unwrap_or_default();
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.iter().any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit())) {
+        return false;
+    }
+    let Ok(major) = parts[0].parse::<u64>() else { return false };
+    let minor = match parts.get(1) {
+        Some(part) => match part.parse::<u64>() { Ok(value) => value, Err(_) => return false },
+        None => 0,
+    };
+    (major, minor) >= (5, 6)
 }
 
 fn apply_codex_long_context(entry: &mut Value, enabled: bool, context_window: u64) {
@@ -6851,17 +7018,8 @@ fn apply_codex_long_context(entry: &mut Value, enabled: bool, context_window: u6
     let supports_custom_context = object
         .get("slug")
         .and_then(Value::as_str)
-        .is_some_and(|slug| {
-            matches!(
-                slug.to_ascii_lowercase().as_str(),
-                "gpt-6-astra"
-                    | "gpt-6-sol"
-                    | "gpt-6-luna"
-                    | "gpt-5.6-sol"
-                    | "gpt-5.6-terra"
-                    | "gpt-5.6-luna"
-            )
-        });
+        .is_some_and(supports_gpt_long_context);
+
     if !supports_custom_context {
         return;
     }
@@ -6878,13 +7036,34 @@ fn codex_models_catalog_value(
     gpt56_long_context_enabled: bool,
     gpt56_long_context_window: u64,
 ) -> Result<Value, String> {
-    let templates = load_codex_model_catalog_templates();
-    codex_models_catalog_value_with_templates_and_context(
-        models,
-        &templates,
-        gpt56_long_context_enabled,
-        gpt56_long_context_window,
-    )
+    let catalog = model_catalog::load(&capability_catalog_path()?)?;
+    Ok(merge_capability_catalog_with_context(&catalog, models, gpt56_long_context_enabled, gpt56_long_context_window))
+}
+
+fn merge_capability_catalog_with_context(
+    catalog: &model_catalog::Catalog,
+    models: Vec<String>,
+    enabled: bool,
+    window: u64,
+) -> Value {
+    let mut merged = merge_capability_catalog(catalog, models);
+    for entry in merged["models"].as_array_mut().into_iter().flatten() {
+        apply_codex_long_context(entry, enabled, window);
+    }
+    merged
+}
+
+fn merge_capability_catalog(catalog: &model_catalog::Catalog, models: Vec<String>) -> Value {
+    let entries: Vec<Value> = models.into_iter().enumerate().map(|(index, model)| {
+        let base = fusion_model_parts(&model).map(|(_, base)| base).unwrap_or(&model);
+        let mut entry = catalog.select(base);
+        entry["slug"] = json!(model);
+        entry["priority"] = json!(index + 1);
+        entry["visibility"] = json!("list");
+        entry["supported_in_api"] = json!(true);
+        entry
+    }).collect();
+    json!({ "models": entries })
 }
 
 fn json_response(value: Value) -> Response {
@@ -6900,6 +7079,7 @@ fn models_response(models: Vec<String>) -> Response {
 }
 
 fn codex_models_response(
+    candidates: &[UpstreamCandidate],
     models: Vec<String>,
     gpt56_long_context_enabled: bool,
     gpt56_long_context_window: u64,
@@ -6909,7 +7089,15 @@ fn codex_models_response(
         gpt56_long_context_enabled,
         gpt56_long_context_window,
     ) {
-        Ok(value) => json_response(value),
+        Ok(mut value) => {
+            decorate_fusion_catalog(
+                &mut value,
+                candidates
+                    .iter()
+                    .map(|c| (c.provider.id.as_str(), c.provider.name.as_str())),
+            );
+            json_response(value)
+        }
         Err(err) => proxy_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 }
@@ -7488,6 +7676,34 @@ fn decoded_proxy_request_body(
         .map_err(|err| format!("无法读取 zstd 请求体: {err}"))?;
 
     Ok(Bytes::from(decoded))
+}
+
+struct ForwardedRequestBody {
+    body: Bytes,
+    encoding: Option<&'static str>,
+}
+
+fn forwarded_request_body(
+    send_uncompressed: bool,
+    headers: &HeaderMap,
+    original: &[u8],
+    decoded: &[u8],
+    prepared: &[u8],
+) -> Result<ForwardedRequestBody, String> {
+    let was_zstd = original.starts_with(&[0x28, 0xB5, 0x2F, 0xFD])
+        || headers.get(CONTENT_ENCODING).and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').any(|e| e.trim().eq_ignore_ascii_case("zstd")));
+    if send_uncompressed || !was_zstd {
+        return Ok(ForwardedRequestBody { body: Bytes::copy_from_slice(prepared), encoding: None });
+    }
+    // Unchanged requests retain the exact original compressed frame.
+    let body = if prepared == decoded {
+        Bytes::copy_from_slice(original)
+    } else {
+        Bytes::from(zstd::stream::encode_all(Cursor::new(prepared), 3)
+            .map_err(|error| format!("重新压缩 zstd 请求失败: {error}"))?)
+    };
+    Ok(ForwardedRequestBody { body, encoding: Some("zstd") })
 }
 
 async fn read_proxy_request_body(body: Body) -> Result<Bytes, String> {
@@ -9259,11 +9475,8 @@ fn ingest_sse_chunk(buffer: &mut String, usage: &mut TokenUsage, bytes: &[u8]) -
         }
     }
 
-    if buffer.len() > 128 * 1024 {
-        let keep_from = buffer.len().saturating_sub(64 * 1024);
-        let tail = buffer[keep_from..].to_string();
-        *buffer = tail;
-    }
+    // Keep the full unfinished event. Responses completion events can echo large
+    // instructions/tool schemas; dropping their prefix loses both usage and terminal state.
     metadata
 }
 
@@ -10299,7 +10512,14 @@ async fn proxy_claude_models(proxy_state: Arc<ProxyState>, headers: HeaderMap) -
                 }
             };
 
-        for model in claude_route_model_values(&candidate.provider, &upstream_models) {
+        for mut model in claude_route_model_values(&candidate.provider, &upstream_models) {
+            if candidate.provider.fusion_enabled {
+                if let Some(id) = model_id_from_value(&model) {
+                    let display = model["display_name"].as_str().unwrap_or(&id).to_string();
+                    model["id"] = json!(claude_fusion_model_id(&candidate.provider.id, &id));
+                    model["display_name"] = json!(format!("{display}（{}）", candidate.provider.name));
+                }
+            }
             push_claude_model_value(&mut models, &mut seen, model);
         }
     }
@@ -10331,6 +10551,8 @@ async fn proxy_claude_request(
     if local_proxy_token(&headers) != Some(router.local_token.trim()) {
         return proxy_error(StatusCode::UNAUTHORIZED, "本地路由 Token 无效");
     }
+    // Always inspect decoded JSON; the forwarding preference only controls wire encoding.
+    let decode_request = true;
     let upstream_client = match proxy_state.upstream() {
         Ok(upstream) => upstream,
         Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
@@ -10345,7 +10567,7 @@ async fn proxy_claude_request(
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
     let body_bytes = match decoded_proxy_request_body(
-        router.zstd_decompression_enabled,
+        decode_request,
         &headers,
         &inbound_body,
     ) {
@@ -10392,24 +10614,28 @@ async fn proxy_claude_request(
             .or_else(|| long_context_suffix_stripped.then(|| model.clone()));
         let prepared_body =
             body_with_provider_overrides(&body_bytes, upstream_model.as_deref(), None);
+        let forwarded = match forwarded_request_body(router.zstd_decompression_enabled, &headers, &inbound_body, &body_bytes, &prepared_body) {
+            Ok(body) => body,
+            Err(error) => return proxy_error(StatusCode::BAD_GATEWAY, error),
+        };
         let request_body = request_body_info(
             &headers,
             &inbound_body,
             &body_bytes,
-            &prepared_body,
-            router.zstd_decompression_enabled,
+            &forwarded.body,
+            decode_request,
         );
         let upstream_path = claude_upstream_path(&path);
         let upstream_url = join_url(&candidate.base_url, &upstream_path) + &query;
         let mut request = upstream_client
             .client
             .request(reqwest_method.clone(), upstream_url)
-            .body(prepared_body);
+            .body(forwarded.body);
 
         for (name, value) in headers.iter() {
             if name == AUTHORIZATION
                 || name == HOST
-                || (router.zstd_decompression_enabled && name == CONTENT_ENCODING)
+                || name == CONTENT_ENCODING
                 || name == CONTENT_LENGTH
                 || name.as_str().eq_ignore_ascii_case("x-api-key")
                 || is_hop_by_hop_header(name)
@@ -10417,6 +10643,9 @@ async fn proxy_claude_request(
                 continue;
             }
             request = request.header(name.as_str(), value.as_bytes());
+        }
+        if let Some(encoding) = forwarded.encoding {
+            request = request.header(CONTENT_ENCODING, encoding);
         }
         request = request.header("x-api-key", candidate.token.clone());
 
@@ -10719,7 +10948,7 @@ async fn proxy_request(
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
     let streams = decoded_proxy_request_body(
-        state.router.zstd_decompression_enabled,
+        true,
         &headers,
         &body_bytes,
     )
@@ -10798,6 +11027,8 @@ async fn proxy_request_now(
     if bearer_token(&headers) != Some(router.local_token.trim()) {
         return proxy_error(StatusCode::UNAUTHORIZED, "本地路由 Token 无效");
     }
+    // Always inspect decoded JSON; the forwarding preference only controls wire encoding.
+    let decode_request = true;
     let upstream_client = match proxy_state.upstream() {
         Ok(upstream) => upstream,
         Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
@@ -10807,6 +11038,7 @@ async fn proxy_request_now(
         if !models.is_empty() {
             return if codex_model_catalog_requested(uri.query()) {
                 codex_models_response(
+                    &candidates,
                     models,
                     router.gpt56_long_context_enabled,
                     router.gpt56_long_context_window,
@@ -10826,7 +11058,7 @@ async fn proxy_request_now(
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
     let body_bytes = match decoded_proxy_request_body(
-        router.zstd_decompression_enabled,
+        decode_request,
         &headers,
         &inbound_body,
     ) {
@@ -10912,12 +11144,16 @@ async fn proxy_request_now(
                 request_has_compaction_trigger(&prepared.body);
         }
         let upstream_url = join_url(&candidate.base_url, &prepared.path) + &prepared.query;
+        let forwarded = match forwarded_request_body(router.zstd_decompression_enabled, &headers, &inbound_body, &body_bytes, &prepared.body) {
+            Ok(body) => body,
+            Err(error) => return proxy_error(StatusCode::BAD_GATEWAY, error),
+        };
         let request_body = request_body_info(
             &headers,
             &inbound_body,
             &body_bytes,
-            &prepared.body,
-            router.zstd_decompression_enabled,
+            &forwarded.body,
+            decode_request,
         );
         let mut debug_capture = build_pending_debug_capture(
             router.debug_mode && path.trim_matches('/') == "responses",
@@ -10930,18 +11166,18 @@ async fn proxy_request_now(
             &body_bytes,
             upstream_url.clone(),
             &prepared.body,
-            !router.zstd_decompression_enabled,
+            !decode_request,
             request_body.clone(),
         );
         let mut request = upstream_client
             .client
             .request(reqwest_method.clone(), &upstream_url)
-            .body(prepared.body.clone());
+            .body(forwarded.body);
 
         for (name, value) in headers.iter() {
             if name == AUTHORIZATION
                 || name == HOST
-                || (router.zstd_decompression_enabled && name == CONTENT_ENCODING)
+                || name == CONTENT_ENCODING
                 || name == CONTENT_LENGTH
                 || name.as_str().eq_ignore_ascii_case("x-request-id")
                 || is_hop_by_hop_header(name)
@@ -10949,6 +11185,9 @@ async fn proxy_request_now(
                 continue;
             }
             request = request.header(name.as_str(), value.as_bytes());
+        }
+        if let Some(encoding) = forwarded.encoding {
+            request = request.header(CONTENT_ENCODING, encoding);
         }
         request = request
             .header(AUTHORIZATION, format!("Bearer {}", candidate.token))
@@ -11894,30 +12133,78 @@ fn normalize_route_filter_text(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty() && value != "all")
 }
 
-fn read_route_logs() -> Result<Vec<RouteRequestLog>, String> {
-    let path = route_logs_path()?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
+#[derive(Default)]
+struct RouteLogCache {
+    path: PathBuf,
+    identity: Option<(u64, u64, Option<SystemTime>)>,
+    modified: Option<SystemTime>,
+    observed_len: u64,
+    offset: u64,
+    logs: Vec<RouteRequestLog>,
+}
 
-    let file = fs::File::open(&path)
-        .map_err(|err| format!("无法读取路由日志 {}: {err}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut logs = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(|err| format!("无法读取路由日志行: {err}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(log) = serde_json::from_str::<RouteRequestLog>(&line) {
-            if !is_usage_route_log(&log) {
-                continue;
+impl RouteLogCache {
+    fn refresh(&mut self, path: &Path) -> Result<(), String> {
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                *self = Self::default();
+                return Ok(());
             }
-            logs.push(log);
+            Err(error) => return Err(format!("无法读取路由日志: {error}")),
+        };
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino(), metadata.created().ok())
+        };
+        #[cfg(not(unix))]
+        let identity = (0, 0, metadata.created().ok());
+        let modified = metadata.modified().ok();
+        let len = metadata.len();
+        if self.path != path || self.identity != Some(identity)
+            || len < self.observed_len
+            || (len == self.observed_len && modified != self.modified)
+        {
+            *self = Self { path: path.to_path_buf(), ..Self::default() };
         }
+        if self.identity == Some(identity) && self.observed_len == len && self.modified == modified {
+            return Ok(());
+        }
+        file.seek(SeekFrom::Start(self.offset)).map_err(|e| e.to_string())?;
+        // Read a stable-length snapshot, leaving a concurrent writer's partial line for next time.
+        let mut reader = BufReader::new(file.take(len - self.offset));
+        let mut line = Vec::new();
+        let mut next_offset = self.offset;
+        let mut added = Vec::new();
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line).map_err(|e| e.to_string())?;
+            if n == 0 || line.last() != Some(&b'\n') { break; }
+            next_offset += n as u64;
+            if let Ok(log) = serde_json::from_slice::<RouteRequestLog>(&line) {
+                if is_usage_route_log(&log) { added.push(log); }
+            }
+        }
+        if !added.is_empty() {
+            self.logs.extend(added);
+            self.logs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+        }
+        self.offset = next_offset;
+        self.identity = Some(identity);
+        self.modified = modified;
+        self.observed_len = len;
+        Ok(())
     }
-    logs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
-    Ok(logs)
+}
+
+fn with_route_logs<T>(build: impl FnOnce(&[RouteRequestLog]) -> T) -> Result<T, String> {
+    static CACHE: OnceLock<Mutex<RouteLogCache>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(|| Mutex::new(RouteLogCache::default()))
+        .lock().map_err(|_| "日志缓存不可用")?;
+    cache.refresh(&route_logs_path()?)?;
+    Ok(build(&cache.logs))
 }
 
 fn append_route_log(log: &RouteRequestLog) -> Result<(), String> {
@@ -12125,6 +12412,10 @@ fn record_provider_failure(
     }
 }
 
+fn route_model_label(model: &str) -> &str {
+    fusion_model_parts(model).map(|(_, base)| base).unwrap_or(model)
+}
+
 fn route_log_matches_filter(log: &RouteRequestLog, filter: &RouteLogFilter) -> bool {
     if let Some(query) = normalize_route_filter_text(filter.query.clone()) {
         let query = query.to_lowercase();
@@ -12153,7 +12444,7 @@ fn route_log_matches_filter(log: &RouteRequestLog, filter: &RouteLogFilter) -> b
         }
     }
     if let Some(model) = normalize_route_filter_text(filter.model.clone()) {
-        if !log.model.eq_ignore_ascii_case(&model) {
+        if !route_model_label(&log.model).eq_ignore_ascii_case(route_model_label(&model)) {
             return false;
         }
     }
@@ -12194,7 +12485,7 @@ fn is_usage_route_log(log: &RouteRequestLog) -> bool {
     )
 }
 
-fn route_available_providers(logs: &[RouteRequestLog]) -> Vec<RouteLogFilterOption> {
+fn route_available_providers<'a>(logs: impl IntoIterator<Item = &'a RouteRequestLog>) -> Vec<RouteLogFilterOption> {
     let mut map = BTreeMap::<String, RouteLogFilterOption>::new();
     for log in logs {
         let entry = map
@@ -12217,10 +12508,10 @@ fn route_available_providers(logs: &[RouteRequestLog]) -> Vec<RouteLogFilterOpti
     providers
 }
 
-fn route_available_models(logs: &[RouteRequestLog]) -> Vec<String> {
+fn route_available_models<'a>(logs: impl IntoIterator<Item = &'a RouteRequestLog>) -> Vec<String> {
     let mut models = logs
-        .iter()
-        .map(|log| log.model.clone())
+        .into_iter()
+        .map(|log| route_model_label(&log.model).to_string())
         .filter(|model| !model.trim().is_empty() && model != "未知模型")
         .collect::<Vec<_>>();
     models.sort();
@@ -12228,8 +12519,8 @@ fn route_available_models(logs: &[RouteRequestLog]) -> Vec<String> {
     models
 }
 
-fn route_available_days(logs: &[RouteRequestLog]) -> Vec<String> {
-    let mut days = logs.iter().map(|log| log.day.clone()).collect::<Vec<_>>();
+fn route_available_days<'a>(logs: impl IntoIterator<Item = &'a RouteRequestLog>) -> Vec<String> {
+    let mut days = logs.into_iter().map(|log| log.day.clone()).collect::<Vec<_>>();
     days.sort();
     days.dedup();
     days
@@ -12282,14 +12573,14 @@ fn route_bucket_label(log: &RouteRequestLog, filter: &RouteLogFilter) -> (String
 }
 
 fn build_route_logs_response(
-    logs: Vec<RouteRequestLog>,
+    logs: impl AsRef<[RouteRequestLog]>,
     filter: RouteLogFilter,
 ) -> RouteLogsResponse {
+    let logs = logs.as_ref();
     let filtered = logs
         .iter()
         .filter(|log| is_usage_route_log(log))
         .filter(|log| route_log_matches_filter(log, &filter))
-        .cloned()
         .collect::<Vec<_>>();
     let page_size = normalized_page_size(filter.page_size);
     let total_pages = filtered.len().div_ceil(page_size).max(1);
@@ -12299,7 +12590,7 @@ fn build_route_logs_response(
         .iter()
         .skip(start)
         .take(page_size)
-        .cloned()
+        .map(|log| (*log).clone())
         .collect::<Vec<_>>();
 
     RouteLogsResponse {
@@ -12308,16 +12599,17 @@ fn build_route_logs_response(
         page,
         page_size,
         total_pages,
-        available_providers: route_available_providers(&filtered),
-        available_models: route_available_models(&filtered),
-        available_days: route_available_days(&filtered),
+        available_providers: route_available_providers(filtered.iter().copied()),
+        available_models: route_available_models(filtered.iter().copied()),
+        available_days: route_available_days(filtered.iter().copied()),
     }
 }
 
 fn build_route_usage_stats(
-    logs: Vec<RouteRequestLog>,
+    logs: impl AsRef<[RouteRequestLog]>,
     filter: RouteLogFilter,
 ) -> Result<RouteUsageStats, String> {
+    let logs = logs.as_ref();
     let filtered = logs
         .iter()
         .filter(|log| route_log_matches_filter(log, &filter))
@@ -12448,9 +12740,9 @@ fn build_route_usage_stats(
         page,
         page_size,
         total_pages,
-        available_providers: route_available_providers(&logs),
-        available_models: route_available_models(&logs),
-        available_days: route_available_days(&logs),
+        available_providers: route_available_providers(logs),
+        available_models: route_available_models(logs),
+        available_days: route_available_days(logs),
     })
 }
 
@@ -12660,6 +12952,9 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
         marker_present,
         router: state.router.clone(),
         codex_models,
+        capability_version: model_catalog::load(&capability_catalog_path()?)?.version,
+        capability_updated_at: fs::metadata(capability_catalog_path()?).ok().and_then(|m| m.modified().ok())
+            .map(|time| DateTime::<Local>::from(time).format("%Y-%m-%d %H:%M:%S").to_string()),
         clients: state.clients.clone(),
         multi_agent_enabled,
         router_status: router_status(runtime, &state.router),
@@ -12694,6 +12989,29 @@ fn set_autostart_enabled(enabled: bool, app: tauri::AppHandle) -> Result<bool, S
     autostart
         .is_enabled()
         .map_err(|err| format!("确认开机自启状态失败: {err}"))
+}
+
+#[tauri::command]
+async fn update_model_capabilities(router_runtime: tauri::State<'_, RouterRuntime>) -> Result<AppState, String> {
+    let bytes = model_catalog::download(model_catalog::URL).await?;
+    // No await while replacing the cache and regenerating client files.
+    static UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = UPDATE_LOCK.lock().map_err(|_| "模型能力更新锁不可用")?;
+    let path = capability_catalog_path()?;
+    let previous = fs::read(&path).ok();
+    let mut state = load_state_file()?;
+    model_catalog::save(&path, &bytes)?;
+    if let Err(error) = ensure_client_configs_applied(&mut state) {
+        let rollback = match previous {
+            Some(previous) => model_catalog::save(&path, &previous),
+            None => fs::remove_file(&path).map_err(|e| e.to_string()),
+        };
+        rollback.map_err(|e| format!("{error}；恢复能力缓存失败: {e}"))?;
+        ensure_client_configs_applied(&mut state).map_err(|e| format!("{error}；恢复客户端目录失败: {e}"))?;
+        return Err(error);
+    }
+    save_state(&state)?;
+    build_app_state(state, &router_runtime)
 }
 
 #[tauri::command]
@@ -12854,6 +13172,9 @@ fn save_provider(
     if let Some(connection_test_model) = payload.connection_test_model {
         provider.connection_test_model = connection_test_model.trim().to_string();
     }
+    if let Some(fusion_enabled) = payload.fusion_enabled {
+        provider.fusion_enabled = fusion_enabled;
+    }
     if let Some(allowed_models) = payload.allowed_models {
         provider.allowed_models = normalize_model_names(allowed_models);
     }
@@ -12885,6 +13206,13 @@ fn save_provider(
                 .then(|| provider.balance_status.clone())
                 .flatten()
         });
+    }
+    if provider.fusion_enabled && provider.allowed_models.is_empty() {
+        return Err("融合模式请先在模型配置中选择要发布的模型".to_string());
+    }
+    let choices = codex_model_choices_for_state(&state);
+    if !choices.iter().any(|model| model == &state.router.codex_model) {
+        state.router.codex_model = choices.first().cloned().unwrap_or_default();
     }
     ensure_client_configs_applied(&mut state)?;
     save_state(&state)?;
@@ -12972,6 +13300,9 @@ fn save_claude_provider(
     if let Some(connection_test_model) = payload.connection_test_model {
         provider.connection_test_model = connection_test_model.trim().to_string();
     }
+    if let Some(fusion_enabled) = payload.fusion_enabled {
+        provider.fusion_enabled = fusion_enabled;
+    }
     if let Some(allowed_models) = payload.allowed_models {
         provider.allowed_models = normalize_model_names(allowed_models);
     }
@@ -12979,6 +13310,9 @@ fn save_claude_provider(
         provider.model_mappings = normalize_model_mappings(model_mappings);
     }
 
+    if provider.fusion_enabled && provider.allowed_models.is_empty() {
+        return Err("融合模式请先在模型配置中选择要发布的模型".to_string());
+    }
     save_state(&state)?;
     build_app_state(state, &router_runtime)
 }
@@ -13126,6 +13460,9 @@ fn preview_provider(
     }
 
     provider.config = toml_text_to_json(&payload.config_toml)?;
+    if let Some(fusion_enabled) = payload.fusion_enabled {
+        provider.fusion_enabled = fusion_enabled;
+    }
     if let Some(allowed_models) = payload.allowed_models {
         provider.allowed_models = normalize_model_names(allowed_models);
     }
@@ -13158,25 +13495,7 @@ fn add_provider(
         return Err("供应商名称不能为空".to_string());
     }
 
-    let id_base = trimmed
-        .to_lowercase()
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    let id_base = if id_base.is_empty() {
-        "provider".to_string()
-    } else {
-        id_base
-    };
-
-    let mut id = id_base.clone();
-    let mut index = 2;
-    while state.providers.iter().any(|provider| provider.id == id) {
-        id = format!("{id_base}-{index}");
-        index += 1;
-    }
+    let id = new_provider_id()?;
 
     state.active_provider_id = id.clone();
     state.providers.push(ProviderConfig {
@@ -13184,6 +13503,7 @@ fn add_provider(
         name: trimmed.to_string(),
         status: ProviderStatus::Enabled,
         enabled: true,
+        fusion_enabled: false,
         consecutive_failure_count: 0,
         auto_disabled_day: None,
         auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -13232,29 +13552,7 @@ fn add_claude_provider(
         return Err("Claude 供应商名称不能为空".to_string());
     }
 
-    let id_base = trimmed
-        .to_lowercase()
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    let id_base = if id_base.is_empty() {
-        "claude-provider".to_string()
-    } else {
-        id_base
-    };
-
-    let mut id = id_base.clone();
-    let mut index = 2;
-    while state
-        .claude_providers
-        .iter()
-        .any(|provider| provider.id == id)
-    {
-        id = format!("{id_base}-{index}");
-        index += 1;
-    }
+    let id = new_provider_id()?;
 
     state.active_claude_provider_id = id.clone();
     state.claude_providers.push(ClaudeProviderConfig {
@@ -13262,6 +13560,7 @@ fn add_claude_provider(
         name: trimmed.to_string(),
         status: ProviderStatus::Enabled,
         enabled: true,
+        fusion_enabled: false,
         consecutive_failure_count: 0,
         auto_disabled_day: None,
         auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -13669,11 +13968,12 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
 }
 
 #[tauri::command]
-fn load_route_logs(payload: Option<LoadRouteLogsPayload>) -> Result<RouteLogsResponse, String> {
+async fn load_route_logs(payload: Option<LoadRouteLogsPayload>) -> Result<RouteLogsResponse, String> {
     let filter = payload
         .and_then(|payload| payload.filter)
         .unwrap_or_default();
-    Ok(build_route_logs_response(read_route_logs()?, filter))
+    tauri::async_runtime::spawn_blocking(move || with_route_logs(|logs| build_route_logs_response(logs, filter)))
+        .await.map_err(|e| format!("日志加载失败: {e}"))?
 }
 
 #[tauri::command]
@@ -13684,13 +13984,14 @@ fn load_route_debug_capture(
 }
 
 #[tauri::command]
-fn load_route_usage_stats(
+async fn load_route_usage_stats(
     payload: Option<LoadRouteLogsPayload>,
 ) -> Result<RouteUsageStats, String> {
     let filter = payload
         .and_then(|payload| payload.filter)
         .unwrap_or_default();
-    build_route_usage_stats(read_route_logs()?, filter)
+    tauri::async_runtime::spawn_blocking(move || with_route_logs(|logs| build_route_usage_stats(logs, filter)))
+        .await.map_err(|e| format!("统计加载失败: {e}"))??
 }
 
 #[tauri::command]
@@ -14016,6 +14317,7 @@ pub fn run() {
             get_autostart_enabled,
             set_autostart_enabled,
             check_for_update,
+            update_model_capabilities,
             install_update,
             select_provider,
             get_provider,
@@ -14070,6 +14372,7 @@ mod tests {
             name: id.to_string(),
             status,
             enabled,
+            fusion_enabled: false,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -14100,6 +14403,7 @@ mod tests {
             name: id.to_string(),
             status,
             enabled,
+            fusion_enabled: false,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -15482,6 +15786,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             name: "Anthropic".to_string(),
             status: ProviderStatus::Enabled,
             enabled: true,
+            fusion_enabled: false,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -15582,6 +15887,28 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert!(error.contains("Claude 上游响应不是有效 JSON"));
         assert!(error.contains("Content-Type: text/html; charset=utf-8"));
         assert!(!error.contains("proxy challenge"));
+    }
+
+    #[test]
+    fn large_split_completion_events_preserve_usage_and_terminal_state() {
+        let value = json!({"type":"response.completed", "response":{
+            "instructions":"Large prompt ".repeat(20000),
+            "usage":{"input_tokens":120000,"input_tokens_details":{"cached_tokens":110000},"output_tokens":37,"total_tokens":120037}
+        }});
+        let event = format!("event: response.completed\ndata: {}\n\n", value);
+        let mut buffer = String::new();
+        let mut usage = TokenUsage::default();
+        let mut completed = false;
+        for chunk in event.as_bytes().chunks(4096) {
+            let metadata = ingest_sse_chunk(&mut buffer, &mut usage, chunk);
+            completed |= matches!(metadata.terminal, Some(ResponsesStreamTerminal::Completed));
+        }
+        assert!(completed);
+        assert!(buffer.is_empty());
+        assert_eq!(usage.input_tokens, 120000);
+        assert_eq!(usage.cached_input_tokens, 110000);
+        assert_eq!(usage.output_tokens, 37);
+        assert_eq!(usage.total_tokens, 120037);
     }
 
     #[test]
@@ -15970,6 +16297,74 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
+    fn route_log_cache_tracks_append_partial_lines_rotation_and_deletion() {
+        let dir = std::env::temp_dir().join(format!("xxswitch-log-cache-{}", new_provider_id().unwrap()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logs.jsonl");
+        let mut first = route_log_for_stats_test("success", "a");
+        first.id = "first".into();
+        first.started_at_ms = 10;
+        let mut second = first.clone();
+        second.id = "second".into();
+        second.started_at_ms = 20;
+        let line1 = serde_json::to_string(&first).unwrap() + "\n";
+        let line2 = serde_json::to_string(&second).unwrap() + "\n";
+        fs::write(&path, &line1).unwrap();
+        let mut cache = RouteLogCache::default();
+        cache.refresh(&path).unwrap();
+        assert_eq!(cache.logs.len(), 1);
+        let offset = cache.offset;
+        cache.refresh(&path).unwrap();
+        assert_eq!(cache.offset, offset);
+        assert_eq!(cache.logs.len(), 1);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        let cut = line2.len() / 2;
+        file.write_all(&line2.as_bytes()[..cut]).unwrap();
+        cache.refresh(&path).unwrap();
+        assert_eq!(cache.logs.len(), 1);
+        assert_eq!(cache.offset, offset);
+        file.write_all(&line2.as_bytes()[cut..]).unwrap();
+        cache.refresh(&path).unwrap();
+        assert_eq!(cache.logs.len(), 2);
+        assert_eq!(cache.logs[0].id, "second");
+        drop(file);
+        fs::write(&path, &line1).unwrap();
+        cache.refresh(&path).unwrap();
+        assert_eq!(cache.logs.len(), 1);
+        assert_eq!(cache.logs[0].id, "first");
+        let replacement = dir.join("replacement");
+        fs::write(&replacement, &line2).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        cache.refresh(&path).unwrap();
+        assert_eq!(cache.logs.len(), 1);
+        assert_eq!(cache.logs[0].id, "second");
+        fs::remove_file(&path).unwrap();
+        cache.refresh(&path).unwrap();
+        assert!(cache.logs.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "read-only benchmark of local user log file"]
+    fn benchmark_local_route_log_cache() {
+        let mut cache = RouteLogCache::default();
+        let path = route_logs_path().unwrap();
+        let start = Instant::now();
+        cache.refresh(&path).unwrap();
+        let cold = start.elapsed();
+        let start = Instant::now();
+        cache.refresh(&path).unwrap();
+        let refreshed = start.elapsed();
+        let start = Instant::now();
+        let response = build_route_logs_response(&cache.logs, RouteLogFilter::default());
+        let page = start.elapsed();
+        let start = Instant::now();
+        let _stats = build_route_usage_stats(&cache.logs, RouteLogFilter::default()).unwrap();
+        eprintln!("rows={} cold={:?} warm_refresh={:?} page={:?} stats={:?} page_rows={}", cache.logs.len(), cold, refreshed, page, start.elapsed(), response.logs.len());
+    }
+
+    #[test]
     fn route_logs_ignore_non_generation_requests() {
         let response = build_route_logs_response(
             vec![
@@ -16016,6 +16411,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             name: "Provider A".to_string(),
             status: ProviderStatus::Enabled,
             enabled: true,
+            fusion_enabled: false,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16204,6 +16600,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             name: "Provider A".to_string(),
             status: ProviderStatus::Enabled,
             enabled: true,
+            fusion_enabled: false,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16341,6 +16738,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     name: "Provider A".to_string(),
                     status: ProviderStatus::Enabled,
                     enabled: true,
+                    fusion_enabled: false,
                     consecutive_failure_count: 0,
                     auto_disabled_day: None,
                     auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16373,6 +16771,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     name: "Provider B".to_string(),
                     status: ProviderStatus::Enabled,
                     enabled: true,
+                    fusion_enabled: false,
                     consecutive_failure_count: 0,
                     auto_disabled_day: None,
                     auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16446,6 +16845,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             name: "Provider B".to_string(),
             status: ProviderStatus::Enabled,
             enabled: true,
+            fusion_enabled: false,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16486,6 +16886,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             name: "Provider A".to_string(),
             status: ProviderStatus::Enabled,
             enabled: true,
+            fusion_enabled: false,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -17637,6 +18038,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             name: "Anthropic".to_string(),
             status: ProviderStatus::Enabled,
             enabled: true,
+            fusion_enabled: false,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -17803,6 +18205,307 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         }));
 
         assert_eq!(models, vec!["gpt-5.4", "gpt-5.5", "legacy-id"]);
+    }
+
+    #[test]
+    #[ignore = "requires npm run catalog:serve"]
+    fn local_capability_service_round_trip() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let bytes = runtime.block_on(model_catalog::download(model_catalog::URL)).unwrap();
+        let path = std::env::temp_dir().join(format!("xxswitch-service-test-{}", std::process::id())).join("capability-catalog.json");
+        model_catalog::save(&path, &bytes).unwrap();
+        let catalog = model_catalog::load(&path).unwrap();
+        let id = fusion_model_id("test-ds", "deepseek-v4-pro");
+        let mut merged = merge_capability_catalog(&catalog, vec!["gpt-6-astra".into(), id.clone(), "unknown-model".into()]);
+        decorate_fusion_catalog(&mut merged, [("test-ds", "DeepSeek 测试")].into_iter());
+        assert_eq!(merged["models"].as_array().unwrap().len(), 3);
+        assert_eq!(merged["models"][1]["slug"], id);
+        assert!(merged["models"][1]["display_name"].as_str().unwrap().contains("DeepSeek 测试"));
+        assert_eq!(merged["models"][1]["base_instructions"], catalog.select("deepseek-v4-pro")["base_instructions"]);
+        assert_eq!(merged["models"][2]["context_window"], catalog.default["context_window"]);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn codex_fusion_ids_are_short_and_old_sessions_still_route() {
+        let mut provider = test_provider_config("1", ProviderStatus::Enabled, true);
+        provider.fusion_enabled = true;
+        provider.allowed_models = vec!["gpt-6-astra".into(), "vendor/model".into()];
+        assert_eq!(fusion_model_id("1", "gpt-6-astra"), "xxswitch-31/gpt-6-astra");
+        for id in ["xxswitch-31/gpt-6-astra", "xxswitch-claude-31--gpt-6-astra"] {
+            assert!(provider_accepts_model(&provider, id));
+            assert_eq!(mapped_model_for_provider(&provider, id).as_deref(), Some("gpt-6-astra"));
+            assert!(supports_gpt_long_context(id));
+            let mut catalog = json!({"models":[{"slug":id,"display_name":"GPT-6 Astra"}]});
+            decorate_fusion_catalog(&mut catalog, [("1", "Xxcd")].into_iter());
+            assert_eq!(catalog["models"][0]["display_name"], "GPT-6 Astra（Xxcd）");
+        }
+        assert_eq!(fusion_model_parts("xxswitch-31/vendor/model"), Some(("31", "vendor/model")));
+        assert!(!provider_accepts_model(&provider, "xxswitch-32/gpt-6-astra"));
+        assert!(!provider_accepts_model(&provider, "xxswitch-31/"));
+        provider.fusion_enabled = false;
+        assert!(!provider_accepts_model(&provider, "xxswitch-claude-31--gpt-6-astra"));
+    }
+
+    #[test]
+    fn zstd_forwarding_preserves_frames_and_recompresses_model_changes() {
+        let raw = br#"{ "model": "xxswitch-31/gpt-6-astra", "input": "hello" }"#;
+        let original = zstd::stream::encode_all(raw.as_slice(), 1).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        let decoded = decoded_proxy_request_body(true, &headers, &original).unwrap();
+        assert_eq!(model_from_request_body(&decoded), "xxswitch-31/gpt-6-astra");
+        let unchanged = forwarded_request_body(false, &headers, &original, &decoded, &decoded).unwrap();
+        assert_eq!(unchanged.body.as_ref(), original.as_slice());
+        assert_eq!(unchanged.encoding, Some("zstd"));
+        let prepared = body_with_provider_overrides(&decoded, Some("gpt-6-astra"), Some("priority"));
+        let changed = forwarded_request_body(false, &headers, &original, &decoded, &prepared).unwrap();
+        assert_eq!(changed.encoding, Some("zstd"));
+        let upstream = zstd::stream::decode_all(changed.body.as_ref()).unwrap();
+        assert_eq!(upstream, prepared);
+        assert_eq!(model_from_request_body(&upstream), "gpt-6-astra");
+        let expanded = forwarded_request_body(true, &headers, &original, &decoded, &prepared).unwrap();
+        assert_eq!(expanded.encoding, None);
+        assert_eq!(expanded.body, prepared);
+        let plain = forwarded_request_body(false, &HeaderMap::new(), raw, raw, raw).unwrap();
+        assert_eq!(plain.encoding, None);
+        assert_eq!(plain.body.as_ref(), raw);
+        let detected = forwarded_request_body(false, &HeaderMap::new(), &original, &decoded, &decoded).unwrap();
+        assert_eq!(detected.encoding, Some("zstd"));
+        assert!(decoded_proxy_request_body(true, &headers, b"broken frame").is_err());
+    }
+
+    #[test]
+    fn compressed_fusion_request_routes_and_rewrites_before_forwarding() {
+        let mut provider = test_provider_config("1", ProviderStatus::Enabled, true);
+        provider.fusion_enabled = true;
+        provider.allowed_models = vec!["gpt-6-astra".into()];
+        let model = fusion_model_id(&provider.id, "gpt-6-astra");
+        let raw = serde_json::to_vec(&json!({"model":model,"input":"hello"})).unwrap();
+        let compressed = zstd::stream::encode_all(raw.as_slice(), 1).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        let configured_decompression = false;
+        let decode_request = configured_decompression || provider.fusion_enabled;
+        let decoded = decoded_proxy_request_body(decode_request, &headers, &compressed).unwrap();
+        let requested = model_from_request_body(&decoded);
+        assert_eq!(requested, model);
+        assert!(provider_accepts_model(&provider, &requested));
+        let ordinary = test_provider_config("ordinary", ProviderStatus::Enabled, true);
+        assert!(!provider_accepts_model(&ordinary, &requested));
+        let prepared = prepare_upstream_request(&provider, "responses", "", &decoded, &requested).unwrap();
+        let forwarded: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(forwarded["model"], "gpt-6-astra");
+    }
+
+    #[test]
+    fn long_context_matches_numeric_gpt_versions_including_fusion() {
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6.1", "gpt-5.7", "gpt-5.10-mini", "gpt-6", "gpt-6.1-sol", "gpt-10", "GPT-6-ASTRA"] {
+            for slug in [model.to_string(), fusion_model_id("provider", model)] {
+                assert!(supports_gpt_long_context(&slug), "{slug}");
+                let mut row = json!({"slug":slug,"context_window":272000,"max_context_window":272000,"auto_compact_token_limit":240000});
+                apply_codex_long_context(&mut row, true, 512000);
+                assert_eq!(row["context_window"], 512000);
+                assert_eq!(row["max_context_window"], 512000);
+                assert!(row["auto_compact_token_limit"].is_null());
+            }
+        }
+        for model in ["gpt-5.5", "gpt-5.2", "gpt-5", "gpt-4o", "deepseek-v4-pro", "gpt-6x", "gpt-5.", "gpt-5..6", "gpt-5.6x", "gpt-", "gpt-reserve"] {
+            assert!(!supports_gpt_long_context(model), "{model}");
+            assert!(!supports_gpt_long_context(&fusion_model_id("p", model)), "{model}");
+            let mut row = json!({"slug":model,"context_window":272000});
+            let original = row.clone();
+            apply_codex_long_context(&mut row, true, 512000);
+            assert_eq!(row, original);
+        }
+        let mut row = json!({"slug":"gpt-6.1","context_window":272000});
+        apply_codex_long_context(&mut row, false, 512000);
+        assert_eq!(row["context_window"], 272000);
+    }
+
+    #[test]
+    fn remote_updates_preserve_explicit_context_for_plain_and_fusion_models() {
+        let mut catalog = model_catalog::bundled();
+        let models = vec!["gpt-6-astra".into(), fusion_model_id("provider", "gpt-6-astra"), "deepseek-v4-pro".into()];
+        for remote_window in [272000, 300000] {
+            let row = catalog.openai.iter_mut().find(|r| r["slug"] == "gpt-6-astra").unwrap();
+            row["context_window"] = json!(remote_window);
+            row["max_context_window"] = json!(remote_window);
+            let merged = merge_capability_catalog_with_context(&catalog, models.clone(), true, 512000);
+            for row in &merged["models"].as_array().unwrap()[..2] {
+                assert_eq!(row["context_window"], 512000);
+                assert_eq!(row["max_context_window"], 512000);
+                assert!(row["auto_compact_token_limit"].is_null());
+            }
+            assert_eq!(merged["models"][2]["context_window"], catalog.select("deepseek-v4-pro")["context_window"]);
+            let unmodified = merge_capability_catalog_with_context(&catalog, models.clone(), false, 512000);
+            assert_eq!(unmodified["models"][0]["context_window"], remote_window);
+        }
+    }
+
+    #[test]
+    fn remote_catalog_merge_preserves_capabilities_and_reloads_updates() {
+        let mut catalog = model_catalog::bundled();
+        let model = catalog.openai[0]["slug"].as_str().unwrap().to_string();
+        catalog.openai[0]["context_window"] = json!(123456);
+        let first = merge_capability_catalog(&catalog, vec![fusion_model_id("a", &model), fusion_model_id("b", &model)]);
+        assert_eq!(first["models"][0]["context_window"], 123456);
+        assert_eq!(first["models"][1]["context_window"], 123456);
+        assert_ne!(first["models"][0]["slug"], first["models"][1]["slug"]);
+        catalog.openai[0]["context_window"] = json!(654321);
+        let second = merge_capability_catalog(&catalog, vec![model]);
+        assert_eq!(second["models"][0]["context_window"], 654321);
+    }
+
+    #[test]
+    fn fusion_routes_are_isolated_and_stale_ids_never_fall_back() {
+        let mut fused = test_provider_config("供应商/a", ProviderStatus::Enabled, true);
+        fused.fusion_enabled = true;
+        fused.allowed_models = vec!["gpt-5.5".into()];
+        let mut ordinary = test_provider_config("ordinary", ProviderStatus::Enabled, true);
+        let id = fusion_model_id(&fused.id, "gpt-5.5");
+        assert!(provider_accepts_model(&fused, &id));
+        assert!(!provider_accepts_model(&ordinary, &id));
+        assert!(!provider_accepts_model(&fused, "gpt-5.5"));
+        assert!(!provider_accepts_model(&fused, "未知模型"));
+        assert!(!provider_accepts_model(&fused, &fusion_model_id(&fused.id, "未知模型")));
+        assert!(provider_accepts_model(&ordinary, "gpt-5.5"));
+        assert!(!provider_accepts_model(
+            &fused,
+            &fusion_model_id(&fused.id, "unlisted")
+        ));
+        ordinary.fusion_enabled = true;
+        ordinary.allowed_models = fused.allowed_models.clone();
+        assert!(!provider_accepts_model(&ordinary, &id));
+        fused.name = "renamed".into();
+        assert!(provider_accepts_model(&fused, &id));
+        fused.fusion_enabled = false;
+        assert!(!provider_accepts_model(&fused, &id));
+        assert!(!provider_accepts_model(&fused, "xxswitch-claude-malformed"));
+    }
+
+    #[test]
+    fn fusion_unwraps_model_before_mapping_and_upstream_protocol_conversion() {
+        let mut provider = test_provider_config("p", ProviderStatus::Enabled, true);
+        provider.fusion_enabled = true;
+        provider.allowed_models = vec!["alias".into()];
+        provider.model_mappings = vec![ModelMapping {
+            source: "alias".into(),
+            target: "actual-model".into(),
+        }];
+        let id = fusion_model_id(&provider.id, "alias");
+        let body = serde_json::to_vec(&json!({"model":id,"input":"hello"})).unwrap();
+        for wire_api in [ProviderWireApi::Responses, ProviderWireApi::ChatCompletions] {
+            provider.wire_api = wire_api;
+            let prepared = prepare_upstream_request(&provider, "responses", "", &body, &id).unwrap();
+            let upstream: Value = serde_json::from_slice(&prepared.body).unwrap();
+            assert_eq!(upstream["model"], "actual-model");
+        }
+        provider.model_mappings.clear();
+        assert_eq!(
+            mapped_model_for_provider(&provider, &id).as_deref(),
+            Some("alias")
+        );
+        // Provider connection tests use bare model IDs, even for fusion providers.
+        assert_eq!(mapped_model_for_provider(&provider, "alias"), None);
+    }
+
+    #[test]
+    fn fusion_catalog_keeps_same_named_providers_and_original_capabilities() {
+        let mut first = test_provider_config("first", ProviderStatus::Enabled, true);
+        first.fusion_enabled = true;
+        first.allowed_models = vec!["gpt-5.5".into()];
+        let mut second = first.clone();
+        second.id = "second".into();
+        second.name = "第二家".into();
+        let mut plain = first.clone();
+        plain.id = "plain".into();
+        plain.fusion_enabled = false;
+        let candidates: Vec<_> = [first, second, plain]
+            .into_iter()
+            .map(|provider| UpstreamCandidate {
+                provider,
+                base_url: "http://localhost".into(),
+                token: "test".into(),
+                route_order: 1,
+            })
+            .collect();
+        let models = configured_route_models(&candidates);
+        assert_eq!(models.len(), 3);
+        let template = json!({"slug":"gpt-5.5", "display_name":"GPT", "context_window":123456, "base_instructions":"original instructions", "future_field":{"preserved":true}});
+        let mut catalog = codex_models_catalog_value_with_templates(models, &[template]).unwrap();
+        decorate_fusion_catalog(
+            &mut catalog,
+            candidates
+                .iter()
+                .map(|c| (c.provider.id.as_str(), c.provider.name.as_str())),
+        );
+        assert_eq!(catalog["models"][0]["display_name"], "GPT（first）");
+        assert_eq!(catalog["models"][1]["display_name"], "GPT（第二家）");
+        assert_eq!(catalog["models"][2]["slug"], "gpt-5.5");
+        for entry in catalog["models"].as_array().unwrap() {
+            assert_eq!(entry["context_window"], 123456);
+            assert_eq!(entry["base_instructions"], "original instructions");
+            assert_eq!(entry["future_field"]["preserved"], true);
+        }
+    }
+
+    #[test]
+    fn fusion_deepseek_keeps_existing_profile_and_unknown_models_are_visible() {
+        let templates = embedded_codex_model_catalog_templates();
+        let raw = codex_model_catalog_entry("deepseek-v4-pro", &templates)
+            .unwrap()
+            .unwrap();
+        let id = fusion_model_id("ds", "deepseek-v4-pro");
+        let catalog = codex_models_catalog_value_with_templates(
+            vec![id.clone(), fusion_model_id("other", "vendor/new-model")],
+            &templates,
+        )
+        .unwrap();
+        assert_eq!(catalog["models"].as_array().unwrap().len(), 2);
+        let entry = &catalog["models"][0];
+        assert_eq!(entry["slug"], id);
+        for key in [
+            "context_window",
+            "base_instructions",
+            "supported_reasoning_levels",
+            "model_messages",
+            "input_modalities",
+        ] {
+            assert_eq!(entry[key], raw[key], "{key}");
+        }
+        assert_eq!(catalog["models"][1]["display_name"], "vendor/new-model");
+        assert_eq!(catalog["models"][1]["input_modalities"], json!(["text"]));
+    }
+
+    #[test]
+    fn fusion_claude_isolates_routes_and_preserves_long_context() {
+        let mut provider = test_claude_provider_config("claude", ProviderStatus::Enabled, true);
+        provider.fusion_enabled = true;
+        provider.allowed_models = vec!["claude-opus-4-6".into()];
+        let id = fusion_model_id(&provider.id, "claude-opus-4-6");
+        assert!(claude_provider_accepts_model(&provider, &id));
+        assert!(!claude_provider_accepts_model(&provider, "claude-opus-4-6"));
+        let variants = with_claude_long_context_variants(vec![claude_model_value_from_id(&id)]);
+        assert_eq!(variants.len(), 2);
+        let long_id = model_id_from_value(&variants[1]).unwrap();
+        let stripped = strip_claude_long_context_suffix(&long_id);
+        assert!(claude_provider_accepts_model(&provider, stripped));
+        assert_eq!(
+            mapped_model_for_claude_provider(&provider, stripped).as_deref(),
+            Some("claude-opus-4-6")
+        );
+        provider.fusion_enabled = false;
+        assert!(!claude_provider_accepts_model(&provider, &id));
+    }
+
+    #[test]
+    fn fusion_defaults_off_for_existing_provider_files() {
+        let provider = test_provider_config("old", ProviderStatus::Enabled, true);
+        let mut value = serde_json::to_value(provider).unwrap();
+        value.as_object_mut().unwrap().remove("fusion_enabled");
+        let restored: ProviderConfig = serde_json::from_value(value).unwrap();
+        assert!(!restored.fusion_enabled);
     }
 
     #[test]

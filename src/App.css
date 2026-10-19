@@ -4374,3 +4374,23 @@ button.danger,
     animation-iteration-count: 1 !important;
   }
 }
+
+.field .fusion-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.field .fusion-toggle input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.model-list-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
