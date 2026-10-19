@@ -81,7 +81,8 @@ static PROVIDER_HEALTH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CODEX_CLI_CHATGPT_LOGIN: OnceLock<bool> = OnceLock::new();
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const AUTO_DISABLE_FAILURE_THRESHOLD: u32 = 3;
+const DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD: u32 = 3;
+const MAX_AUTO_DISABLE_FAILURE_THRESHOLD: u32 = 100;
 const DEFAULT_AUTO_DISABLE_RESET_TIME: &str = "00:00";
 const DEFAULT_AUTO_DISABLE_RESET_WEEKDAY: u32 = 1;
 const DEFAULT_AUTO_DISABLE_RESET_DAY: u32 = 1;
@@ -105,6 +106,12 @@ struct ProviderConfig {
     enabled: bool,
     #[serde(default)]
     fusion_enabled: bool,
+    #[serde(default)]
+    auto_disable_override: bool,
+    #[serde(default = "default_true")]
+    auto_disable_enabled: bool,
+    #[serde(default = "default_auto_disable_failure_threshold")]
+    auto_disable_failure_threshold: u32,
     #[serde(default)]
     consecutive_failure_count: u32,
     #[serde(default)]
@@ -149,6 +156,12 @@ struct ClaudeProviderConfig {
     enabled: bool,
     #[serde(default)]
     fusion_enabled: bool,
+    #[serde(default)]
+    auto_disable_override: bool,
+    #[serde(default = "default_true")]
+    auto_disable_enabled: bool,
+    #[serde(default = "default_auto_disable_failure_threshold")]
+    auto_disable_failure_threshold: u32,
     #[serde(default)]
     consecutive_failure_count: u32,
     #[serde(default)]
@@ -357,6 +370,10 @@ struct RouterConfig {
     gpt56_long_context_enabled: bool,
     #[serde(default = "default_gpt56_long_context_window")]
     gpt56_long_context_window: u64,
+    #[serde(default = "default_true")]
+    auto_disable_enabled: bool,
+    #[serde(default = "default_auto_disable_failure_threshold")]
+    auto_disable_failure_threshold: u32,
     #[serde(default = "default_router_model_provider")]
     model_provider: String,
     #[serde(default)]
@@ -549,6 +566,8 @@ impl Default for RouterConfig {
             zstd_decompression_enabled: true,
             gpt56_long_context_enabled: false,
             gpt56_long_context_window: default_gpt56_long_context_window(),
+            auto_disable_enabled: true,
+            auto_disable_failure_threshold: default_auto_disable_failure_threshold(),
             model_provider: default_router_model_provider(),
             codex_model: String::new(),
             host: default_router_host(),
@@ -696,6 +715,9 @@ struct ProviderSummary {
     name: String,
     status: ProviderStatus,
     enabled: bool,
+    auto_disable_override: bool,
+    auto_disable_enabled: bool,
+    auto_disable_failure_threshold: u32,
     consecutive_failure_count: u32,
     auto_disabled_day: Option<String>,
     auto_disable_reset_period: AutoDisableResetPeriod,
@@ -812,6 +834,9 @@ struct SaveProviderPayload {
     balance_status: Option<BalanceStatus>,
     connection_test_model: Option<String>,
     fusion_enabled: Option<bool>,
+    auto_disable_override: Option<bool>,
+    auto_disable_enabled: Option<bool>,
+    auto_disable_failure_threshold: Option<u32>,
     allowed_models: Option<Vec<String>>,
     model_mappings: Option<Vec<ModelMapping>>,
     wire_api: Option<ProviderWireApi>,
@@ -838,6 +863,9 @@ struct SaveClaudeProviderPayload {
     api_key: Option<String>,
     connection_test_model: Option<String>,
     fusion_enabled: Option<bool>,
+    auto_disable_override: Option<bool>,
+    auto_disable_enabled: Option<bool>,
+    auto_disable_failure_threshold: Option<u32>,
     allowed_models: Option<Vec<String>>,
     model_mappings: Option<Vec<ModelMapping>>,
 }
@@ -918,6 +946,10 @@ struct SaveRouterPayload {
     gpt56_long_context_enabled: bool,
     #[serde(default = "default_gpt56_long_context_window")]
     gpt56_long_context_window: u64,
+    #[serde(default = "default_true")]
+    auto_disable_enabled: bool,
+    #[serde(default = "default_auto_disable_failure_threshold")]
+    auto_disable_failure_threshold: u32,
     #[serde(default = "default_router_model_provider")]
     model_provider: String,
     #[serde(default)]
@@ -2901,6 +2933,38 @@ fn default_auto_disable_reset_day() -> u32 {
     DEFAULT_AUTO_DISABLE_RESET_DAY
 }
 
+fn default_auto_disable_failure_threshold() -> u32 {
+    DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD
+}
+
+fn normalize_auto_disable_failure_threshold(value: u32) -> u32 {
+    value.clamp(1, MAX_AUTO_DISABLE_FAILURE_THRESHOLD)
+}
+
+fn effective_auto_disable_policy(
+    global_enabled: bool,
+    global_threshold: u32,
+    provider_override: bool,
+    provider_enabled: bool,
+    provider_threshold: u32,
+) -> (bool, u32) {
+    if provider_override {
+        (
+            provider_enabled,
+            normalize_auto_disable_failure_threshold(provider_threshold),
+        )
+    } else {
+        (
+            global_enabled,
+            normalize_auto_disable_failure_threshold(global_threshold),
+        )
+    }
+}
+
+fn should_auto_disable(enabled: bool, consecutive_failures: u32, threshold: u32) -> bool {
+    enabled && consecutive_failures >= normalize_auto_disable_failure_threshold(threshold)
+}
+
 fn normalize_auto_disable_reset_weekday(value: u32) -> u32 {
     if (1..=7).contains(&value) {
         value
@@ -3178,6 +3242,8 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
     if state.router.gpt56_long_context_window == 0 {
         state.router.gpt56_long_context_window = default_gpt56_long_context_window();
     }
+    state.router.auto_disable_failure_threshold =
+        normalize_auto_disable_failure_threshold(state.router.auto_disable_failure_threshold);
     for provider in &mut state.providers {
         provider.auto_disable_reset_weekday =
             normalize_auto_disable_reset_weekday(provider.auto_disable_reset_weekday);
@@ -3185,6 +3251,8 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
             normalize_auto_disable_reset_day(provider.auto_disable_reset_day);
         provider.auto_disable_reset_time =
             normalize_auto_disable_reset_time(&provider.auto_disable_reset_time);
+        provider.auto_disable_failure_threshold =
+            normalize_auto_disable_failure_threshold(provider.auto_disable_failure_threshold);
         let previous_status = provider.status;
         provider.status = normalize_provider_status(
             provider.status,
@@ -3196,6 +3264,23 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
             &provider.auto_disable_reset_time,
         );
         provider.enabled = provider_enabled_from_status(provider.status);
+        let (auto_disable_enabled, _) = effective_auto_disable_policy(
+            state.router.auto_disable_enabled,
+            state.router.auto_disable_failure_threshold,
+            provider.auto_disable_override,
+            provider.auto_disable_enabled,
+            provider.auto_disable_failure_threshold,
+        );
+        if !auto_disable_enabled {
+            if provider.status == ProviderStatus::AutoDisabled {
+                provider.status = ProviderStatus::Enabled;
+                provider.enabled = true;
+            }
+            provider.consecutive_failure_count = 0;
+            provider.auto_disabled_day = None;
+            provider.last_failure_reason = None;
+            provider.last_failure_at_ms = None;
+        }
         if provider.status == ProviderStatus::Disabled
             || (previous_status == ProviderStatus::AutoDisabled
                 && provider.status == ProviderStatus::Enabled)
@@ -3217,6 +3302,8 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
             normalize_auto_disable_reset_day(provider.auto_disable_reset_day);
         provider.auto_disable_reset_time =
             normalize_auto_disable_reset_time(&provider.auto_disable_reset_time);
+        provider.auto_disable_failure_threshold =
+            normalize_auto_disable_failure_threshold(provider.auto_disable_failure_threshold);
         let previous_status = provider.status;
         provider.status = normalize_provider_status(
             provider.status,
@@ -3228,6 +3315,23 @@ fn normalize_state(mut state: ManagerState) -> ManagerState {
             &provider.auto_disable_reset_time,
         );
         provider.enabled = provider_enabled_from_status(provider.status);
+        let (auto_disable_enabled, _) = effective_auto_disable_policy(
+            state.router.auto_disable_enabled,
+            state.router.auto_disable_failure_threshold,
+            provider.auto_disable_override,
+            provider.auto_disable_enabled,
+            provider.auto_disable_failure_threshold,
+        );
+        if !auto_disable_enabled {
+            if provider.status == ProviderStatus::AutoDisabled {
+                provider.status = ProviderStatus::Enabled;
+                provider.enabled = true;
+            }
+            provider.consecutive_failure_count = 0;
+            provider.auto_disabled_day = None;
+            provider.last_failure_reason = None;
+            provider.last_failure_at_ms = None;
+        }
         if provider.status == ProviderStatus::Disabled
             || (previous_status == ProviderStatus::AutoDisabled
                 && provider.status == ProviderStatus::Enabled)
@@ -3603,15 +3707,25 @@ const FUSION_PREFIX: &str = "xxswitch-";
 const LEGACY_FUSION_PREFIX: &str = "xxswitch-claude-";
 
 fn fusion_provider_key(provider_id: &str) -> String {
-    provider_id.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+    provider_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn fusion_model_id(provider_id: &str, model: &str) -> String {
-    format!("{FUSION_PREFIX}{}/{model}", fusion_provider_key(provider_id))
+    format!(
+        "{FUSION_PREFIX}{}/{model}",
+        fusion_provider_key(provider_id)
+    )
 }
 
 fn claude_fusion_model_id(provider_id: &str, model: &str) -> String {
-    format!("{LEGACY_FUSION_PREFIX}{}--{model}", fusion_provider_key(provider_id))
+    format!(
+        "{LEGACY_FUSION_PREFIX}{}--{model}",
+        fusion_provider_key(provider_id)
+    )
 }
 
 fn fusion_model_parts(model: &str) -> Option<(&str, &str)> {
@@ -4559,7 +4673,9 @@ fn claude_model_base_id(model: &str) -> String {
 }
 
 fn claude_model_supports_long_context(model: &str) -> bool {
-    let model = fusion_model_parts(model).map(|(_, base)| base).unwrap_or(model);
+    let model = fusion_model_parts(model)
+        .map(|(_, base)| base)
+        .unwrap_or(model);
     let base = claude_model_base_id(model);
     CLAUDE_LONG_CONTEXT_MODELS
         .iter()
@@ -6138,7 +6254,13 @@ fn ensure_codex_model_catalog_applied(state: &ManagerState) -> Result<bool, Stri
         state.router.gpt56_long_context_enabled,
         state.router.gpt56_long_context_window,
     )?;
-    decorate_fusion_catalog(&mut desired, state.providers.iter().map(|p| (p.id.as_str(), p.name.as_str())));
+    decorate_fusion_catalog(
+        &mut desired,
+        state
+            .providers
+            .iter()
+            .map(|p| (p.id.as_str(), p.name.as_str())),
+    );
     if path.exists() {
         let current = fs::read_to_string(&path)
             .ok()
@@ -6683,8 +6805,6 @@ fn parse_codex_cli_version_output(output: &[u8]) -> Option<Version> {
         .find_map(|value| Version::parse(value.trim_start_matches('v')).ok())
 }
 
-
-
 #[cfg(test)]
 fn catalog_has_required_models(templates: &[Value]) -> bool {
     ["gpt-6-astra", "gpt-5.6-sol"].iter().all(|model| {
@@ -6739,15 +6859,15 @@ fn external_codex_catalog_is_eligible(version: &Version, templates: &[Value]) ->
     version >= &embedded_version && catalog_has_required_models(templates)
 }
 
-
-
 fn capability_catalog_path() -> Result<PathBuf, String> {
     Ok(manager_dir()?.join("capability-catalog.json"))
 }
 
 fn load_codex_model_catalog_templates() -> Vec<Value> {
-    capability_catalog_path().and_then(|path| model_catalog::load(&path))
-        .unwrap_or_else(|_| model_catalog::bundled()).rows()
+    capability_catalog_path()
+        .and_then(|path| model_catalog::load(&path))
+        .unwrap_or_else(|_| model_catalog::bundled())
+        .rows()
 }
 
 #[cfg(test)]
@@ -6992,17 +7112,29 @@ fn codex_models_catalog_value_with_templates_and_context(
 }
 
 fn supports_gpt_long_context(model: &str) -> bool {
-    let model = fusion_model_parts(model).map(|(_, base)| base).unwrap_or(model);
+    let model = fusion_model_parts(model)
+        .map(|(_, base)| base)
+        .unwrap_or(model);
     let model = model.to_ascii_lowercase();
-    let Some(rest) = model.strip_prefix("gpt-") else { return false };
+    let Some(rest) = model.strip_prefix("gpt-") else {
+        return false;
+    };
     let version = rest.split('-').next().unwrap_or_default();
     let parts: Vec<_> = version.split('.').collect();
-    if parts.iter().any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit())) {
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+    {
         return false;
     }
-    let Ok(major) = parts[0].parse::<u64>() else { return false };
+    let Ok(major) = parts[0].parse::<u64>() else {
+        return false;
+    };
     let minor = match parts.get(1) {
-        Some(part) => match part.parse::<u64>() { Ok(value) => value, Err(_) => return false },
+        Some(part) => match part.parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => return false,
+        },
         None => 0,
     };
     (major, minor) >= (5, 6)
@@ -7037,7 +7169,12 @@ fn codex_models_catalog_value(
     gpt56_long_context_window: u64,
 ) -> Result<Value, String> {
     let catalog = model_catalog::load(&capability_catalog_path()?)?;
-    Ok(merge_capability_catalog_with_context(&catalog, models, gpt56_long_context_enabled, gpt56_long_context_window))
+    Ok(merge_capability_catalog_with_context(
+        &catalog,
+        models,
+        gpt56_long_context_enabled,
+        gpt56_long_context_window,
+    ))
 }
 
 fn merge_capability_catalog_with_context(
@@ -7054,15 +7191,21 @@ fn merge_capability_catalog_with_context(
 }
 
 fn merge_capability_catalog(catalog: &model_catalog::Catalog, models: Vec<String>) -> Value {
-    let entries: Vec<Value> = models.into_iter().enumerate().map(|(index, model)| {
-        let base = fusion_model_parts(&model).map(|(_, base)| base).unwrap_or(&model);
-        let mut entry = catalog.select(base);
-        entry["slug"] = json!(model);
-        entry["priority"] = json!(index + 1);
-        entry["visibility"] = json!("list");
-        entry["supported_in_api"] = json!(true);
-        entry
-    }).collect();
+    let entries: Vec<Value> = models
+        .into_iter()
+        .enumerate()
+        .map(|(index, model)| {
+            let base = fusion_model_parts(&model)
+                .map(|(_, base)| base)
+                .unwrap_or(&model);
+            let mut entry = catalog.select(base);
+            entry["slug"] = json!(model);
+            entry["priority"] = json!(index + 1);
+            entry["visibility"] = json!("list");
+            entry["supported_in_api"] = json!(true);
+            entry
+        })
+        .collect();
     json!({ "models": entries })
 }
 
@@ -7691,19 +7834,29 @@ fn forwarded_request_body(
     prepared: &[u8],
 ) -> Result<ForwardedRequestBody, String> {
     let was_zstd = original.starts_with(&[0x28, 0xB5, 0x2F, 0xFD])
-        || headers.get(CONTENT_ENCODING).and_then(|v| v.to_str().ok())
+        || headers
+            .get(CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.split(',').any(|e| e.trim().eq_ignore_ascii_case("zstd")));
     if send_uncompressed || !was_zstd {
-        return Ok(ForwardedRequestBody { body: Bytes::copy_from_slice(prepared), encoding: None });
+        return Ok(ForwardedRequestBody {
+            body: Bytes::copy_from_slice(prepared),
+            encoding: None,
+        });
     }
     // Unchanged requests retain the exact original compressed frame.
     let body = if prepared == decoded {
         Bytes::copy_from_slice(original)
     } else {
-        Bytes::from(zstd::stream::encode_all(Cursor::new(prepared), 3)
-            .map_err(|error| format!("重新压缩 zstd 请求失败: {error}"))?)
+        Bytes::from(
+            zstd::stream::encode_all(Cursor::new(prepared), 3)
+                .map_err(|error| format!("重新压缩 zstd 请求失败: {error}"))?,
+        )
     };
-    Ok(ForwardedRequestBody { body, encoding: Some("zstd") })
+    Ok(ForwardedRequestBody {
+        body,
+        encoding: Some("zstd"),
+    })
 }
 
 async fn read_proxy_request_body(body: Body) -> Result<Bytes, String> {
@@ -10517,7 +10670,8 @@ async fn proxy_claude_models(proxy_state: Arc<ProxyState>, headers: HeaderMap) -
                 if let Some(id) = model_id_from_value(&model) {
                     let display = model["display_name"].as_str().unwrap_or(&id).to_string();
                     model["id"] = json!(claude_fusion_model_id(&candidate.provider.id, &id));
-                    model["display_name"] = json!(format!("{display}（{}）", candidate.provider.name));
+                    model["display_name"] =
+                        json!(format!("{display}（{}）", candidate.provider.name));
                 }
             }
             push_claude_model_value(&mut models, &mut seen, model);
@@ -10566,11 +10720,7 @@ async fn proxy_claude_request(
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
-    let body_bytes = match decoded_proxy_request_body(
-        decode_request,
-        &headers,
-        &inbound_body,
-    ) {
+    let body_bytes = match decoded_proxy_request_body(decode_request, &headers, &inbound_body) {
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
@@ -10614,7 +10764,13 @@ async fn proxy_claude_request(
             .or_else(|| long_context_suffix_stripped.then(|| model.clone()));
         let prepared_body =
             body_with_provider_overrides(&body_bytes, upstream_model.as_deref(), None);
-        let forwarded = match forwarded_request_body(router.zstd_decompression_enabled, &headers, &inbound_body, &body_bytes, &prepared_body) {
+        let forwarded = match forwarded_request_body(
+            router.zstd_decompression_enabled,
+            &headers,
+            &inbound_body,
+            &body_bytes,
+            &prepared_body,
+        ) {
             Ok(body) => body,
             Err(error) => return proxy_error(StatusCode::BAD_GATEWAY, error),
         };
@@ -10947,13 +11103,9 @@ async fn proxy_request(
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
-    let streams = decoded_proxy_request_body(
-        true,
-        &headers,
-        &body_bytes,
-    )
-    .ok()
-    .is_some_and(|decoded| request_body_streams(&decoded));
+    let streams = decoded_proxy_request_body(true, &headers, &body_bytes)
+        .ok()
+        .is_some_and(|decoded| request_body_streams(&decoded));
     let delay_secs = selected_slow_delay_secs(&state.router);
     let slow_timing = RequestTiming {
         slow_delay_ms: Some(delay_secs.saturating_mul(1_000)),
@@ -11057,11 +11209,7 @@ async fn proxy_request_now(
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
-    let body_bytes = match decoded_proxy_request_body(
-        decode_request,
-        &headers,
-        &inbound_body,
-    ) {
+    let body_bytes = match decoded_proxy_request_body(decode_request, &headers, &inbound_body) {
         Ok(bytes) => bytes,
         Err(err) => return proxy_error(StatusCode::BAD_REQUEST, err),
     };
@@ -11144,7 +11292,13 @@ async fn proxy_request_now(
                 request_has_compaction_trigger(&prepared.body);
         }
         let upstream_url = join_url(&candidate.base_url, &prepared.path) + &prepared.query;
-        let forwarded = match forwarded_request_body(router.zstd_decompression_enabled, &headers, &inbound_body, &body_bytes, &prepared.body) {
+        let forwarded = match forwarded_request_body(
+            router.zstd_decompression_enabled,
+            &headers,
+            &inbound_body,
+            &body_bytes,
+            &prepared.body,
+        ) {
             Ok(body) => body,
             Err(error) => return proxy_error(StatusCode::BAD_GATEWAY, error),
         };
@@ -12163,16 +12317,22 @@ impl RouteLogCache {
         let identity = (0, 0, metadata.created().ok());
         let modified = metadata.modified().ok();
         let len = metadata.len();
-        if self.path != path || self.identity != Some(identity)
+        if self.path != path
+            || self.identity != Some(identity)
             || len < self.observed_len
             || (len == self.observed_len && modified != self.modified)
         {
-            *self = Self { path: path.to_path_buf(), ..Self::default() };
+            *self = Self {
+                path: path.to_path_buf(),
+                ..Self::default()
+            };
         }
-        if self.identity == Some(identity) && self.observed_len == len && self.modified == modified {
+        if self.identity == Some(identity) && self.observed_len == len && self.modified == modified
+        {
             return Ok(());
         }
-        file.seek(SeekFrom::Start(self.offset)).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(|e| e.to_string())?;
         // Read a stable-length snapshot, leaving a concurrent writer's partial line for next time.
         let mut reader = BufReader::new(file.take(len - self.offset));
         let mut line = Vec::new();
@@ -12180,16 +12340,23 @@ impl RouteLogCache {
         let mut added = Vec::new();
         loop {
             line.clear();
-            let n = reader.read_until(b'\n', &mut line).map_err(|e| e.to_string())?;
-            if n == 0 || line.last() != Some(&b'\n') { break; }
+            let n = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|e| e.to_string())?;
+            if n == 0 || line.last() != Some(&b'\n') {
+                break;
+            }
             next_offset += n as u64;
             if let Ok(log) = serde_json::from_slice::<RouteRequestLog>(&line) {
-                if is_usage_route_log(&log) { added.push(log); }
+                if is_usage_route_log(&log) {
+                    added.push(log);
+                }
             }
         }
         if !added.is_empty() {
             self.logs.extend(added);
-            self.logs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+            self.logs
+                .sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
         }
         self.offset = next_offset;
         self.identity = Some(identity);
@@ -12201,8 +12368,10 @@ impl RouteLogCache {
 
 fn with_route_logs<T>(build: impl FnOnce(&[RouteRequestLog]) -> T) -> Result<T, String> {
     static CACHE: OnceLock<Mutex<RouteLogCache>> = OnceLock::new();
-    let mut cache = CACHE.get_or_init(|| Mutex::new(RouteLogCache::default()))
-        .lock().map_err(|_| "日志缓存不可用")?;
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(RouteLogCache::default()))
+        .lock()
+        .map_err(|_| "日志缓存不可用")?;
     cache.refresh(&route_logs_path()?)?;
     Ok(build(&cache.logs))
 }
@@ -12302,6 +12471,76 @@ fn clear_claude_provider_failure_state(provider: &mut ClaudeProviderConfig) -> b
     changed
 }
 
+fn reconcile_codex_auto_disable_policy(state: &mut ManagerState, provider_id: &str) {
+    let global_enabled = state.router.auto_disable_enabled;
+    let global_threshold = state.router.auto_disable_failure_threshold;
+    let Some(provider) = state
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == provider_id)
+    else {
+        return;
+    };
+    let (enabled, _) = effective_auto_disable_policy(
+        global_enabled,
+        global_threshold,
+        provider.auto_disable_override,
+        provider.auto_disable_enabled,
+        provider.auto_disable_failure_threshold,
+    );
+    if !enabled {
+        let next_status = if provider.status == ProviderStatus::AutoDisabled {
+            ProviderStatus::Enabled
+        } else {
+            provider.status
+        };
+        set_provider_status_fields(
+            next_status,
+            &mut provider.enabled,
+            &mut provider.consecutive_failure_count,
+            &mut provider.auto_disabled_day,
+            &mut provider.last_failure_reason,
+            &mut provider.last_failure_at_ms,
+        );
+        provider.status = next_status;
+    }
+}
+
+fn reconcile_claude_auto_disable_policy(state: &mut ManagerState, provider_id: &str) {
+    let global_enabled = state.router.auto_disable_enabled;
+    let global_threshold = state.router.auto_disable_failure_threshold;
+    let Some(provider) = state
+        .claude_providers
+        .iter_mut()
+        .find(|provider| provider.id == provider_id)
+    else {
+        return;
+    };
+    let (enabled, _) = effective_auto_disable_policy(
+        global_enabled,
+        global_threshold,
+        provider.auto_disable_override,
+        provider.auto_disable_enabled,
+        provider.auto_disable_failure_threshold,
+    );
+    if !enabled {
+        let next_status = if provider.status == ProviderStatus::AutoDisabled {
+            ProviderStatus::Enabled
+        } else {
+            provider.status
+        };
+        set_provider_status_fields(
+            next_status,
+            &mut provider.enabled,
+            &mut provider.consecutive_failure_count,
+            &mut provider.auto_disabled_day,
+            &mut provider.last_failure_reason,
+            &mut provider.last_failure_at_ms,
+        );
+        provider.status = next_status;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_provider_failure(
     provider_kind: ProviderKind,
@@ -12325,6 +12564,8 @@ fn record_provider_failure(
     let mut counted = true;
 
     if let Ok(mut state) = load_state_file() {
+        let global_auto_disable_enabled = state.router.auto_disable_enabled;
+        let global_auto_disable_threshold = state.router.auto_disable_failure_threshold;
         match provider_kind {
             ProviderKind::Codex => {
                 if let Some(provider) = state
@@ -12332,25 +12573,40 @@ fn record_provider_failure(
                     .iter_mut()
                     .find(|provider| provider.id == provider_id)
                 {
+                    let (auto_disable_enabled, failure_threshold) = effective_auto_disable_policy(
+                        global_auto_disable_enabled,
+                        global_auto_disable_threshold,
+                        provider.auto_disable_override,
+                        provider.auto_disable_enabled,
+                        provider.auto_disable_failure_threshold,
+                    );
                     if provider.status == ProviderStatus::Disabled {
                         counted = false;
                         consecutive_failure_count = provider.consecutive_failure_count;
                     } else {
-                        provider.consecutive_failure_count =
-                            provider.consecutive_failure_count.saturating_add(1);
                         provider.last_failure_reason = Some(error.clone());
                         provider.last_failure_at_ms = Some(started_at_ms);
-                        if provider.consecutive_failure_count >= AUTO_DISABLE_FAILURE_THRESHOLD {
-                            provider.status = ProviderStatus::AutoDisabled;
-                            provider.enabled = false;
-                            provider.auto_disabled_day = Some(provider_cycle_for_timestamp(
-                                started_at_ms,
-                                provider.auto_disable_reset_period,
-                                provider.auto_disable_reset_weekday,
-                                provider.auto_disable_reset_day,
-                                &provider.auto_disable_reset_time,
-                            ));
-                            auto_disabled = true;
+                        if auto_disable_enabled {
+                            provider.consecutive_failure_count =
+                                provider.consecutive_failure_count.saturating_add(1);
+                            if should_auto_disable(
+                                auto_disable_enabled,
+                                provider.consecutive_failure_count,
+                                failure_threshold,
+                            ) {
+                                provider.status = ProviderStatus::AutoDisabled;
+                                provider.enabled = false;
+                                provider.auto_disabled_day = Some(provider_cycle_for_timestamp(
+                                    started_at_ms,
+                                    provider.auto_disable_reset_period,
+                                    provider.auto_disable_reset_weekday,
+                                    provider.auto_disable_reset_day,
+                                    &provider.auto_disable_reset_time,
+                                ));
+                                auto_disabled = true;
+                            }
+                        } else {
+                            counted = false;
                         }
                         consecutive_failure_count = provider.consecutive_failure_count;
                     }
@@ -12362,25 +12618,40 @@ fn record_provider_failure(
                     .iter_mut()
                     .find(|provider| provider.id == provider_id)
                 {
+                    let (auto_disable_enabled, failure_threshold) = effective_auto_disable_policy(
+                        global_auto_disable_enabled,
+                        global_auto_disable_threshold,
+                        provider.auto_disable_override,
+                        provider.auto_disable_enabled,
+                        provider.auto_disable_failure_threshold,
+                    );
                     if provider.status == ProviderStatus::Disabled {
                         counted = false;
                         consecutive_failure_count = provider.consecutive_failure_count;
                     } else {
-                        provider.consecutive_failure_count =
-                            provider.consecutive_failure_count.saturating_add(1);
                         provider.last_failure_reason = Some(error.clone());
                         provider.last_failure_at_ms = Some(started_at_ms);
-                        if provider.consecutive_failure_count >= AUTO_DISABLE_FAILURE_THRESHOLD {
-                            provider.status = ProviderStatus::AutoDisabled;
-                            provider.enabled = false;
-                            provider.auto_disabled_day = Some(provider_cycle_for_timestamp(
-                                started_at_ms,
-                                provider.auto_disable_reset_period,
-                                provider.auto_disable_reset_weekday,
-                                provider.auto_disable_reset_day,
-                                &provider.auto_disable_reset_time,
-                            ));
-                            auto_disabled = true;
+                        if auto_disable_enabled {
+                            provider.consecutive_failure_count =
+                                provider.consecutive_failure_count.saturating_add(1);
+                            if should_auto_disable(
+                                auto_disable_enabled,
+                                provider.consecutive_failure_count,
+                                failure_threshold,
+                            ) {
+                                provider.status = ProviderStatus::AutoDisabled;
+                                provider.enabled = false;
+                                provider.auto_disabled_day = Some(provider_cycle_for_timestamp(
+                                    started_at_ms,
+                                    provider.auto_disable_reset_period,
+                                    provider.auto_disable_reset_weekday,
+                                    provider.auto_disable_reset_day,
+                                    &provider.auto_disable_reset_time,
+                                ));
+                                auto_disabled = true;
+                            }
+                        } else {
+                            counted = false;
                         }
                         consecutive_failure_count = provider.consecutive_failure_count;
                     }
@@ -12413,7 +12684,9 @@ fn record_provider_failure(
 }
 
 fn route_model_label(model: &str) -> &str {
-    fusion_model_parts(model).map(|(_, base)| base).unwrap_or(model)
+    fusion_model_parts(model)
+        .map(|(_, base)| base)
+        .unwrap_or(model)
 }
 
 fn route_log_matches_filter(log: &RouteRequestLog, filter: &RouteLogFilter) -> bool {
@@ -12485,7 +12758,9 @@ fn is_usage_route_log(log: &RouteRequestLog) -> bool {
     )
 }
 
-fn route_available_providers<'a>(logs: impl IntoIterator<Item = &'a RouteRequestLog>) -> Vec<RouteLogFilterOption> {
+fn route_available_providers<'a>(
+    logs: impl IntoIterator<Item = &'a RouteRequestLog>,
+) -> Vec<RouteLogFilterOption> {
     let mut map = BTreeMap::<String, RouteLogFilterOption>::new();
     for log in logs {
         let entry = map
@@ -12520,7 +12795,10 @@ fn route_available_models<'a>(logs: impl IntoIterator<Item = &'a RouteRequestLog
 }
 
 fn route_available_days<'a>(logs: impl IntoIterator<Item = &'a RouteRequestLog>) -> Vec<String> {
-    let mut days = logs.into_iter().map(|log| log.day.clone()).collect::<Vec<_>>();
+    let mut days = logs
+        .into_iter()
+        .map(|log| log.day.clone())
+        .collect::<Vec<_>>();
     days.sort();
     days.dedup();
     days
@@ -12862,6 +13140,9 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                 name: provider.name.clone(),
                 status: provider.status,
                 enabled: provider.enabled,
+                auto_disable_override: provider.auto_disable_override,
+                auto_disable_enabled: provider.auto_disable_enabled,
+                auto_disable_failure_threshold: provider.auto_disable_failure_threshold,
                 consecutive_failure_count: provider.consecutive_failure_count,
                 auto_disabled_day: provider.auto_disabled_day.clone(),
                 auto_disable_reset_period: provider.auto_disable_reset_period,
@@ -12899,6 +13180,9 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
                 name: provider.name.clone(),
                 status: provider.status,
                 enabled: provider.enabled,
+                auto_disable_override: provider.auto_disable_override,
+                auto_disable_enabled: provider.auto_disable_enabled,
+                auto_disable_failure_threshold: provider.auto_disable_failure_threshold,
                 consecutive_failure_count: provider.consecutive_failure_count,
                 auto_disabled_day: provider.auto_disabled_day.clone(),
                 auto_disable_reset_period: provider.auto_disable_reset_period,
@@ -12953,8 +13237,14 @@ fn build_app_state(state: ManagerState, runtime: &RouterRuntime) -> Result<AppSt
         router: state.router.clone(),
         codex_models,
         capability_version: model_catalog::load(&capability_catalog_path()?)?.version,
-        capability_updated_at: fs::metadata(capability_catalog_path()?).ok().and_then(|m| m.modified().ok())
-            .map(|time| DateTime::<Local>::from(time).format("%Y-%m-%d %H:%M:%S").to_string()),
+        capability_updated_at: fs::metadata(capability_catalog_path()?)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|time| {
+                DateTime::<Local>::from(time)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            }),
         clients: state.clients.clone(),
         multi_agent_enabled,
         router_status: router_status(runtime, &state.router),
@@ -12992,7 +13282,9 @@ fn set_autostart_enabled(enabled: bool, app: tauri::AppHandle) -> Result<bool, S
 }
 
 #[tauri::command]
-async fn update_model_capabilities(router_runtime: tauri::State<'_, RouterRuntime>) -> Result<AppState, String> {
+async fn update_model_capabilities(
+    router_runtime: tauri::State<'_, RouterRuntime>,
+) -> Result<AppState, String> {
     let bytes = model_catalog::download(model_catalog::URL).await?;
     // No await while replacing the cache and regenerating client files.
     static UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -13007,7 +13299,8 @@ async fn update_model_capabilities(router_runtime: tauri::State<'_, RouterRuntim
             None => fs::remove_file(&path).map_err(|e| e.to_string()),
         };
         rollback.map_err(|e| format!("{error}；恢复能力缓存失败: {e}"))?;
-        ensure_client_configs_applied(&mut state).map_err(|e| format!("{error}；恢复客户端目录失败: {e}"))?;
+        ensure_client_configs_applied(&mut state)
+            .map_err(|e| format!("{error}；恢复客户端目录失败: {e}"))?;
         return Err(error);
     }
     save_state(&state)?;
@@ -13102,10 +13395,11 @@ fn save_provider(
     router_runtime: tauri::State<RouterRuntime>,
 ) -> Result<AppState, String> {
     let mut state = load_state_file()?;
+    let provider_id = payload.provider_id.clone();
     let provider = state
         .providers
         .iter_mut()
-        .find(|provider| provider.id == payload.provider_id)
+        .find(|provider| provider.id == provider_id)
         .ok_or_else(|| "供应商不存在".to_string())?;
 
     if let Some(name) = payload.provider_name.as_deref() {
@@ -13175,6 +13469,16 @@ fn save_provider(
     if let Some(fusion_enabled) = payload.fusion_enabled {
         provider.fusion_enabled = fusion_enabled;
     }
+    if let Some(auto_disable_override) = payload.auto_disable_override {
+        provider.auto_disable_override = auto_disable_override;
+    }
+    if let Some(auto_disable_enabled) = payload.auto_disable_enabled {
+        provider.auto_disable_enabled = auto_disable_enabled;
+    }
+    if let Some(auto_disable_failure_threshold) = payload.auto_disable_failure_threshold {
+        provider.auto_disable_failure_threshold =
+            normalize_auto_disable_failure_threshold(auto_disable_failure_threshold);
+    }
     if let Some(allowed_models) = payload.allowed_models {
         provider.allowed_models = normalize_model_names(allowed_models);
     }
@@ -13210,8 +13514,12 @@ fn save_provider(
     if provider.fusion_enabled && provider.allowed_models.is_empty() {
         return Err("融合模式请先在模型配置中选择要发布的模型".to_string());
     }
+    reconcile_codex_auto_disable_policy(&mut state, &provider_id);
     let choices = codex_model_choices_for_state(&state);
-    if !choices.iter().any(|model| model == &state.router.codex_model) {
+    if !choices
+        .iter()
+        .any(|model| model == &state.router.codex_model)
+    {
         state.router.codex_model = choices.first().cloned().unwrap_or_default();
     }
     ensure_client_configs_applied(&mut state)?;
@@ -13225,10 +13533,11 @@ fn save_claude_provider(
     router_runtime: tauri::State<RouterRuntime>,
 ) -> Result<AppState, String> {
     let mut state = load_state_file()?;
+    let provider_id = payload.provider_id.clone();
     let provider = state
         .claude_providers
         .iter_mut()
-        .find(|provider| provider.id == payload.provider_id)
+        .find(|provider| provider.id == provider_id)
         .ok_or_else(|| "Claude 供应商不存在".to_string())?;
 
     if let Some(name) = payload.provider_name.as_deref() {
@@ -13303,6 +13612,16 @@ fn save_claude_provider(
     if let Some(fusion_enabled) = payload.fusion_enabled {
         provider.fusion_enabled = fusion_enabled;
     }
+    if let Some(auto_disable_override) = payload.auto_disable_override {
+        provider.auto_disable_override = auto_disable_override;
+    }
+    if let Some(auto_disable_enabled) = payload.auto_disable_enabled {
+        provider.auto_disable_enabled = auto_disable_enabled;
+    }
+    if let Some(auto_disable_failure_threshold) = payload.auto_disable_failure_threshold {
+        provider.auto_disable_failure_threshold =
+            normalize_auto_disable_failure_threshold(auto_disable_failure_threshold);
+    }
     if let Some(allowed_models) = payload.allowed_models {
         provider.allowed_models = normalize_model_names(allowed_models);
     }
@@ -13313,6 +13632,7 @@ fn save_claude_provider(
     if provider.fusion_enabled && provider.allowed_models.is_empty() {
         return Err("融合模式请先在模型配置中选择要发布的模型".to_string());
     }
+    reconcile_claude_auto_disable_policy(&mut state, &provider_id);
     save_state(&state)?;
     build_app_state(state, &router_runtime)
 }
@@ -13463,6 +13783,16 @@ fn preview_provider(
     if let Some(fusion_enabled) = payload.fusion_enabled {
         provider.fusion_enabled = fusion_enabled;
     }
+    if let Some(auto_disable_override) = payload.auto_disable_override {
+        provider.auto_disable_override = auto_disable_override;
+    }
+    if let Some(auto_disable_enabled) = payload.auto_disable_enabled {
+        provider.auto_disable_enabled = auto_disable_enabled;
+    }
+    if let Some(auto_disable_failure_threshold) = payload.auto_disable_failure_threshold {
+        provider.auto_disable_failure_threshold =
+            normalize_auto_disable_failure_threshold(auto_disable_failure_threshold);
+    }
     if let Some(allowed_models) = payload.allowed_models {
         provider.allowed_models = normalize_model_names(allowed_models);
     }
@@ -13504,6 +13834,9 @@ fn add_provider(
         status: ProviderStatus::Enabled,
         enabled: true,
         fusion_enabled: false,
+        auto_disable_override: false,
+        auto_disable_enabled: true,
+        auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
         consecutive_failure_count: 0,
         auto_disabled_day: None,
         auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -13561,6 +13894,9 @@ fn add_claude_provider(
         status: ProviderStatus::Enabled,
         enabled: true,
         fusion_enabled: false,
+        auto_disable_override: false,
+        auto_disable_enabled: true,
+        auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
         consecutive_failure_count: 0,
         auto_disabled_day: None,
         auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -13617,6 +13953,10 @@ fn save_router_config(
         zstd_decompression_enabled: payload.zstd_decompression_enabled,
         gpt56_long_context_enabled: payload.gpt56_long_context_enabled,
         gpt56_long_context_window: payload.gpt56_long_context_window,
+        auto_disable_enabled: payload.auto_disable_enabled,
+        auto_disable_failure_threshold: normalize_auto_disable_failure_threshold(
+            payload.auto_disable_failure_threshold,
+        ),
         model_provider,
         codex_model,
         host: if host.is_empty() {
@@ -13641,6 +13981,22 @@ fn save_router_config(
     validate_router_slow_mode(&router)?;
     validate_gpt56_long_context(&router)?;
     state.router = router;
+    let codex_ids = state
+        .providers
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect::<Vec<_>>();
+    for provider_id in codex_ids {
+        reconcile_codex_auto_disable_policy(&mut state, &provider_id);
+    }
+    let claude_ids = state
+        .claude_providers
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect::<Vec<_>>();
+    for provider_id in claude_ids {
+        reconcile_claude_auto_disable_policy(&mut state, &provider_id);
+    }
     ensure_client_configs_applied(&mut state)?;
     save_state(&state)?;
     ensure_router(&router_runtime, &state.router)?;
@@ -13968,12 +14324,17 @@ fn apply_config(router_runtime: tauri::State<RouterRuntime>) -> Result<AppState,
 }
 
 #[tauri::command]
-async fn load_route_logs(payload: Option<LoadRouteLogsPayload>) -> Result<RouteLogsResponse, String> {
+async fn load_route_logs(
+    payload: Option<LoadRouteLogsPayload>,
+) -> Result<RouteLogsResponse, String> {
     let filter = payload
         .and_then(|payload| payload.filter)
         .unwrap_or_default();
-    tauri::async_runtime::spawn_blocking(move || with_route_logs(|logs| build_route_logs_response(logs, filter)))
-        .await.map_err(|e| format!("日志加载失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        with_route_logs(|logs| build_route_logs_response(logs, filter))
+    })
+    .await
+    .map_err(|e| format!("日志加载失败: {e}"))?
 }
 
 #[tauri::command]
@@ -13990,8 +14351,11 @@ async fn load_route_usage_stats(
     let filter = payload
         .and_then(|payload| payload.filter)
         .unwrap_or_default();
-    tauri::async_runtime::spawn_blocking(move || with_route_logs(|logs| build_route_usage_stats(logs, filter)))
-        .await.map_err(|e| format!("统计加载失败: {e}"))??
+    tauri::async_runtime::spawn_blocking(move || {
+        with_route_logs(|logs| build_route_usage_stats(logs, filter))
+    })
+    .await
+    .map_err(|e| format!("统计加载失败: {e}"))??
 }
 
 #[tauri::command]
@@ -14373,6 +14737,9 @@ mod tests {
             status,
             enabled,
             fusion_enabled: false,
+            auto_disable_override: false,
+            auto_disable_enabled: true,
+            auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -14404,6 +14771,9 @@ mod tests {
             status,
             enabled,
             fusion_enabled: false,
+            auto_disable_override: false,
+            auto_disable_enabled: true,
+            auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -14454,6 +14824,11 @@ mod tests {
         assert_eq!(
             router.gpt56_long_context_window,
             DEFAULT_GPT56_LONG_CONTEXT_WINDOW
+        );
+        assert!(router.auto_disable_enabled);
+        assert_eq!(
+            router.auto_disable_failure_threshold,
+            DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD
         );
     }
 
@@ -14613,6 +14988,93 @@ multi_agent = false
         for _ in 0..32 {
             assert!((5..=10).contains(&selected_slow_delay_secs(&router)));
         }
+    }
+
+    #[test]
+    fn auto_disable_policy_respects_global_and_provider_overrides() {
+        assert_eq!(
+            effective_auto_disable_policy(true, 3, false, false, 9),
+            (true, 3)
+        );
+        assert_eq!(
+            effective_auto_disable_policy(true, 3, true, false, 9),
+            (false, 9)
+        );
+        assert_eq!(
+            effective_auto_disable_policy(false, 3, true, true, 2),
+            (true, 2)
+        );
+        assert!(!should_auto_disable(false, 99, 1));
+        assert!(!should_auto_disable(true, 2, 3));
+        assert!(should_auto_disable(true, 3, 3));
+        assert!(should_auto_disable(true, 100, 0));
+        assert_eq!(normalize_auto_disable_failure_threshold(0), 1);
+        assert_eq!(
+            normalize_auto_disable_failure_threshold(u32::MAX),
+            MAX_AUTO_DISABLE_FAILURE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn disabling_auto_disable_reenables_auto_disabled_providers_but_overrides_win() {
+        let mut state = default_state();
+        state.router.auto_disable_enabled = false;
+        state
+            .providers
+            .push(test_provider_config("auto", ProviderStatus::Enabled, true));
+        let cycle = provider_cycle_now(
+            state.providers[0].auto_disable_reset_period,
+            state.providers[0].auto_disable_reset_weekday,
+            state.providers[0].auto_disable_reset_day,
+            &state.providers[0].auto_disable_reset_time,
+        );
+        let provider = &mut state.providers[0];
+        provider.status = ProviderStatus::AutoDisabled;
+        provider.enabled = false;
+        provider.consecutive_failure_count = 3;
+        provider.auto_disabled_day = Some(cycle.clone());
+        let normalized = normalize_state(state);
+        assert_eq!(normalized.providers[0].status, ProviderStatus::Enabled);
+        assert_eq!(normalized.providers[0].consecutive_failure_count, 0);
+
+        let mut state = default_state();
+        state.router.auto_disable_enabled = false;
+        state.providers.push(test_provider_config(
+            "override",
+            ProviderStatus::Enabled,
+            true,
+        ));
+        let provider = &mut state.providers[0];
+        provider.status = ProviderStatus::AutoDisabled;
+        provider.enabled = false;
+        provider.auto_disable_override = true;
+        provider.auto_disable_enabled = true;
+        provider.auto_disable_failure_threshold = 2;
+        provider.consecutive_failure_count = 2;
+        provider.auto_disabled_day = Some(cycle);
+        let normalized = normalize_state(state);
+        assert_eq!(normalized.providers[0].status, ProviderStatus::AutoDisabled);
+        assert_eq!(normalized.providers[0].consecutive_failure_count, 2);
+    }
+
+    #[test]
+    fn provider_auto_disable_fields_default_when_loading_old_state() {
+        let provider = test_provider_config("old", ProviderStatus::Enabled, true);
+        let mut value = serde_json::to_value(provider).unwrap();
+        for key in [
+            "auto_disable_override",
+            "auto_disable_enabled",
+            "auto_disable_failure_threshold",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        let restored: ProviderConfig = serde_json::from_value(value).unwrap();
+        assert!(!restored.auto_disable_override);
+        assert!(restored.auto_disable_enabled);
+        assert_eq!(
+            restored.auto_disable_failure_threshold,
+            DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD
+        );
     }
 
     #[test]
@@ -14869,7 +15331,7 @@ multi_agent = false
     #[test]
     fn keeps_auto_disabled_provider_for_current_day() {
         let mut provider = test_provider_config("provider-a", ProviderStatus::AutoDisabled, false);
-        provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD;
+        provider.consecutive_failure_count = DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD;
         provider.auto_disabled_day = Some(provider_cycle_now(
             AutoDisableResetPeriod::Daily,
             DEFAULT_AUTO_DISABLE_RESET_WEEKDAY,
@@ -14887,7 +15349,7 @@ multi_agent = false
         assert!(!normalized.providers[0].enabled);
         assert_eq!(
             normalized.providers[0].consecutive_failure_count,
-            AUTO_DISABLE_FAILURE_THRESHOLD
+            DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD
         );
     }
 
@@ -14974,7 +15436,7 @@ multi_agent = false
     #[test]
     fn keeps_enabled_provider_failure_sequence_across_normalization() {
         let mut provider = test_provider_config("provider-a", ProviderStatus::Enabled, true);
-        provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD - 1;
+        provider.consecutive_failure_count = DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD - 1;
         provider.last_failure_reason = Some("upstream failed".to_string());
         provider.last_failure_at_ms = Some(1);
         let mut state = default_state();
@@ -14986,7 +15448,7 @@ multi_agent = false
         assert!(normalized.providers[0].enabled);
         assert_eq!(
             normalized.providers[0].consecutive_failure_count,
-            AUTO_DISABLE_FAILURE_THRESHOLD - 1
+            DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD - 1
         );
         assert_eq!(
             normalized.providers[0].last_failure_reason.as_deref(),
@@ -14997,7 +15459,7 @@ multi_agent = false
     #[test]
     fn recovers_auto_disabled_provider_after_provider_day_changes() {
         let mut provider = test_provider_config("provider-a", ProviderStatus::AutoDisabled, false);
-        provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD;
+        provider.consecutive_failure_count = DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD;
         provider.auto_disabled_day = Some("1900-01-01".to_string());
         provider.last_failure_reason = Some("upstream failed".to_string());
         provider.last_failure_at_ms = Some(1);
@@ -15017,7 +15479,7 @@ multi_agent = false
     fn never_reset_provider_stays_auto_disabled() {
         let mut provider = test_provider_config("provider-a", ProviderStatus::AutoDisabled, false);
         provider.auto_disable_reset_period = AutoDisableResetPeriod::Never;
-        provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD;
+        provider.consecutive_failure_count = DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD;
         provider.auto_disabled_day = Some("1900-01-01".to_string());
         provider.last_failure_reason = Some("upstream failed".to_string());
         provider.last_failure_at_ms = Some(1);
@@ -15030,14 +15492,14 @@ multi_agent = false
         assert!(!normalized.providers[0].enabled);
         assert_eq!(
             normalized.providers[0].consecutive_failure_count,
-            AUTO_DISABLE_FAILURE_THRESHOLD
+            DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD
         );
     }
 
     #[test]
     fn provider_success_clears_auto_disabled_state() {
         let mut provider = test_provider_config("provider-a", ProviderStatus::AutoDisabled, false);
-        provider.consecutive_failure_count = AUTO_DISABLE_FAILURE_THRESHOLD;
+        provider.consecutive_failure_count = DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD;
         provider.auto_disabled_day = Some(provider_cycle_now(
             AutoDisableResetPeriod::Daily,
             DEFAULT_AUTO_DISABLE_RESET_WEEKDAY,
@@ -15787,6 +16249,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             status: ProviderStatus::Enabled,
             enabled: true,
             fusion_enabled: false,
+            auto_disable_override: false,
+            auto_disable_enabled: true,
+            auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16298,7 +16763,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
 
     #[test]
     fn route_log_cache_tracks_append_partial_lines_rotation_and_deletion() {
-        let dir = std::env::temp_dir().join(format!("xxswitch-log-cache-{}", new_provider_id().unwrap()));
+        let dir =
+            std::env::temp_dir().join(format!("xxswitch-log-cache-{}", new_provider_id().unwrap()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("logs.jsonl");
         let mut first = route_log_for_stats_test("success", "a");
@@ -16361,7 +16827,15 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         let page = start.elapsed();
         let start = Instant::now();
         let _stats = build_route_usage_stats(&cache.logs, RouteLogFilter::default()).unwrap();
-        eprintln!("rows={} cold={:?} warm_refresh={:?} page={:?} stats={:?} page_rows={}", cache.logs.len(), cold, refreshed, page, start.elapsed(), response.logs.len());
+        eprintln!(
+            "rows={} cold={:?} warm_refresh={:?} page={:?} stats={:?} page_rows={}",
+            cache.logs.len(),
+            cold,
+            refreshed,
+            page,
+            start.elapsed(),
+            response.logs.len()
+        );
     }
 
     #[test]
@@ -16412,6 +16886,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             status: ProviderStatus::Enabled,
             enabled: true,
             fusion_enabled: false,
+            auto_disable_override: false,
+            auto_disable_enabled: true,
+            auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16601,6 +17078,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             status: ProviderStatus::Enabled,
             enabled: true,
             fusion_enabled: false,
+            auto_disable_override: false,
+            auto_disable_enabled: true,
+            auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16739,6 +17219,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     status: ProviderStatus::Enabled,
                     enabled: true,
                     fusion_enabled: false,
+                    auto_disable_override: false,
+                    auto_disable_enabled: true,
+                    auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
                     consecutive_failure_count: 0,
                     auto_disabled_day: None,
                     auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16772,6 +17255,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     status: ProviderStatus::Enabled,
                     enabled: true,
                     fusion_enabled: false,
+                    auto_disable_override: false,
+                    auto_disable_enabled: true,
+                    auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
                     consecutive_failure_count: 0,
                     auto_disabled_day: None,
                     auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16846,6 +17332,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             status: ProviderStatus::Enabled,
             enabled: true,
             fusion_enabled: false,
+            auto_disable_override: false,
+            auto_disable_enabled: true,
+            auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -16887,6 +17376,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             status: ProviderStatus::Enabled,
             enabled: true,
             fusion_enabled: false,
+            auto_disable_override: false,
+            auto_disable_enabled: true,
+            auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -17199,7 +17691,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                         body["reasoning_effort"] = json!(effort);
                         body["logprobs"] = json!(true);
                     }
-                    let normalized = gpt6_compatible_request_body(body.to_string().as_bytes(), path);
+                    let normalized =
+                        gpt6_compatible_request_body(body.to_string().as_bytes(), path);
                     let value: Value = serde_json::from_slice(&normalized).unwrap();
                     let effort_path = if path == "responses" {
                         "/reasoning/effort"
@@ -17230,8 +17723,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             }
         }
         for model in ["gpt-5.6-sol", "gpt-6-solar", "gpt-6-lunatic"] {
-            let body = json!({"model": model, "temperature": 1, "reasoning": {"effort": "minimal"}})
-                .to_string();
+            let body =
+                json!({"model": model, "temperature": 1, "reasoning": {"effort": "minimal"}})
+                    .to_string();
             assert_eq!(
                 gpt6_compatible_request_body(body.as_bytes(), "responses").as_ref(),
                 body.as_bytes()
@@ -17274,7 +17768,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     assert!(converted.unwrap_err().contains("GPT-6 Sol/Luna"));
                 }
                 body.as_object_mut().unwrap().remove("tools");
-                assert!(responses_provider_requirement(body.to_string().as_bytes(), model).is_none());
+                assert!(
+                    responses_provider_requirement(body.to_string().as_bytes(), model).is_none()
+                );
             }
         }
     }
@@ -18039,6 +18535,9 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             status: ProviderStatus::Enabled,
             enabled: true,
             fusion_enabled: false,
+            auto_disable_override: false,
+            auto_disable_enabled: true,
+            auto_disable_failure_threshold: DEFAULT_AUTO_DISABLE_FAILURE_THRESHOLD,
             consecutive_failure_count: 0,
             auto_disabled_day: None,
             auto_disable_reset_period: AutoDisableResetPeriod::Daily,
@@ -18208,21 +18707,48 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
+    #[ignore = "requires network access to the production catalog"]
+    fn remote_capability_service_round_trip() {
+        capability_service_round_trip(model_catalog::URL);
+    }
+
+    #[test]
     #[ignore = "requires npm run catalog:serve"]
     fn local_capability_service_round_trip() {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let bytes = runtime.block_on(model_catalog::download(model_catalog::URL)).unwrap();
-        let path = std::env::temp_dir().join(format!("xxswitch-service-test-{}", std::process::id())).join("capability-catalog.json");
+        capability_service_round_trip("http://127.0.0.1:18081/catalog.json");
+    }
+
+    fn capability_service_round_trip(url: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let bytes = runtime.block_on(model_catalog::download(url)).unwrap();
+        let path = std::env::temp_dir()
+            .join(format!("xxswitch-service-test-{}", std::process::id()))
+            .join("capability-catalog.json");
         model_catalog::save(&path, &bytes).unwrap();
         let catalog = model_catalog::load(&path).unwrap();
         let id = fusion_model_id("test-ds", "deepseek-v4-pro");
-        let mut merged = merge_capability_catalog(&catalog, vec!["gpt-6-astra".into(), id.clone(), "unknown-model".into()]);
+        let mut merged = merge_capability_catalog(
+            &catalog,
+            vec!["gpt-6-astra".into(), id.clone(), "unknown-model".into()],
+        );
         decorate_fusion_catalog(&mut merged, [("test-ds", "DeepSeek 测试")].into_iter());
         assert_eq!(merged["models"].as_array().unwrap().len(), 3);
         assert_eq!(merged["models"][1]["slug"], id);
-        assert!(merged["models"][1]["display_name"].as_str().unwrap().contains("DeepSeek 测试"));
-        assert_eq!(merged["models"][1]["base_instructions"], catalog.select("deepseek-v4-pro")["base_instructions"]);
-        assert_eq!(merged["models"][2]["context_window"], catalog.default["context_window"]);
+        assert!(merged["models"][1]["display_name"]
+            .as_str()
+            .unwrap()
+            .contains("DeepSeek 测试"));
+        assert_eq!(
+            merged["models"][1]["base_instructions"],
+            catalog.select("deepseek-v4-pro")["base_instructions"]
+        );
+        assert_eq!(
+            merged["models"][2]["context_window"],
+            catalog.default["context_window"]
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -18231,20 +18757,35 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         let mut provider = test_provider_config("1", ProviderStatus::Enabled, true);
         provider.fusion_enabled = true;
         provider.allowed_models = vec!["gpt-6-astra".into(), "vendor/model".into()];
-        assert_eq!(fusion_model_id("1", "gpt-6-astra"), "xxswitch-31/gpt-6-astra");
+        assert_eq!(
+            fusion_model_id("1", "gpt-6-astra"),
+            "xxswitch-31/gpt-6-astra"
+        );
         for id in ["xxswitch-31/gpt-6-astra", "xxswitch-claude-31--gpt-6-astra"] {
             assert!(provider_accepts_model(&provider, id));
-            assert_eq!(mapped_model_for_provider(&provider, id).as_deref(), Some("gpt-6-astra"));
+            assert_eq!(
+                mapped_model_for_provider(&provider, id).as_deref(),
+                Some("gpt-6-astra")
+            );
             assert!(supports_gpt_long_context(id));
             let mut catalog = json!({"models":[{"slug":id,"display_name":"GPT-6 Astra"}]});
             decorate_fusion_catalog(&mut catalog, [("1", "Xxcd")].into_iter());
             assert_eq!(catalog["models"][0]["display_name"], "GPT-6 Astra（Xxcd）");
         }
-        assert_eq!(fusion_model_parts("xxswitch-31/vendor/model"), Some(("31", "vendor/model")));
-        assert!(!provider_accepts_model(&provider, "xxswitch-32/gpt-6-astra"));
+        assert_eq!(
+            fusion_model_parts("xxswitch-31/vendor/model"),
+            Some(("31", "vendor/model"))
+        );
+        assert!(!provider_accepts_model(
+            &provider,
+            "xxswitch-32/gpt-6-astra"
+        ));
         assert!(!provider_accepts_model(&provider, "xxswitch-31/"));
         provider.fusion_enabled = false;
-        assert!(!provider_accepts_model(&provider, "xxswitch-claude-31--gpt-6-astra"));
+        assert!(!provider_accepts_model(
+            &provider,
+            "xxswitch-claude-31--gpt-6-astra"
+        ));
     }
 
     #[test]
@@ -18255,22 +18796,28 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
         let decoded = decoded_proxy_request_body(true, &headers, &original).unwrap();
         assert_eq!(model_from_request_body(&decoded), "xxswitch-31/gpt-6-astra");
-        let unchanged = forwarded_request_body(false, &headers, &original, &decoded, &decoded).unwrap();
+        let unchanged =
+            forwarded_request_body(false, &headers, &original, &decoded, &decoded).unwrap();
         assert_eq!(unchanged.body.as_ref(), original.as_slice());
         assert_eq!(unchanged.encoding, Some("zstd"));
-        let prepared = body_with_provider_overrides(&decoded, Some("gpt-6-astra"), Some("priority"));
-        let changed = forwarded_request_body(false, &headers, &original, &decoded, &prepared).unwrap();
+        let prepared =
+            body_with_provider_overrides(&decoded, Some("gpt-6-astra"), Some("priority"));
+        let changed =
+            forwarded_request_body(false, &headers, &original, &decoded, &prepared).unwrap();
         assert_eq!(changed.encoding, Some("zstd"));
         let upstream = zstd::stream::decode_all(changed.body.as_ref()).unwrap();
         assert_eq!(upstream, prepared);
         assert_eq!(model_from_request_body(&upstream), "gpt-6-astra");
-        let expanded = forwarded_request_body(true, &headers, &original, &decoded, &prepared).unwrap();
+        let expanded =
+            forwarded_request_body(true, &headers, &original, &decoded, &prepared).unwrap();
         assert_eq!(expanded.encoding, None);
         assert_eq!(expanded.body, prepared);
         let plain = forwarded_request_body(false, &HeaderMap::new(), raw, raw, raw).unwrap();
         assert_eq!(plain.encoding, None);
         assert_eq!(plain.body.as_ref(), raw);
-        let detected = forwarded_request_body(false, &HeaderMap::new(), &original, &decoded, &decoded).unwrap();
+        let detected =
+            forwarded_request_body(false, &HeaderMap::new(), &original, &decoded, &decoded)
+                .unwrap();
         assert_eq!(detected.encoding, Some("zstd"));
         assert!(decoded_proxy_request_body(true, &headers, b"broken frame").is_err());
     }
@@ -18293,14 +18840,25 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert!(provider_accepts_model(&provider, &requested));
         let ordinary = test_provider_config("ordinary", ProviderStatus::Enabled, true);
         assert!(!provider_accepts_model(&ordinary, &requested));
-        let prepared = prepare_upstream_request(&provider, "responses", "", &decoded, &requested).unwrap();
+        let prepared =
+            prepare_upstream_request(&provider, "responses", "", &decoded, &requested).unwrap();
         let forwarded: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(forwarded["model"], "gpt-6-astra");
     }
 
     #[test]
     fn long_context_matches_numeric_gpt_versions_including_fusion() {
-        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6.1", "gpt-5.7", "gpt-5.10-mini", "gpt-6", "gpt-6.1-sol", "gpt-10", "GPT-6-ASTRA"] {
+        for model in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6.1",
+            "gpt-5.7",
+            "gpt-5.10-mini",
+            "gpt-6",
+            "gpt-6.1-sol",
+            "gpt-10",
+            "GPT-6-ASTRA",
+        ] {
             for slug in [model.to_string(), fusion_model_id("provider", model)] {
                 assert!(supports_gpt_long_context(&slug), "{slug}");
                 let mut row = json!({"slug":slug,"context_window":272000,"max_context_window":272000,"auto_compact_token_limit":240000});
@@ -18310,9 +18868,24 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 assert!(row["auto_compact_token_limit"].is_null());
             }
         }
-        for model in ["gpt-5.5", "gpt-5.2", "gpt-5", "gpt-4o", "deepseek-v4-pro", "gpt-6x", "gpt-5.", "gpt-5..6", "gpt-5.6x", "gpt-", "gpt-reserve"] {
+        for model in [
+            "gpt-5.5",
+            "gpt-5.2",
+            "gpt-5",
+            "gpt-4o",
+            "deepseek-v4-pro",
+            "gpt-6x",
+            "gpt-5.",
+            "gpt-5..6",
+            "gpt-5.6x",
+            "gpt-",
+            "gpt-reserve",
+        ] {
             assert!(!supports_gpt_long_context(model), "{model}");
-            assert!(!supports_gpt_long_context(&fusion_model_id("p", model)), "{model}");
+            assert!(
+                !supports_gpt_long_context(&fusion_model_id("p", model)),
+                "{model}"
+            );
             let mut row = json!({"slug":model,"context_window":272000});
             let original = row.clone();
             apply_codex_long_context(&mut row, true, 512000);
@@ -18326,19 +18899,32 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     #[test]
     fn remote_updates_preserve_explicit_context_for_plain_and_fusion_models() {
         let mut catalog = model_catalog::bundled();
-        let models = vec!["gpt-6-astra".into(), fusion_model_id("provider", "gpt-6-astra"), "deepseek-v4-pro".into()];
+        let models = vec![
+            "gpt-6-astra".into(),
+            fusion_model_id("provider", "gpt-6-astra"),
+            "deepseek-v4-pro".into(),
+        ];
         for remote_window in [272000, 300000] {
-            let row = catalog.openai.iter_mut().find(|r| r["slug"] == "gpt-6-astra").unwrap();
+            let row = catalog
+                .openai
+                .iter_mut()
+                .find(|r| r["slug"] == "gpt-6-astra")
+                .unwrap();
             row["context_window"] = json!(remote_window);
             row["max_context_window"] = json!(remote_window);
-            let merged = merge_capability_catalog_with_context(&catalog, models.clone(), true, 512000);
+            let merged =
+                merge_capability_catalog_with_context(&catalog, models.clone(), true, 512000);
             for row in &merged["models"].as_array().unwrap()[..2] {
                 assert_eq!(row["context_window"], 512000);
                 assert_eq!(row["max_context_window"], 512000);
                 assert!(row["auto_compact_token_limit"].is_null());
             }
-            assert_eq!(merged["models"][2]["context_window"], catalog.select("deepseek-v4-pro")["context_window"]);
-            let unmodified = merge_capability_catalog_with_context(&catalog, models.clone(), false, 512000);
+            assert_eq!(
+                merged["models"][2]["context_window"],
+                catalog.select("deepseek-v4-pro")["context_window"]
+            );
+            let unmodified =
+                merge_capability_catalog_with_context(&catalog, models.clone(), false, 512000);
             assert_eq!(unmodified["models"][0]["context_window"], remote_window);
         }
     }
@@ -18348,7 +18934,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         let mut catalog = model_catalog::bundled();
         let model = catalog.openai[0]["slug"].as_str().unwrap().to_string();
         catalog.openai[0]["context_window"] = json!(123456);
-        let first = merge_capability_catalog(&catalog, vec![fusion_model_id("a", &model), fusion_model_id("b", &model)]);
+        let first = merge_capability_catalog(
+            &catalog,
+            vec![fusion_model_id("a", &model), fusion_model_id("b", &model)],
+        );
         assert_eq!(first["models"][0]["context_window"], 123456);
         assert_eq!(first["models"][1]["context_window"], 123456);
         assert_ne!(first["models"][0]["slug"], first["models"][1]["slug"]);
@@ -18368,7 +18957,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         assert!(!provider_accepts_model(&ordinary, &id));
         assert!(!provider_accepts_model(&fused, "gpt-5.5"));
         assert!(!provider_accepts_model(&fused, "未知模型"));
-        assert!(!provider_accepts_model(&fused, &fusion_model_id(&fused.id, "未知模型")));
+        assert!(!provider_accepts_model(
+            &fused,
+            &fusion_model_id(&fused.id, "未知模型")
+        ));
         assert!(provider_accepts_model(&ordinary, "gpt-5.5"));
         assert!(!provider_accepts_model(
             &fused,
@@ -18397,7 +18989,8 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
         let body = serde_json::to_vec(&json!({"model":id,"input":"hello"})).unwrap();
         for wire_api in [ProviderWireApi::Responses, ProviderWireApi::ChatCompletions] {
             provider.wire_api = wire_api;
-            let prepared = prepare_upstream_request(&provider, "responses", "", &body, &id).unwrap();
+            let prepared =
+                prepare_upstream_request(&provider, "responses", "", &body, &id).unwrap();
             let upstream: Value = serde_json::from_slice(&prepared.body).unwrap();
             assert_eq!(upstream["model"], "actual-model");
         }

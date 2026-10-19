@@ -65,6 +65,8 @@ type RouterConfig = {
   zstd_decompression_enabled: boolean;
   gpt56_long_context_enabled: boolean;
   gpt56_long_context_window: number;
+  auto_disable_enabled: boolean;
+  auto_disable_failure_threshold: number;
   model_provider: string;
   codex_model: string;
   host: string;
@@ -172,6 +174,9 @@ type ProviderConfig = {
   status: ProviderStatus;
   enabled: boolean;
   fusion_enabled: boolean;
+  auto_disable_override: boolean;
+  auto_disable_enabled: boolean;
+  auto_disable_failure_threshold: number;
   consecutive_failure_count: number;
   auto_disabled_day?: string | null;
   auto_disable_reset_period: AutoDisableResetPeriod;
@@ -197,6 +202,9 @@ type ClaudeProviderConfig = {
   status: ProviderStatus;
   enabled: boolean;
   fusion_enabled: boolean;
+  auto_disable_override: boolean;
+  auto_disable_enabled: boolean;
+  auto_disable_failure_threshold: number;
   consecutive_failure_count: number;
   auto_disabled_day?: string | null;
   auto_disable_reset_period: AutoDisableResetPeriod;
@@ -218,6 +226,9 @@ type ProviderSummary = {
   name: string;
   status: ProviderStatus;
   enabled: boolean;
+  auto_disable_override: boolean;
+  auto_disable_enabled: boolean;
+  auto_disable_failure_threshold: number;
   consecutive_failure_count: number;
   auto_disabled_day?: string | null;
   auto_disable_reset_period: AutoDisableResetPeriod;
@@ -480,6 +491,7 @@ const ROUTER_TIMEOUT_LIMITS = {
 } as const;
 const MAX_SLOW_DELAY_SECS = 3600;
 const DEFAULT_GPT56_LONG_CONTEXT_WINDOW = 372_000;
+const MAX_AUTO_DISABLE_FAILURE_THRESHOLD = 100;
 
 function defaultBalanceQuery(endpoint = ""): BalanceQueryConfig {
   return {
@@ -505,6 +517,8 @@ function defaultRouterConfig(): RouterConfig {
     zstd_decompression_enabled: true,
     gpt56_long_context_enabled: false,
     gpt56_long_context_window: DEFAULT_GPT56_LONG_CONTEXT_WINDOW,
+    auto_disable_enabled: true,
+    auto_disable_failure_threshold: 3,
     model_provider: "custom",
     codex_model: "",
     host: "127.0.0.1",
@@ -584,6 +598,18 @@ function routerTimeoutError(router: RouterConfig) {
   }
   if (router.response_header_timeout_secs > router.stream_idle_timeout_secs) {
     return "流空闲超时不能小于响应头超时。";
+  }
+  return "";
+}
+
+function autoDisableThresholdError(enabled: boolean, threshold: number) {
+  if (!enabled) return "";
+  if (
+    !Number.isInteger(threshold) ||
+    threshold < 1 ||
+    threshold > MAX_AUTO_DISABLE_FAILURE_THRESHOLD
+  ) {
+    return `连续失败次数必须是 1 到 ${MAX_AUTO_DISABLE_FAILURE_THRESHOLD} 之间的整数。`;
   }
   return "";
 }
@@ -1438,6 +1464,9 @@ function App() {
   const [providerAutoDisableResetWeekday, setProviderAutoDisableResetWeekday] = useState(1);
   const [providerAutoDisableResetDay, setProviderAutoDisableResetDay] = useState(1);
   const [providerAutoDisableResetTime, setProviderAutoDisableResetTime] = useState("00:00");
+  const [providerAutoDisableOverride, setProviderAutoDisableOverride] = useState(false);
+  const [providerAutoDisableEnabled, setProviderAutoDisableEnabled] = useState(true);
+  const [providerAutoDisableFailureThreshold, setProviderAutoDisableFailureThreshold] = useState(3);
   const [providerWireApi, setProviderWireApi] = useState<ProviderWireApi>("responses");
   const [providerServiceTier, setProviderServiceTier] = useState<ProviderServiceTier>("");
   const [providerTestModel, setProviderTestModel] = useState("");
@@ -1669,6 +1698,13 @@ function App() {
     setProviderAutoDisableResetWeekday(targetFull.auto_disable_reset_weekday ?? summary?.auto_disable_reset_weekday ?? 1);
     setProviderAutoDisableResetDay(targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1);
     setProviderAutoDisableResetTime(targetFull.auto_disable_reset_time ?? summary?.auto_disable_reset_time ?? "00:00");
+    setProviderAutoDisableOverride(targetFull.auto_disable_override ?? false);
+    setProviderAutoDisableEnabled(targetFull.auto_disable_enabled ?? appState?.router.auto_disable_enabled ?? true);
+    setProviderAutoDisableFailureThreshold(
+      targetFull.auto_disable_failure_threshold ??
+        appState?.router.auto_disable_failure_threshold ??
+        3,
+    );
     setProviderWireApi(targetFull.wire_api ?? "responses");
     const serviceTier = targetFull.service_tier?.trim().toLowerCase();
     setProviderServiceTier(
@@ -1711,6 +1747,13 @@ function App() {
     setProviderAutoDisableResetWeekday(targetFull.auto_disable_reset_weekday ?? summary?.auto_disable_reset_weekday ?? 1);
     setProviderAutoDisableResetDay(targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1);
     setProviderAutoDisableResetTime(targetFull.auto_disable_reset_time ?? summary?.auto_disable_reset_time ?? "00:00");
+    setProviderAutoDisableOverride(targetFull.auto_disable_override ?? false);
+    setProviderAutoDisableEnabled(targetFull.auto_disable_enabled ?? appState?.router.auto_disable_enabled ?? true);
+    setProviderAutoDisableFailureThreshold(
+      targetFull.auto_disable_failure_threshold ??
+        appState?.router.auto_disable_failure_threshold ??
+        3,
+    );
     setProviderTestModel(targetFull.connection_test_model ?? "");
     setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
     setAllowedModels(targetFull.allowed_models ?? []);
@@ -1791,6 +1834,11 @@ function App() {
   async function saveProvider() {
     if (!editingId) return;
     await run(async () => {
+      const thresholdError = autoDisableThresholdError(
+        providerAutoDisableOverride && providerAutoDisableEnabled,
+        providerAutoDisableFailureThreshold,
+      );
+      if (thresholdError) throw new Error(thresholdError);
       if (modelListCleared && allowedModels.length === 0) {
         throw new Error("模型列表已清空，请重新获取或手动添加模型后保存；如需停止使用供应商，请将其停用。");
       }
@@ -1809,6 +1857,9 @@ function App() {
         auto_disable_reset_weekday: providerAutoDisableResetWeekday,
         auto_disable_reset_day: providerAutoDisableResetDay,
         auto_disable_reset_time: providerAutoDisableResetTime,
+        auto_disable_override: providerAutoDisableOverride,
+        auto_disable_enabled: providerAutoDisableEnabled,
+        auto_disable_failure_threshold: providerAutoDisableFailureThreshold,
         balance_query: nextBalance,
         balance_status: balanceTestStatus,
         connection_test_model: providerTestModel,
@@ -1833,6 +1884,11 @@ function App() {
   async function saveClaudeProvider() {
     if (!editingId) return;
     await run(async () => {
+      const thresholdError = autoDisableThresholdError(
+        providerAutoDisableOverride && providerAutoDisableEnabled,
+        providerAutoDisableFailureThreshold,
+      );
+      if (thresholdError) throw new Error(thresholdError);
       if (modelListCleared && allowedModels.length === 0) {
         throw new Error("模型列表已清空，请重新获取或手动添加模型后保存；如需停止使用供应商，请将其停用。");
       }
@@ -1843,6 +1899,9 @@ function App() {
         auto_disable_reset_weekday: providerAutoDisableResetWeekday,
         auto_disable_reset_day: providerAutoDisableResetDay,
         auto_disable_reset_time: providerAutoDisableResetTime,
+        auto_disable_override: providerAutoDisableOverride,
+        auto_disable_enabled: providerAutoDisableEnabled,
+        auto_disable_failure_threshold: providerAutoDisableFailureThreshold,
         base_url: providerBaseUrl,
         connection_test_model: providerTestModel,
         allowed_models: allowedModels,
@@ -2732,6 +2791,11 @@ function App() {
           providerAutoDisableResetWeekday={providerAutoDisableResetWeekday}
           providerAutoDisableResetDay={providerAutoDisableResetDay}
           providerAutoDisableResetTime={providerAutoDisableResetTime}
+          providerAutoDisableOverride={providerAutoDisableOverride}
+          providerAutoDisableEnabled={providerAutoDisableEnabled}
+          providerAutoDisableFailureThreshold={providerAutoDisableFailureThreshold}
+          globalAutoDisableEnabled={appState.router.auto_disable_enabled}
+          globalAutoDisableFailureThreshold={appState.router.auto_disable_failure_threshold}
           providerServiceTier={providerServiceTier}
           providerWireApi={providerWireApi}
           secretVisible={secretVisible}
@@ -2757,6 +2821,9 @@ function App() {
           setProviderAutoDisableResetWeekday={setProviderAutoDisableResetWeekday}
           setProviderAutoDisableResetDay={setProviderAutoDisableResetDay}
           setProviderAutoDisableResetTime={setProviderAutoDisableResetTime}
+          setProviderAutoDisableOverride={setProviderAutoDisableOverride}
+          setProviderAutoDisableEnabled={setProviderAutoDisableEnabled}
+          setProviderAutoDisableFailureThreshold={setProviderAutoDisableFailureThreshold}
           setProviderServiceTier={setProviderServiceTier}
           setProviderWireApi={setProviderWireApi}
           setSecretVisible={setSecretVisible}
@@ -2788,6 +2855,11 @@ function App() {
           providerAutoDisableResetWeekday={providerAutoDisableResetWeekday}
           providerAutoDisableResetDay={providerAutoDisableResetDay}
           providerAutoDisableResetTime={providerAutoDisableResetTime}
+          providerAutoDisableOverride={providerAutoDisableOverride}
+          providerAutoDisableEnabled={providerAutoDisableEnabled}
+          providerAutoDisableFailureThreshold={providerAutoDisableFailureThreshold}
+          globalAutoDisableEnabled={appState.router.auto_disable_enabled}
+          globalAutoDisableFailureThreshold={appState.router.auto_disable_failure_threshold}
           secretVisible={secretVisible}
           setAllowedModels={setAllowedModels}
           setModelMappings={setModelMappings}
@@ -2808,6 +2880,9 @@ function App() {
           setProviderAutoDisableResetWeekday={setProviderAutoDisableResetWeekday}
           setProviderAutoDisableResetDay={setProviderAutoDisableResetDay}
           setProviderAutoDisableResetTime={setProviderAutoDisableResetTime}
+          setProviderAutoDisableOverride={setProviderAutoDisableOverride}
+          setProviderAutoDisableEnabled={setProviderAutoDisableEnabled}
+          setProviderAutoDisableFailureThreshold={setProviderAutoDisableFailureThreshold}
           setSecretVisible={setSecretVisible}
         />
       )}
@@ -2832,12 +2907,17 @@ function LocalProxySettings({
 }) {
   const timeoutError = routerTimeoutError(routerDraft);
   const slowModeError = routerSlowModeError(routerDraft);
+  const autoDisableError = autoDisableThresholdError(
+    routerDraft.auto_disable_enabled,
+    routerDraft.auto_disable_failure_threshold,
+  );
   const endpointError = routerDraft.enabled && !routerDraft.host.trim()
     ? "监听地址不能为空。"
     : routerDraft.enabled && (!Number.isInteger(routerDraft.port) || routerDraft.port < 1 || routerDraft.port > 65_535)
       ? "监听端口必须是 1 到 65535 之间的整数。"
       : "";
-  const proxySettingsValid = !endpointError && !timeoutError && !slowModeError;
+  const proxySettingsValid =
+    !endpointError && !timeoutError && !slowModeError && !autoDisableError;
   const updateTimeout = (
     field: "connect_timeout_secs" | "response_header_timeout_secs" | "stream_idle_timeout_secs",
     rawValue: string,
@@ -3029,6 +3109,40 @@ function LocalProxySettings({
         ) : null}
         {slowModeError ? <small>{slowModeError}</small> : null}
       </div>
+
+      <div className="route-toggle-line">
+        <div>
+          <strong>自动禁用供应商</strong>
+          <p>连续失败达到次数后停用供应商，并按供应商的刷新周期自动恢复。供应商可单独覆盖此策略。</p>
+        </div>
+        <Toggle
+          checked={routerDraft.auto_disable_enabled}
+          disabled={busy}
+          onChange={(auto_disable_enabled) =>
+            setRouterDraft({ ...routerDraft, auto_disable_enabled })
+          }
+        />
+      </div>
+      {routerDraft.auto_disable_enabled ? (
+        <label className="compact-field">
+          <span>连续失败次数</span>
+          <input
+            aria-invalid={Boolean(autoDisableError)}
+            max={MAX_AUTO_DISABLE_FAILURE_THRESHOLD}
+            min={1}
+            step={1}
+            type="number"
+            value={routerDraft.auto_disable_failure_threshold}
+            onChange={(event) =>
+              setRouterDraft({
+                ...routerDraft,
+                auto_disable_failure_threshold: Number(event.currentTarget.value),
+              })
+            }
+          />
+          {autoDisableError ? <small>{autoDisableError}</small> : null}
+        </label>
+      ) : null}
 
       <div className="route-toggle-line debug-mode-toggle">
         <div>
@@ -5058,6 +5172,84 @@ function AutoDisableResetFields(props: {
   );
 }
 
+function AutoDisablePolicyFields(props: {
+  override: boolean;
+  enabled: boolean;
+  threshold: number;
+  globalEnabled: boolean;
+  globalThreshold: number;
+  setOverride: (value: boolean) => void;
+  setEnabled: (value: boolean) => void;
+  setThreshold: (value: number) => void;
+}) {
+  const {
+    override,
+    enabled,
+    threshold,
+    globalEnabled,
+    globalThreshold,
+    setOverride,
+    setEnabled,
+    setThreshold,
+  } = props;
+  const thresholdError = autoDisableThresholdError(override && enabled, threshold);
+  return (
+    <section className="auto-disable-policy">
+      <label className="field">
+        <span>自动禁用策略</span>
+        <select
+          value={override ? "custom" : "global"}
+          onChange={(event) => {
+            const custom = event.currentTarget.value === "custom";
+            setOverride(custom);
+            if (custom && !override) {
+              setEnabled(globalEnabled);
+              setThreshold(globalThreshold);
+            }
+          }}
+        >
+          <option value="global">继承全局设置</option>
+          <option value="custom">单独设置</option>
+        </select>
+        <small>
+          全局：{globalEnabled ? `连续失败 ${globalThreshold} 次后禁用` : "已关闭自动禁用"}
+        </small>
+      </label>
+      {override ? (
+        <>
+          <div className="route-toggle-line">
+            <div>
+              <strong>启用自动禁用</strong>
+              <p>连续失败达到次数后停用此供应商。</p>
+            </div>
+            <Toggle
+              checked={enabled}
+              onChange={setEnabled}
+              label="启用此供应商的自动禁用"
+            />
+          </div>
+          <label className="field">
+            <span>连续失败次数</span>
+            <input
+              aria-invalid={Boolean(thresholdError)}
+              disabled={!enabled}
+              max={MAX_AUTO_DISABLE_FAILURE_THRESHOLD}
+              min={1}
+              step={1}
+              type="number"
+              value={threshold}
+              onChange={(event) =>
+                setThreshold(Number(event.currentTarget.value))
+              }
+            />
+            {thresholdError ? <small className="danger-text">{thresholdError}</small> : null}
+          </label>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
 function ProviderEditor(props: {
   modelListCleared: boolean;
   onClearModels: () => void;
@@ -5086,6 +5278,11 @@ function ProviderEditor(props: {
   providerAutoDisableResetWeekday: number;
   providerAutoDisableResetDay: number;
   providerAutoDisableResetTime: string;
+  providerAutoDisableOverride: boolean;
+  providerAutoDisableEnabled: boolean;
+  providerAutoDisableFailureThreshold: number;
+  globalAutoDisableEnabled: boolean;
+  globalAutoDisableFailureThreshold: number;
   providerServiceTier: ProviderServiceTier;
   providerWireApi: ProviderWireApi;
   secretVisible: boolean;
@@ -5099,6 +5296,9 @@ function ProviderEditor(props: {
   setProviderAutoDisableResetWeekday: (value: number) => void;
   setProviderAutoDisableResetDay: (value: number) => void;
   setProviderAutoDisableResetTime: (value: string) => void;
+  setProviderAutoDisableOverride: (value: boolean) => void;
+  setProviderAutoDisableEnabled: (value: boolean) => void;
+  setProviderAutoDisableFailureThreshold: (value: number) => void;
   setProviderServiceTier: (value: ProviderServiceTier) => void;
   setProviderWireApi: (value: ProviderWireApi) => void;
   setSecretVisible: (value: boolean) => void;
@@ -5132,6 +5332,11 @@ function ProviderEditor(props: {
     providerAutoDisableResetWeekday,
     providerAutoDisableResetDay,
     providerAutoDisableResetTime,
+    providerAutoDisableOverride,
+    providerAutoDisableEnabled,
+    providerAutoDisableFailureThreshold,
+    globalAutoDisableEnabled,
+    globalAutoDisableFailureThreshold,
     providerServiceTier,
     providerWireApi,
     secretVisible,
@@ -5145,6 +5350,9 @@ function ProviderEditor(props: {
     setProviderAutoDisableResetWeekday,
     setProviderAutoDisableResetDay,
     setProviderAutoDisableResetTime,
+    setProviderAutoDisableOverride,
+    setProviderAutoDisableEnabled,
+    setProviderAutoDisableFailureThreshold,
     setProviderServiceTier,
     setProviderWireApi,
     setSecretVisible,
@@ -5243,6 +5451,16 @@ function ProviderEditor(props: {
                 }} /> 融合模式</span>
                 <small>选定的模型将显示供应商名称，并仅发往此供应商。普通模型请求不会使用此供应商。请在模型配置中选择要发布的模型；Codex 需重启以刷新列表。</small>
               </label>
+              <AutoDisablePolicyFields
+                override={providerAutoDisableOverride}
+                enabled={providerAutoDisableEnabled}
+                threshold={providerAutoDisableFailureThreshold}
+                globalEnabled={globalAutoDisableEnabled}
+                globalThreshold={globalAutoDisableFailureThreshold}
+                setOverride={setProviderAutoDisableOverride}
+                setEnabled={setProviderAutoDisableEnabled}
+                setThreshold={setProviderAutoDisableFailureThreshold}
+              />
               <AutoDisableResetFields
                 period={providerAutoDisableResetPeriod}
                 resetDay={providerAutoDisableResetDay}
@@ -5628,6 +5846,11 @@ function ClaudeProviderEditor(props: {
   providerAutoDisableResetWeekday: number;
   providerAutoDisableResetDay: number;
   providerAutoDisableResetTime: string;
+  providerAutoDisableOverride: boolean;
+  providerAutoDisableEnabled: boolean;
+  providerAutoDisableFailureThreshold: number;
+  globalAutoDisableEnabled: boolean;
+  globalAutoDisableFailureThreshold: number;
   secretVisible: boolean;
   setAllowedModels: (models: string[]) => void;
   setModelMappings: (mappings: ModelMapping[]) => void;
@@ -5639,6 +5862,9 @@ function ClaudeProviderEditor(props: {
   setProviderAutoDisableResetWeekday: (value: number) => void;
   setProviderAutoDisableResetDay: (value: number) => void;
   setProviderAutoDisableResetTime: (value: string) => void;
+  setProviderAutoDisableOverride: (value: boolean) => void;
+  setProviderAutoDisableEnabled: (value: boolean) => void;
+  setProviderAutoDisableFailureThreshold: (value: number) => void;
   setSecretVisible: (value: boolean) => void;
 }) {
   const {
@@ -5661,6 +5887,11 @@ function ClaudeProviderEditor(props: {
     providerAutoDisableResetWeekday,
     providerAutoDisableResetDay,
     providerAutoDisableResetTime,
+    providerAutoDisableOverride,
+    providerAutoDisableEnabled,
+    providerAutoDisableFailureThreshold,
+    globalAutoDisableEnabled,
+    globalAutoDisableFailureThreshold,
     secretVisible,
     setAllowedModels,
     setModelMappings,
@@ -5672,6 +5903,9 @@ function ClaudeProviderEditor(props: {
     setProviderAutoDisableResetWeekday,
     setProviderAutoDisableResetDay,
     setProviderAutoDisableResetTime,
+    setProviderAutoDisableOverride,
+    setProviderAutoDisableEnabled,
+    setProviderAutoDisableFailureThreshold,
     setSecretVisible,
   } = props;
   const [customAllowedModel, setCustomAllowedModel] = useState("");
@@ -5748,6 +5982,16 @@ function ClaudeProviderEditor(props: {
             }} /> 融合模式</span>
             <small>选定的模型将显示供应商名称，并仅发往此供应商。普通模型请求不会使用此供应商。请在模型配置中选择要发布的模型。</small>
           </label>
+          <AutoDisablePolicyFields
+            override={providerAutoDisableOverride}
+            enabled={providerAutoDisableEnabled}
+            threshold={providerAutoDisableFailureThreshold}
+            globalEnabled={globalAutoDisableEnabled}
+            globalThreshold={globalAutoDisableFailureThreshold}
+            setOverride={setProviderAutoDisableOverride}
+            setEnabled={setProviderAutoDisableEnabled}
+            setThreshold={setProviderAutoDisableFailureThreshold}
+          />
           <AutoDisableResetFields
             period={providerAutoDisableResetPeriod}
             resetDay={providerAutoDisableResetDay}

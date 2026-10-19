@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs, path::Path, time::Duration};
 
-pub const URL: &str = "http://127.0.0.1:18081/catalog.json";
+pub const URL: &str = "https://models.xxcd.top/catalog.json";
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
