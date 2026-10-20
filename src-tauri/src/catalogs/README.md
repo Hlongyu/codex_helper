@@ -1,6 +1,8 @@
 # Codex 模型目录
 
-- `codex-models.json`：CLI `0.153.4` 的 bundled 目录，由 `pnpm catalog:update` 更新。
+这里是旧目录实现的测试快照，当前运行时和发布服务使用 `model-catalog/catalog.json`。请使用 `pnpm catalog:update --version YYYY-MM-DD.N` 更新生效目录，详见 `model-catalog/README.md`。下述内容仅记录旧快照的来源与行为。
+
+- `codex-models.json`：CLI `0.153.4` 的 bundled 目录，历史更新脚本为 `node scripts/update-codex-bundled-catalog.mjs`。
 - `codex-models-gpt6.json`：2026-09-23 使用官方 CLI `0.156.0` 的 `debug models` 刷新后，提取的 `gpt-6-sol`、`gpt-6-luna` 原始 capability 条目，包含各自完整提示词。该版本的 `debug models --bundled` 尚未包含这两个模型。
 
 运行时先选择合格的外部 bundled 目录或内置目录，再补充缺少的 Sol/Luna 条目；同名外部条目优先。这里的补充只提供模型能力，实际可路由模型仍取决于服务商配置。

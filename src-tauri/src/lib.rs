@@ -18930,6 +18930,42 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
     }
 
     #[test]
+    fn gpt61_sol_uses_official_capabilities_for_plain_and_fusion_models() {
+        let catalog = model_catalog::bundled();
+        let official = catalog
+            .openai
+            .iter()
+            .find(|row| row["slug"] == "gpt-6.1-sol")
+            .expect("bundled catalog must include the official GPT-6.1 Sol profile");
+        assert_eq!(official["default_reasoning_level"], "low");
+        let efforts: Vec<_> = official["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|level| level["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(efforts, ["low", "medium", "high", "xhigh", "max", "ultra"]);
+        assert_eq!(
+            official["base_instructions"],
+            official["model_messages"]["instructions_template"]
+        );
+        assert_ne!(
+            official["base_instructions"],
+            catalog.default["base_instructions"]
+        );
+        let models = vec!["gpt-6.1-sol".into(), fusion_model_id("31", "gpt-6.1-sol")];
+        let merged = merge_capability_catalog(&catalog, models.clone());
+        for (index, model) in models.iter().enumerate() {
+            let mut expected = official.clone();
+            expected["slug"] = json!(model);
+            expected["priority"] = json!(index + 1);
+            expected["visibility"] = json!("list");
+            expected["supported_in_api"] = json!(true);
+            assert_eq!(merged["models"][index], expected);
+        }
+    }
+
+    #[test]
     fn remote_catalog_merge_preserves_capabilities_and_reloads_updates() {
         let mut catalog = model_catalog::bundled();
         let model = catalog.openai[0]["slug"].as_str().unwrap().to_string();
