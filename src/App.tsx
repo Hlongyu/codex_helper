@@ -2,6 +2,7 @@ import { type PointerEvent, useEffect, useId, useMemo, useRef, useState } from "
 import { invoke } from "@tauri-apps/api/core";
 import brandMark from "../output/icons/codex-helper-mark-transparent.png";
 import "./App.css";
+import { ProviderImport } from "./ProviderImport";
 
 type JsonValue =
   | string
@@ -2712,6 +2713,11 @@ function App() {
           </section>
         )}
       </section>
+
+      <ProviderImport onImported={async () => {
+        // Preserve unsaved route and provider drafts while updating the saved list.
+        setAppState(await callCommand<AppState>("load_app_state"));
+      }} />
 
       {pendingScreen && (
         <div

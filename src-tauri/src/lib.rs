@@ -1,4 +1,5 @@
 mod model_catalog;
+mod provider_import;
 
 use axum::{
     body::{Body, Bytes},
@@ -13814,23 +13815,10 @@ fn preview_provider(
     build_app_state(state, &router_runtime)
 }
 
-#[tauri::command]
-fn add_provider(
-    name: String,
-    router_runtime: tauri::State<RouterRuntime>,
-) -> Result<AppState, String> {
-    let mut state = load_state_file()?;
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("供应商名称不能为空".to_string());
-    }
-
-    let id = new_provider_id()?;
-
-    state.active_provider_id = id.clone();
-    state.providers.push(ProviderConfig {
-        id: id.clone(),
-        name: trimmed.to_string(),
+fn new_codex_provider(id: String, name: String) -> Result<ProviderConfig, String> {
+    Ok(ProviderConfig {
+        id,
+        name,
         status: ProviderStatus::Enabled,
         enabled: true,
         fusion_enabled: false,
@@ -13856,7 +13844,26 @@ fn add_provider(
         config: toml_text_to_json(
             "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"\"\nexperimental_bearer_token = \"\"\n",
         )?,
-    });
+    })
+}
+
+#[tauri::command]
+fn add_provider(
+    name: String,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("供应商名称不能为空".to_string());
+    }
+
+    let id = new_provider_id()?;
+
+    state.active_provider_id = id.clone();
+    state
+        .providers
+        .push(new_codex_provider(id.clone(), trimmed.to_string())?);
 
     save_state(&state)?;
     build_app_state(state, &router_runtime)
@@ -13874,23 +13881,10 @@ fn save_base_template(
     build_app_state(state, &router_runtime)
 }
 
-#[tauri::command]
-fn add_claude_provider(
-    name: String,
-    router_runtime: tauri::State<RouterRuntime>,
-) -> Result<AppState, String> {
-    let mut state = load_state_file()?;
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("Claude 供应商名称不能为空".to_string());
-    }
-
-    let id = new_provider_id()?;
-
-    state.active_claude_provider_id = id.clone();
-    state.claude_providers.push(ClaudeProviderConfig {
-        id: id.clone(),
-        name: trimmed.to_string(),
+fn new_claude_provider(id: String, name: String) -> Result<ClaudeProviderConfig, String> {
+    Ok(ClaudeProviderConfig {
+        id,
+        name,
         status: ProviderStatus::Enabled,
         enabled: true,
         fusion_enabled: false,
@@ -13911,7 +13905,26 @@ fn add_claude_provider(
         allowed_models: Vec::new(),
         model_mappings: Vec::new(),
         connection_status: None,
-    });
+    })
+}
+
+#[tauri::command]
+fn add_claude_provider(
+    name: String,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
+    let mut state = load_state_file()?;
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Claude 供应商名称不能为空".to_string());
+    }
+
+    let id = new_provider_id()?;
+
+    state.active_claude_provider_id = id.clone();
+    state
+        .claude_providers
+        .push(new_claude_provider(id.clone(), trimmed.to_string())?);
 
     save_state(&state)?;
     build_app_state(state, &router_runtime)
@@ -14609,6 +14622,11 @@ fn launched_from_autostart() -> bool {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(provider_import::ImportInbox::default())
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_ARG]),
@@ -14664,6 +14682,7 @@ pub fn run() {
             if let Err(err) = ensure_router(&router_runtime, &state.router) {
                 eprintln!("本地路由启动失败: {err}");
             }
+            provider_import::setup(app.handle())?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -14677,6 +14696,9 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            provider_import::peek_provider_import,
+            provider_import::dismiss_provider_import,
+            provider_import::confirm_provider_import,
             load_app_state,
             get_autostart_enabled,
             set_autostart_enabled,

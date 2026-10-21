@@ -83,6 +83,12 @@ Claude 供应商使用 Claude-compatible 消息协议，也支持从上游获取
 
 模型测试位于供应商列表外层，不属于基础配置。测试默认内容为 `hi`，可切换同步或流式消息，并显示上游回复结果。
 
+## 从 new-api 一键导入供应商
+
+支持 `xxswitch://v1/import` 链接导入 Codex 和 Claude 供应商。点击网页上的“导出到 XXSwitch”后，应用会显示配置摘要和脱敏后的 API Key，确认后新增到供应商列表。默认以停用状态保存，可在确认窗口勾选启用；已有供应商不会被覆盖。
+
+站点只需按协议生成包含名称、Base URL、API Key 和接口格式的链接，无需新增 ticket 后端接口。字段约定、按钮代码和安装验证步骤见 [new-api 接入指南](docs/integrations/new-api-provider-import.md)。
+
 ## 调用记录
 
 XXSwitch 仅记录经过本地路由的生成调用，模型列表等非生成请求不会进入调用统计。记录内容包括：

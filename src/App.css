@@ -4394,3 +4394,32 @@ button.danger,
   align-items: center;
   gap: 8px;
 }
+
+
+.provider-import-dialog {
+  margin: auto;
+  padding: 0;
+  color: var(--text);
+}
+
+.provider-import-dialog:not([open]) { display: none; }
+.provider-import-dialog::backdrop {
+  background: rgba(20, 27, 24, 0.38);
+  backdrop-filter: blur(3px);
+}
+.provider-import-dialog h2 { margin: 0; font-size: 20px; }
+.provider-import-dialog header p { margin: 8px 0 0; color: var(--text-secondary); }
+.provider-import-details {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 14px 16px;
+  margin: 0;
+  font-size: 14px;
+}
+.provider-import-details dt { color: var(--text-secondary); }
+.provider-import-details dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.provider-import-enable { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.provider-import-enable input { width: 16px; height: 16px; accent-color: var(--accent-strong); }
+.provider-import-hint { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.7; }
+.provider-import-warning { margin: 0; color: #9b6413; font-size: 13px; line-height: 1.7; }
+.provider-import-error { margin: 0; color: #c44040; overflow-wrap: anywhere; }
