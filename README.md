@@ -79,6 +79,8 @@ XXSwitch 只维护自己的 `xxswitch` provider 及其模型列表，不覆盖�
 
 Codex 供应商的基础配置包含名称、Base URL、API Key、接口协议和 Fast 模式。模型配置与连接参数分开：可从上游获取或手动添加模型，再选择需要参与路由的模型；未限制启用模型时，该供应商兼容任意请求模型。
 
+在 Codex 供应商的“基础配置”中可开启“图片 detail 兼容：original → auto”。该开关默认关闭，仅对当前供应商生效；开启后会在转发 Responses（含远程压缩）和 Chat Completions 请求时，将图片内容块的 `detail: "original"` 转为 `"auto"`，以兼容仅接受 `auto`、`low`、`high` 的上游。其他图片精度和请求字段保持不变。
+
 Claude 供应商使用 Claude-compatible 消息协议，也支持从上游获取模型、启用模型和模型映射。Fast 模式仅适用于 Codex 供应商。
 
 模型测试位于供应商列表外层，不属于基础配置。测试默认内容为 `hi`，可切换同步或流式消息，并显示上游回复结果。

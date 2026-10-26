@@ -133,6 +133,8 @@ struct ProviderConfig {
     #[serde(default)]
     wire_api: ProviderWireApi,
     #[serde(default)]
+    image_detail_original_to_auto: bool,
+    #[serde(default)]
     service_tier: String,
     #[serde(default)]
     connection_test_model: String,
@@ -841,6 +843,7 @@ struct SaveProviderPayload {
     allowed_models: Option<Vec<String>>,
     model_mappings: Option<Vec<ModelMapping>>,
     wire_api: Option<ProviderWireApi>,
+    image_detail_original_to_auto: Option<bool>,
     service_tier: Option<String>,
     enabled: Option<bool>,
     auto_disable_reset_period: Option<AutoDisableResetPeriod>,
@@ -7908,6 +7911,50 @@ fn provider_service_tier_for_path<'a>(provider: &'a ProviderConfig, path: &str) 
         .then_some(service_tier)
 }
 
+// Only visit protocol content arrays, never tool schemas or arbitrary user JSON.
+fn image_detail_compatible_request_body(body: &[u8], path: &str) -> Bytes {
+    let input_key = match path.trim_matches('/') {
+        "responses" | "responses/compact" => "input",
+        "chat/completions" => "messages",
+        _ => return Bytes::copy_from_slice(body),
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return Bytes::copy_from_slice(body);
+    };
+    let Some(items) = value.get_mut(input_key).and_then(Value::as_array_mut) else {
+        return Bytes::copy_from_slice(body);
+    };
+    let mut changed = false;
+    for item in items {
+        for key in ["content", "output"] {
+            let Some(parts) = item.get_mut(key).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for part in parts {
+                let detail = match part.get("type").and_then(Value::as_str) {
+                    Some("input_image") => part.get_mut("detail"),
+                    Some("image_url") => part
+                        .get_mut("image_url")
+                        .and_then(|image| image.get_mut("detail")),
+                    _ => None,
+                };
+                if let Some(detail) = detail {
+                    if detail.as_str() == Some("original") {
+                        *detail = Value::String("auto".to_string());
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    if !changed {
+        return Bytes::copy_from_slice(body);
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| Bytes::copy_from_slice(body))
+}
+
 fn prepare_upstream_request(
     provider: &ProviderConfig,
     path: &str,
@@ -7915,6 +7962,13 @@ fn prepare_upstream_request(
     body: &[u8],
     requested_model: &str,
 ) -> Result<PreparedUpstreamRequest, String> {
+    let compatible_body;
+    let body = if provider.image_detail_original_to_auto {
+        compatible_body = image_detail_compatible_request_body(body, path);
+        compatible_body.as_ref()
+    } else {
+        body
+    };
     let upstream_model = mapped_model_for_provider(provider, requested_model);
     let service_tier = provider_service_tier_for_path(provider, path);
     if provider.wire_api == ProviderWireApi::ChatCompletions
@@ -13483,6 +13537,9 @@ fn save_provider(
     if let Some(allowed_models) = payload.allowed_models {
         provider.allowed_models = normalize_model_names(allowed_models);
     }
+    if let Some(enabled) = payload.image_detail_original_to_auto {
+        provider.image_detail_original_to_auto = enabled;
+    }
     if let Some(wire_api) = payload.wire_api {
         provider.wire_api = wire_api;
     }
@@ -13834,6 +13891,7 @@ fn new_codex_provider(id: String, name: String) -> Result<ProviderConfig, String
         last_failure_reason: None,
         last_failure_at_ms: None,
         wire_api: ProviderWireApi::Responses,
+        image_detail_original_to_auto: false,
         service_tier: String::new(),
         connection_test_model: String::new(),
         allowed_models: Vec::new(),
@@ -14772,6 +14830,7 @@ mod tests {
             last_failure_at_ms: None,
             config: json!({}),
             wire_api: ProviderWireApi::Responses,
+            image_detail_original_to_auto: false,
             service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: Vec::new(),
@@ -16929,6 +16988,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                 }
             }),
             wire_api: ProviderWireApi::Responses,
+            image_detail_original_to_auto: false,
             service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: Vec::new(),
@@ -17113,6 +17173,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             last_failure_at_ms: None,
             config: json!({}),
             wire_api: ProviderWireApi::Responses,
+            image_detail_original_to_auto: false,
             service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: vec!["gpt-5.5".to_string(), "gpt-5.4".to_string()],
@@ -17254,6 +17315,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     last_failure_at_ms: None,
                     config: json!({}),
                     wire_api: ProviderWireApi::Responses,
+                    image_detail_original_to_auto: false,
                     service_tier: String::new(),
                     connection_test_model: String::new(),
                     allowed_models: vec![
@@ -17290,6 +17352,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     last_failure_at_ms: None,
                     config: json!({}),
                     wire_api: ProviderWireApi::ChatCompletions,
+                    image_detail_original_to_auto: false,
                     service_tier: String::new(),
                     connection_test_model: String::new(),
                     allowed_models: vec!["GPT-5.4".to_string(), "gpt-5.3".to_string()],
@@ -17367,6 +17430,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             last_failure_at_ms: None,
             config: json!({}),
             wire_api: ProviderWireApi::ChatCompletions,
+            image_detail_original_to_auto: false,
             service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: vec!["gpt-5.2".to_string()],
@@ -17411,6 +17475,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             last_failure_at_ms: None,
             config: json!({}),
             wire_api: ProviderWireApi::Responses,
+            image_detail_original_to_auto: false,
             service_tier: "priority".to_string(),
             connection_test_model: String::new(),
             allowed_models: Vec::new(),
@@ -19413,6 +19478,169 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             assert_eq!(entry["base_instructions"], "bundled prompt");
             assert_eq!(entry["input_modalities"], json!(["text", "image"]));
             assert_eq!(entry["supports_image_detail_original"], true);
+        }
+    }
+
+    #[test]
+    fn image_detail_compatibility_defaults_off_and_persists() {
+        let mut provider = test_provider_config("images", ProviderStatus::Enabled, true);
+        let mut old = serde_json::to_value(&provider).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("image_detail_original_to_auto");
+        let loaded: ProviderConfig = serde_json::from_value(old).unwrap();
+        assert!(!loaded.image_detail_original_to_auto);
+        provider.image_detail_original_to_auto = true;
+        let loaded: ProviderConfig =
+            serde_json::from_slice(&serde_json::to_vec(&provider).unwrap()).unwrap();
+        assert!(loaded.image_detail_original_to_auto);
+        let payload: SaveProviderPayload = serde_json::from_value(json!({
+            "provider_id": "images", "config_toml": "", "image_detail_original_to_auto": true
+        }))
+        .unwrap();
+        assert_eq!(payload.image_detail_original_to_auto, Some(true));
+        let payload: SaveProviderPayload = serde_json::from_value(json!({
+            "provider_id": "images", "config_toml": ""
+        }))
+        .unwrap();
+        assert_eq!(payload.image_detail_original_to_auto, None);
+    }
+
+    #[test]
+    fn image_detail_compatibility_is_scoped_to_each_provider_and_protocol() {
+        let mut provider = test_provider_config("images", ProviderStatus::Enabled, true);
+        let body = json!({
+            "model": "deepseek-flash",
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "original"},
+                {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8=", "detail": "original"}
+            ]}]
+        }).to_string();
+        let original = body.as_bytes();
+        for wire_api in [ProviderWireApi::Responses, ProviderWireApi::ChatCompletions] {
+            provider.wire_api = wire_api;
+            // Reusing the same inbound bytes mirrors retrying with another supplier.
+            for enabled in [false, true, false] {
+                provider.image_detail_original_to_auto = enabled;
+                let prepared = prepare_upstream_request(
+                    &provider,
+                    "responses",
+                    "",
+                    original,
+                    "deepseek-flash",
+                )
+                .unwrap();
+                let value: Value = serde_json::from_slice(&prepared.body).unwrap();
+                let detail = if wire_api == ProviderWireApi::Responses {
+                    &value["input"][0]["content"][1]["detail"]
+                } else {
+                    assert_eq!(prepared.path, "chat/completions");
+                    &value["messages"][0]["content"][1]["image_url"]["detail"]
+                };
+                assert_eq!(detail, if enabled { "auto" } else { "original" });
+                if !enabled && wire_api == ProviderWireApi::Responses {
+                    assert_eq!(prepared.body.as_ref(), original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_detail_compatibility_only_rewrites_image_content() {
+        let image = json!({"type": "input_image", "file_id": "file-1", "detail": "original"});
+        let body = json!({
+            "model": "test-model",
+            "detail": "original",
+            "metadata": image,
+            "tools": [{"type": "function", "parameters": image}],
+            "input": [
+                {"role": "user", "content": [
+                    image,
+                    {"type": "input_image", "detail": "auto"},
+                    {"type": "input_image", "detail": "low"},
+                    {"type": "input_image", "detail": "high"},
+                    {"type": "input_image"},
+                    {"type": "input_text", "text": "original", "detail": "original"}
+                ]},
+                {"type": "function_call_output", "output": [image]},
+                {"type": "custom_tool_call_output", "output": [image]},
+                {"type": "function_call_output", "output": image.to_string()}
+            ]
+        });
+        let mut expected = body.clone();
+        expected["input"][0]["content"][0]["detail"] = json!("auto");
+        expected["input"][1]["output"][0]["detail"] = json!("auto");
+        expected["input"][2]["output"][0]["detail"] = json!("auto");
+        let mut provider = test_provider_config("images", ProviderStatus::Enabled, true);
+        provider.image_detail_original_to_auto = true;
+        for path in ["responses", "responses/compact"] {
+            let prepared = prepare_upstream_request(
+                &provider,
+                path,
+                "",
+                body.to_string().as_bytes(),
+                "test-model",
+            )
+            .unwrap();
+            let value: Value = serde_json::from_slice(&prepared.body).unwrap();
+            assert_eq!(value, expected);
+        }
+        for body in [
+            b"invalid JSON".as_slice(),
+            b"[]",
+            b"{ \"input\": \"original\" }",
+            b"{ \"input\": [{\"content\": [{\"type\": \"input_image\", \"detail\": \"high\"}]}] }",
+        ] {
+            assert_eq!(
+                image_detail_compatible_request_body(body, "responses").as_ref(),
+                body
+            );
+        }
+        let body = body.to_string();
+        assert_eq!(
+            image_detail_compatible_request_body(body.as_bytes(), "other").as_ref(),
+            body.as_bytes()
+        );
+    }
+
+    #[test]
+    fn image_detail_compatibility_handles_compressed_chat_requests() {
+        let mut provider = test_provider_config("images", ProviderStatus::Enabled, true);
+        provider.image_detail_original_to_auto = true;
+        let body = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png", "detail": "original"}},
+                {"type": "text", "text": "original"}
+            ]}]
+        });
+        let encoded =
+            zstd::stream::encode_all(Cursor::new(body.to_string().as_bytes()), 3).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        let decoded = decoded_proxy_request_body(true, &headers, &encoded).unwrap();
+        let prepared =
+            prepare_upstream_request(&provider, "chat/completions", "", &decoded, "test-model")
+                .unwrap();
+        let mut expected = body;
+        expected["messages"][0]["content"][0]["image_url"]["detail"] = json!("auto");
+        for send_uncompressed in [false, true] {
+            let forwarded = forwarded_request_body(
+                send_uncompressed,
+                &headers,
+                &encoded,
+                &decoded,
+                &prepared.body,
+            )
+            .unwrap();
+            let bytes = if send_uncompressed {
+                assert_eq!(forwarded.encoding, None);
+                forwarded.body.to_vec()
+            } else {
+                assert_eq!(forwarded.encoding, Some("zstd"));
+                zstd::stream::decode_all(Cursor::new(forwarded.body)).unwrap()
+            };
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
         }
     }
 

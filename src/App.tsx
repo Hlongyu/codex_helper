@@ -188,6 +188,7 @@ type ProviderConfig = {
   last_failure_at_ms?: number | null;
   config: JsonValue;
   wire_api: ProviderWireApi;
+  image_detail_original_to_auto: boolean;
   service_tier: string;
   connection_test_model: string;
   allowed_models: string[];
@@ -1469,6 +1470,7 @@ function App() {
   const [providerAutoDisableEnabled, setProviderAutoDisableEnabled] = useState(true);
   const [providerAutoDisableFailureThreshold, setProviderAutoDisableFailureThreshold] = useState(3);
   const [providerWireApi, setProviderWireApi] = useState<ProviderWireApi>("responses");
+  const [providerImageDetailOriginalToAuto, setProviderImageDetailOriginalToAuto] = useState(false);
   const [providerServiceTier, setProviderServiceTier] = useState<ProviderServiceTier>("");
   const [providerTestModel, setProviderTestModel] = useState("");
   const [providerModels, setProviderModels] = useState<string[]>([]);
@@ -1707,6 +1709,7 @@ function App() {
         3,
     );
     setProviderWireApi(targetFull.wire_api ?? "responses");
+    setProviderImageDetailOriginalToAuto(targetFull.image_detail_original_to_auto ?? false);
     const serviceTier = targetFull.service_tier?.trim().toLowerCase();
     setProviderServiceTier(
       serviceTier === "priority" || serviceTier === "fast"
@@ -1853,6 +1856,7 @@ function App() {
         config_toml: "",
         base_url: providerBaseUrl,
         wire_api: providerWireApi,
+        image_detail_original_to_auto: providerImageDetailOriginalToAuto,
         service_tier: providerServiceTier,
         auto_disable_reset_period: providerAutoDisableResetPeriod,
         auto_disable_reset_weekday: providerAutoDisableResetWeekday,
@@ -2804,6 +2808,7 @@ function App() {
           globalAutoDisableFailureThreshold={appState.router.auto_disable_failure_threshold}
           providerServiceTier={providerServiceTier}
           providerWireApi={providerWireApi}
+          providerImageDetailOriginalToAuto={providerImageDetailOriginalToAuto}
           secretVisible={secretVisible}
           setProviderApiKey={(value) => {
             setProviderApiKey(value);
@@ -2832,6 +2837,7 @@ function App() {
           setProviderAutoDisableFailureThreshold={setProviderAutoDisableFailureThreshold}
           setProviderServiceTier={setProviderServiceTier}
           setProviderWireApi={setProviderWireApi}
+          setProviderImageDetailOriginalToAuto={setProviderImageDetailOriginalToAuto}
           setSecretVisible={setSecretVisible}
           tab={editorTab}
         />
@@ -5291,6 +5297,7 @@ function ProviderEditor(props: {
   globalAutoDisableFailureThreshold: number;
   providerServiceTier: ProviderServiceTier;
   providerWireApi: ProviderWireApi;
+  providerImageDetailOriginalToAuto: boolean;
   secretVisible: boolean;
   setAllowedModels: (models: string[]) => void;
   setProviderApiKey: (value: string) => void;
@@ -5307,6 +5314,7 @@ function ProviderEditor(props: {
   setProviderAutoDisableFailureThreshold: (value: number) => void;
   setProviderServiceTier: (value: ProviderServiceTier) => void;
   setProviderWireApi: (value: ProviderWireApi) => void;
+  setProviderImageDetailOriginalToAuto: (value: boolean) => void;
   setSecretVisible: (value: boolean) => void;
   tab: EditorTab;
 }) {
@@ -5345,6 +5353,7 @@ function ProviderEditor(props: {
     globalAutoDisableFailureThreshold,
     providerServiceTier,
     providerWireApi,
+    providerImageDetailOriginalToAuto,
     secretVisible,
     setAllowedModels,
     setProviderApiKey,
@@ -5361,6 +5370,7 @@ function ProviderEditor(props: {
     setProviderAutoDisableFailureThreshold,
     setProviderServiceTier,
     setProviderWireApi,
+    setProviderImageDetailOriginalToAuto,
     setSecretVisible,
     tab,
   } = props;
@@ -5448,6 +5458,14 @@ function ProviderEditor(props: {
                   <option value="chat_completions">Chat Completions 兼容</option>
                 </select>
                 <small>上游不支持 Responses API 时选择 Chat Completions 兼容模式</small>
+              </label>
+              <label className="field">
+                <span className="fusion-toggle"><input
+                  type="checkbox"
+                  checked={providerImageDetailOriginalToAuto}
+                  onChange={(event) => setProviderImageDetailOriginalToAuto(event.currentTarget.checked)}
+                /> 图片 detail 兼容：original → auto</span>
+                <small>仅对当前供应商生效。上游不支持 original 图片精度时开启，发送前将其转换为 auto；默认关闭。</small>
               </label>
               <label className="field">
                 <span className="fusion-toggle"><input type="checkbox" checked={fusionEnabled} onChange={(event) => {
