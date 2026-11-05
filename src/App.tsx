@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import brandMark from "../output/icons/codex-helper-mark-transparent.png";
 import "./App.css";
 import { ProviderImport } from "./ProviderImport";
+import { ProviderSync } from "./ProviderSync";
 
 type JsonValue =
   | string
@@ -2610,6 +2611,9 @@ function App() {
 
         {screen === "settings" && (
           <section className="settings-grid">
+            <ProviderSync onDownloaded={async () => {
+              setAppState(await callCommand<AppState>("load_app_state"));
+            }} />
             <LocalProxySettings
               appState={appState}
               busy={busy}

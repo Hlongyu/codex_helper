@@ -1,5 +1,6 @@
 mod model_catalog;
 mod provider_import;
+mod provider_sync;
 
 use axum::{
     body::{Body, Bytes},
@@ -595,6 +596,8 @@ struct RouterStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManagerState {
+    #[serde(skip)]
+    revision: provider_sync::StateRevision,
     active_provider_id: String,
     #[serde(default)]
     applied_provider_id: Option<String>,
@@ -2907,6 +2910,7 @@ fn find_discovered_skill(
 
 fn default_state() -> ManagerState {
     ManagerState {
+        revision: provider_sync::StateRevision::default(),
         active_provider_id: String::new(),
         applied_provider_id: None,
         base_template_name: "默认模板".to_string(),
@@ -3219,8 +3223,9 @@ fn load_state_file() -> Result<ManagerState, String> {
     let state_value: Value =
         serde_json::from_str(&raw).map_err(|err| format!("状态文件 JSON 无效: {err}"))?;
     let clients_missing = state_value.get("clients").is_none();
-    let state: ManagerState = serde_json::from_value(state_value.clone())
+    let mut state: ManagerState = serde_json::from_value(state_value.clone())
         .map_err(|err| format!("状态文件 JSON 无效: {err}"))?;
+    state.revision = provider_sync::StateRevision::from_bytes(raw.as_bytes());
     let state = migrate_legacy_clients_if_missing(state, clients_missing);
 
     if is_legacy_seed_state(&state) {
@@ -3476,7 +3481,7 @@ fn save_state(state: &ManagerState) -> Result<(), String> {
     fs::create_dir_all(manager_dir()?).map_err(|err| format!("无法创建管理目录: {err}"))?;
     let raw =
         serde_json::to_string_pretty(state).map_err(|err| format!("无法序列化状态文件: {err}"))?;
-    fs::write(state_path()?, raw).map_err(|err| format!("无法写入状态文件: {err}"))
+    provider_sync::write_state_checked(&state_path()?, raw.as_bytes(), &state.revision)
 }
 
 fn active_provider(state: &ManagerState) -> Option<ProviderConfig> {
@@ -14741,6 +14746,7 @@ pub fn run() {
                 eprintln!("本地路由启动失败: {err}");
             }
             provider_import::setup(app.handle())?;
+            provider_sync::start_auto_upload();
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -14754,6 +14760,13 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            provider_sync::get_provider_sync,
+            provider_sync::save_provider_sync,
+            provider_sync::test_provider_sync,
+            provider_sync::preview_provider_sync,
+            provider_sync::cancel_provider_sync_preview,
+            provider_sync::upload_provider_sync,
+            provider_sync::download_provider_sync,
             provider_import::peek_provider_import,
             provider_import::dismiss_provider_import,
             provider_import::confirm_provider_import,

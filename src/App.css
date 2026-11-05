@@ -4423,3 +4423,14 @@ button.danger,
 .provider-import-hint { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.7; }
 .provider-import-warning { margin: 0; color: #9b6413; font-size: 13px; line-height: 1.7; }
 .provider-import-error { margin: 0; color: #c44040; overflow-wrap: anywhere; }
+.provider-sync-panel { grid-column: 1 / -1; }
+.provider-sync-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.provider-sync-url { grid-column: 1 / -1; }
+.provider-sync-note, .provider-sync-fields small { color: var(--text-secondary, #697586); font-size: 12px; line-height: 1.6; }
+.provider-sync-auto { display: flex; align-items: flex-start; gap: 10px; margin: 20px 0 12px; font-size: 13px; }
+.provider-sync-auto input { margin-top: 3px; }
+.provider-sync-auto small { display: block; margin-top: 4px; }
+.provider-sync-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.provider-sync-preview { margin-top: 20px; padding: 18px; border: 1px solid var(--border, #dbe2ea); border-radius: 10px; font-size: 13px; }
+.provider-sync-error { color: #b42318; font-size: 13px; overflow-wrap: anywhere; }
+.provider-sync-message { font-size: 13px; overflow-wrap: anywhere; }
