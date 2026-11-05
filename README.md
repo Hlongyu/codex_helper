@@ -11,6 +11,7 @@ XXSwitch 只记录实际经过本地路由的生成调用及其 Token、延迟�
 - **供应商云同步**：通过 WebDAV 上传、下载和自动上传供应商配置，支持远端冲突检测及下载前本地备份。
 - **模型配置**：从上游拉取模型，选择参与路由的模型，并配置客户端模型到上游模型的映射。
 - **协议兼容**：Codex 供应商可选择 Responses API 或 Chat Completions 兼容模式。
+- **WebSocket**：Codex 可通过 WS 接入本地路由，支持原生 Responses WS 上游，并兼容 HTTP 上游。
 - **Fast 模式**：Codex 供应商可强制使用 `service_tier: "priority"`。
 - **上下文接力**：可启用 Codex 实验性的 Token Budget，并使用内置 Notes/History 在上下文窗口之间接续任务。
 - **真实模型测速**：选择实际模型和同步或流式请求，使用自定义内容发起生成请求，并查看延迟与完整回复。
@@ -49,6 +50,22 @@ XXSwitch 只维护各客户端中由自己接管的字段，并在关闭接管�
 XXSwitch 将 `model_provider` 指向本地 `custom` provider，维护其 Base URL、本地访问令牌和名称，并根据设置同步 `features.remote_compaction_v2`。接管期间会合并设置 `http_headers = { "x-openai-actor-authorization" = "local-image-extension" }`，让当前 `custom` provider 暴露 Codex 内置 `image_gen`。同时，XXSwitch 只判断是否已配置 ChatGPT 登录态：已配置时设置 `requires_openai_auth = true`，未配置时设置为 `false`；不会检查凭据是否过期，也不会主动刷新或联网验证。用户可通过“强制不使用 OpenAI 登录态”将该字段固定为 `false`。该 header 只是自定义 provider 的能力标记，不是 ChatGPT 凭证；接管请求仍使用本地访问令牌并转发到当前供应商。关闭接管后会恢复这些字段的原值。
 
 启用“实验性上下文接力”时，XXSwitch 同步设置 `features.token_budget.enabled` 和 `features.token_budget.use_history_notes_extension`，具体提醒阈值、兜底缓冲和提示模板继续使用当前模型目录提供的默认值。该功能与远程压缩独立配置。
+
+### Codex WebSocket
+
+1. 在支持 Responses WebSocket 的供应商“基础配置”中打开“上游支持 WebSocket”。Base URL 继续填写原来的 HTTP(S) API 地址。
+2. 在“路由 → Codex”打开“启用 WebSocket”，保存后重启 Codex。XXSwitch 会管理当前 provider 的 `supports_websockets` 字段，关闭接管时恢复原值。两个开关均默认关闭。
+3. 可在该供应商的“模型测速”中选择“流式”验证 WS 握手和完整回复。WS 测试失败会显示错误，不会以 HTTP 测试成功代替；同步测试仍使用 HTTP。
+
+本地 WS 入口为 `ws://127.0.0.1:18080/v1/responses`，使用与 HTTP 相同的本地访问令牌。原生 WS 转发沿用供应商顺序、融合模型隔离、模型映射、Fast 模式、图片 detail 兼容和系统代理。每次 `response.create` 单独记录 Token、结果与耗时，Debug 模式保存消息快照；`generate: false` 预热不计入生成统计。
+
+原生 WS 在首条请求选择上游，随后复用该连接并固定供应商，保留 `previous_response_id` 的上游上下文。建立连接前可以故障切换；请求发出后断线会返回失败，不会自动重放生成请求或跨供应商续接。改变供应商或使用当前供应商不支持的模型时，需要重新连接。
+
+未开启 WS 的供应商走 HTTP 兼容链路。已开启 WS 的上游若在握手时返回 400、404、405、426 或 501，也会回退 HTTP。该连接之后通过 HTTP 处理 `response.create`，将 SSE 转成 WS 事件，并在内存中展开续接历史；支持 Chat Completions 兼容模式。同一 `stream_id` 的请求按顺序处理，不同 stream 可并行。实时控制事件需要原生 WS 上游，HTTP 兼容链路会明确返回不支持。
+
+HTTP 兼容链路仅缓存当前连接最近 8 个响应的上下文，总量不超过 64 MiB，断开即释放。引用未缓存的响应会返回 `previous_response_not_found`，客户端需清除该 ID 并发送完整上下文。单条 WS 消息上限为 64 MiB，每个连接最多接受 32 个待完成响应。普通 HTTP 请求和远程压缩继续使用原有接口。
+
+协议参考：[OpenAI Responses WebSocket 文档](https://developers.openai.com/api/docs/guides/websocket-mode)。
 
 ### 供应商融合模式
 

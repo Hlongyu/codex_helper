@@ -1,6 +1,7 @@
 mod model_catalog;
 mod provider_import;
 mod provider_sync;
+mod responses_websocket;
 
 use axum::{
     body::{Body, Bytes},
@@ -74,7 +75,7 @@ const EMBEDDED_CODEX_MODEL_CATALOG_VERSION: &str = "0.153.4";
 #[cfg(test)]
 const EMBEDDED_CODEX_MODEL_CATALOG_JSON: &str = include_str!("catalogs/codex-models.json");
 const CODEX_ROUTER_MODEL_CATALOG: &str = "config-manager/router-models.json";
-const ROUTER_BACKUP_SCHEMA_VERSION: u8 = 3;
+const ROUTER_BACKUP_SCHEMA_VERSION: u8 = 4;
 const PI_PROVIDER_ID: &str = "xxswitch";
 const LEGACY_PI_PROVIDER_ID: &str = "codex-helper";
 const PI_PROVIDER_API: &str = "openai-responses";
@@ -135,6 +136,8 @@ struct ProviderConfig {
     wire_api: ProviderWireApi,
     #[serde(default)]
     image_detail_original_to_auto: bool,
+    #[serde(default)]
+    supports_websockets: bool,
     #[serde(default)]
     service_tier: String,
     #[serde(default)]
@@ -368,6 +371,8 @@ struct RouterConfig {
     remote_compaction_enabled: bool,
     #[serde(default)]
     token_budget_enabled: bool,
+    #[serde(default)]
+    websockets_enabled: bool,
     #[serde(default = "default_true")]
     zstd_decompression_enabled: bool,
     #[serde(default)]
@@ -567,6 +572,7 @@ impl Default for RouterConfig {
             force_disable_openai_auth: false,
             remote_compaction_enabled: false,
             token_budget_enabled: false,
+            websockets_enabled: false,
             zstd_decompression_enabled: true,
             gpt56_long_context_enabled: false,
             gpt56_long_context_window: default_gpt56_long_context_window(),
@@ -651,6 +657,8 @@ struct RouterApplyBackup {
     custom_requires_openai_auth: RouterFieldBackup,
     #[serde(default)]
     custom_image_authorization: RouterFieldBackup,
+    #[serde(default)]
+    custom_supports_websockets: RouterFieldBackup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -847,6 +855,7 @@ struct SaveProviderPayload {
     model_mappings: Option<Vec<ModelMapping>>,
     wire_api: Option<ProviderWireApi>,
     image_detail_original_to_auto: Option<bool>,
+    supports_websockets: Option<bool>,
     service_tier: Option<String>,
     enabled: Option<bool>,
     auto_disable_reset_period: Option<AutoDisableResetPeriod>,
@@ -947,6 +956,8 @@ struct SaveRouterPayload {
     remote_compaction_enabled: bool,
     #[serde(default)]
     token_budget_enabled: bool,
+    #[serde(default)]
+    websockets_enabled: bool,
     #[serde(default = "default_true")]
     zstd_decompression_enabled: bool,
     #[serde(default)]
@@ -1667,6 +1678,7 @@ struct RouteStreamState {
     sse_buffer: String,
     usage: TokenUsage,
     terminal: Option<ResponsesStreamTerminal>,
+    require_terminal: bool,
     finished: bool,
 }
 
@@ -1947,7 +1959,14 @@ fn claude_home() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".claude"))
 }
 
+#[cfg(test)]
+tokio::task_local! { static TEST_MANAGER_DIR: PathBuf; }
+
 fn manager_dir() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Ok(path) = TEST_MANAGER_DIR.try_with(Clone::clone) {
+        return Ok(path);
+    }
     Ok(codex_home()?.join("config-manager"))
 }
 
@@ -5113,6 +5132,10 @@ async fn measure_codex_provider_latency(
     }
 
     let started = Instant::now();
+    if stream && provider.supports_websockets && provider.wire_api == ProviderWireApi::Responses {
+        return responses_websocket::measure_provider(provider, client, base_url, token, body)
+            .await;
+    }
     let response = client
         .post(join_url(&base_url, path))
         .bearer_auth(token.trim())
@@ -5610,7 +5633,7 @@ fn router_provider_path(provider_name: &str, field: &str) -> String {
     format!("model_providers.{provider_name}.{field}")
 }
 
-fn router_managed_paths(router: &RouterConfig) -> [String; 11] {
+fn router_managed_paths(router: &RouterConfig) -> [String; 12] {
     let provider_name = normalize_router_model_provider(&router.model_provider)
         .unwrap_or_else(|_| default_router_model_provider());
     [
@@ -5621,6 +5644,7 @@ fn router_managed_paths(router: &RouterConfig) -> [String; 11] {
         router_provider_path(&provider_name, "base_url"),
         router_provider_path(&provider_name, "experimental_bearer_token"),
         router_provider_path(&provider_name, "requires_openai_auth"),
+        router_provider_path(&provider_name, "supports_websockets"),
         router_provider_path(
             &provider_name,
             &format!("http_headers.{OPENAI_ACTOR_AUTHORIZATION_HEADER}"),
@@ -5656,6 +5680,10 @@ fn capture_router_backup(doc: &DocumentMut, provider_name: &str) -> RouterApplyB
         custom_token: capture_toml_field(
             doc,
             &router_provider_path(provider_name, "experimental_bearer_token"),
+        ),
+        custom_supports_websockets: capture_toml_field(
+            doc,
+            &router_provider_path(provider_name, "supports_websockets"),
         ),
         custom_requires_openai_auth: capture_toml_field(
             doc,
@@ -5720,6 +5748,13 @@ fn restore_router_backup(
             &router_provider_path(&provider_name, "experimental_bearer_token"),
             &backup.custom_token,
         )?;
+        if backup.schema_version >= 4 {
+            restore_toml_field(
+                &mut doc,
+                &router_provider_path(&provider_name, "supports_websockets"),
+                &backup.custom_supports_websockets,
+            )?;
+        }
         restore_toml_field(
             &mut doc,
             &router_provider_path(&provider_name, "requires_openai_auth"),
@@ -5762,6 +5797,12 @@ fn prepare_router_patch(
             }
             if backup.schema_version < 3 {
                 backup.token_budget = capture_toml_field(&doc, "features.token_budget");
+            }
+            if backup.schema_version < 4 {
+                backup.custom_supports_websockets = capture_toml_field(
+                    &doc,
+                    &router_provider_path(&provider_name, "supports_websockets"),
+                );
             }
             backup.schema_version = ROUTER_BACKUP_SCHEMA_VERSION;
             let current_model_catalog = capture_toml_field(&doc, "model_catalog_json");
@@ -5828,6 +5869,11 @@ fn render_router_patch_toml(
         ),
         &Value::String(LOCAL_IMAGE_EXTENSION_AUTHORIZATION.to_string()),
     )?;
+    set_toml_path(
+        &mut doc,
+        &router_provider_path(&provider_name, "supports_websockets"),
+        &Value::Bool(router.websockets_enabled),
+    )?;
     let configured_name = if router.remote_compaction_enabled {
         "OpenAI".to_string()
     } else {
@@ -5880,6 +5926,10 @@ fn router_patch_desired(router: &RouterConfig, requires_openai_auth: bool) -> Va
     managed_provider.insert(
         "requires_openai_auth".to_string(),
         Value::Bool(requires_openai_auth),
+    );
+    managed_provider.insert(
+        "supports_websockets".to_string(),
+        Value::Bool(router.websockets_enabled),
     );
     managed_provider.insert(
         "http_headers".to_string(),
@@ -9764,6 +9814,29 @@ fn route_stream_terminal_success(
 
 fn finish_route_stream(state: &mut RouteStreamState, dropped: bool) {
     route_stream_finish_usage(state);
+    if !dropped && state.require_terminal && state.terminal.is_none() {
+        let error = "上游 HTTP 流在响应完成前断开".to_string();
+        state.pending.error = Some(error.clone());
+        record_provider_failure(
+            ProviderKind::Codex,
+            &state.pending.provider_id,
+            &state.pending.provider_name,
+            &state.pending.id,
+            state.pending.started_at_ms,
+            &state.pending.path,
+            &state.pending.model,
+            ProviderFailureKind::Stream,
+            state.pending.status_code,
+            error,
+        );
+        finish_route_log(
+            state.pending.clone(),
+            false,
+            state.usage.clone(),
+            state.first_byte_ms,
+        );
+        return;
+    }
     let terminal_success = route_stream_terminal_success(state.status_success, state.terminal);
     if dropped && terminal_success.is_none() {
         finish_cancelled_route_log(
@@ -11092,9 +11165,9 @@ async fn proxy_request(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    AxumPath(path): AxumPath<String>,
     body: Body,
 ) -> Response {
+    let path = uri.path().trim_start_matches("/v1/").to_string();
     let received_timing = RequestTiming::now();
     if method == Method::GET {
         return proxy_request_now(
@@ -11218,6 +11291,21 @@ async fn proxy_request_now(
     body: Body,
     timing: Option<RequestTiming>,
 ) -> Response {
+    proxy_request_with_candidates(proxy_state, method, uri, headers, path, body, timing, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_request_with_candidates(
+    proxy_state: Arc<ProxyState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    path: String,
+    body: Body,
+    timing: Option<RequestTiming>,
+    candidates_override: Option<(RouterConfig, Vec<UpstreamCandidate>)>,
+) -> Response {
+    let require_terminal = candidates_override.is_some();
     if method == Method::GET
         && path.trim_matches('/') == "models"
         && claude_models_request(&headers)
@@ -11232,7 +11320,10 @@ async fn proxy_request_now(
     let request_started = timing.start;
     let request_started_at_ms = timing.started_at_ms;
     let route_request_id = request_id(request_started_at_ms);
-    let (router, candidates) = match upstream_candidates() {
+    let (router, candidates) = match candidates_override
+        .map(Ok)
+        .unwrap_or_else(upstream_candidates)
+    {
         Ok(config) => config,
         Err(err) => return proxy_error(StatusCode::BAD_GATEWAY, err),
     };
@@ -11573,6 +11664,7 @@ async fn proxy_request_now(
                         sse_buffer: String::new(),
                         usage: TokenUsage::default(),
                         terminal: None,
+                        require_terminal,
                         finished: false,
                     };
                     builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
@@ -11808,6 +11900,10 @@ fn ensure_router(runtime: &RouterRuntime, config: &RouterConfig) -> Result<(), S
         upstream: RwLock::new(build_upstream_client(config)?),
     });
     let app = Router::new()
+        .route(
+            "/v1/responses",
+            axum::routing::get(responses_websocket::upgrade).fallback(proxy_request),
+        )
         .route("/v1/{*path}", any(proxy_request))
         .fallback(proxy_not_found)
         .with_state(Arc::clone(&proxy_state));
@@ -12812,6 +12908,7 @@ fn is_usage_route_log(log: &RouteRequestLog) -> bool {
     matches!(
         (log.method.as_str(), log.path.as_str()),
         ("POST", "/v1/responses")
+            | ("GET", "/v1/responses") // One record per WebSocket response.create.
             | ("POST", "/v1/chat/completions")
             | ("POST", "/v1/completions")
             | ("POST", "/v1/messages")
@@ -13545,6 +13642,9 @@ fn save_provider(
     if let Some(enabled) = payload.image_detail_original_to_auto {
         provider.image_detail_original_to_auto = enabled;
     }
+    if let Some(enabled) = payload.supports_websockets {
+        provider.supports_websockets = enabled;
+    }
     if let Some(wire_api) = payload.wire_api {
         provider.wire_api = wire_api;
     }
@@ -13859,6 +13959,9 @@ fn preview_provider(
     if let Some(allowed_models) = payload.allowed_models {
         provider.allowed_models = normalize_model_names(allowed_models);
     }
+    if let Some(enabled) = payload.supports_websockets {
+        provider.supports_websockets = enabled;
+    }
     if let Some(wire_api) = payload.wire_api {
         provider.wire_api = wire_api;
     }
@@ -13897,6 +14000,7 @@ fn new_codex_provider(id: String, name: String) -> Result<ProviderConfig, String
         last_failure_at_ms: None,
         wire_api: ProviderWireApi::Responses,
         image_detail_original_to_auto: false,
+            supports_websockets: false,
         service_tier: String::new(),
         connection_test_model: String::new(),
         allowed_models: Vec::new(),
@@ -14026,6 +14130,7 @@ fn save_router_config(
         force_disable_openai_auth: payload.force_disable_openai_auth,
         remote_compaction_enabled: payload.remote_compaction_enabled,
         token_budget_enabled: payload.token_budget_enabled,
+        websockets_enabled: payload.websockets_enabled,
         zstd_decompression_enabled: payload.zstd_decompression_enabled,
         gpt56_long_context_enabled: payload.gpt56_long_context_enabled,
         gpt56_long_context_window: payload.gpt56_long_context_window,
@@ -14844,6 +14949,7 @@ mod tests {
             config: json!({}),
             wire_api: ProviderWireApi::Responses,
             image_detail_original_to_auto: false,
+            supports_websockets: false,
             service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: Vec::new(),
@@ -17002,6 +17108,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             }),
             wire_api: ProviderWireApi::Responses,
             image_detail_original_to_auto: false,
+            supports_websockets: false,
             service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: Vec::new(),
@@ -17187,6 +17294,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             config: json!({}),
             wire_api: ProviderWireApi::Responses,
             image_detail_original_to_auto: false,
+            supports_websockets: false,
             service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: vec!["gpt-5.5".to_string(), "gpt-5.4".to_string()],
@@ -17329,6 +17437,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     config: json!({}),
                     wire_api: ProviderWireApi::Responses,
                     image_detail_original_to_auto: false,
+                    supports_websockets: false,
                     service_tier: String::new(),
                     connection_test_model: String::new(),
                     allowed_models: vec![
@@ -17366,6 +17475,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
                     config: json!({}),
                     wire_api: ProviderWireApi::ChatCompletions,
                     image_detail_original_to_auto: false,
+                    supports_websockets: false,
                     service_tier: String::new(),
                     connection_test_model: String::new(),
                     allowed_models: vec!["GPT-5.4".to_string(), "gpt-5.3".to_string()],
@@ -17444,6 +17554,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             config: json!({}),
             wire_api: ProviderWireApi::ChatCompletions,
             image_detail_original_to_auto: false,
+            supports_websockets: false,
             service_tier: String::new(),
             connection_test_model: String::new(),
             allowed_models: vec!["gpt-5.2".to_string()],
@@ -17489,6 +17600,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",
             config: json!({}),
             wire_api: ProviderWireApi::Responses,
             image_detail_original_to_auto: false,
+            supports_websockets: false,
             service_tier: "priority".to_string(),
             connection_test_model: String::new(),
             allowed_models: Vec::new(),

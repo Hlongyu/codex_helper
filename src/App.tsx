@@ -64,6 +64,7 @@ type RouterConfig = {
   force_disable_openai_auth: boolean;
   remote_compaction_enabled: boolean;
   token_budget_enabled: boolean;
+  websockets_enabled: boolean;
   zstd_decompression_enabled: boolean;
   gpt56_long_context_enabled: boolean;
   gpt56_long_context_window: number;
@@ -190,6 +191,7 @@ type ProviderConfig = {
   config: JsonValue;
   wire_api: ProviderWireApi;
   image_detail_original_to_auto: boolean;
+  supports_websockets: boolean;
   service_tier: string;
   connection_test_model: string;
   allowed_models: string[];
@@ -517,6 +519,7 @@ function defaultRouterConfig(): RouterConfig {
     force_disable_openai_auth: false,
     remote_compaction_enabled: false,
     token_budget_enabled: false,
+    websockets_enabled: false,
     zstd_decompression_enabled: true,
     gpt56_long_context_enabled: false,
     gpt56_long_context_window: DEFAULT_GPT56_LONG_CONTEXT_WINDOW,
@@ -1471,6 +1474,7 @@ function App() {
   const [providerAutoDisableEnabled, setProviderAutoDisableEnabled] = useState(true);
   const [providerAutoDisableFailureThreshold, setProviderAutoDisableFailureThreshold] = useState(3);
   const [providerWireApi, setProviderWireApi] = useState<ProviderWireApi>("responses");
+  const [providerSupportsWebsockets, setProviderSupportsWebsockets] = useState(false);
   const [providerImageDetailOriginalToAuto, setProviderImageDetailOriginalToAuto] = useState(false);
   const [providerServiceTier, setProviderServiceTier] = useState<ProviderServiceTier>("");
   const [providerTestModel, setProviderTestModel] = useState("");
@@ -1710,6 +1714,7 @@ function App() {
         3,
     );
     setProviderWireApi(targetFull.wire_api ?? "responses");
+    setProviderSupportsWebsockets(targetFull.supports_websockets ?? false);
     setProviderImageDetailOriginalToAuto(targetFull.image_detail_original_to_auto ?? false);
     const serviceTier = targetFull.service_tier?.trim().toLowerCase();
     setProviderServiceTier(
@@ -1857,6 +1862,7 @@ function App() {
         config_toml: "",
         base_url: providerBaseUrl,
         wire_api: providerWireApi,
+        supports_websockets: providerWireApi === "responses" && providerSupportsWebsockets,
         image_detail_original_to_auto: providerImageDetailOriginalToAuto,
         service_tier: providerServiceTier,
         auto_disable_reset_period: providerAutoDisableResetPeriod,
@@ -2812,6 +2818,8 @@ function App() {
           globalAutoDisableFailureThreshold={appState.router.auto_disable_failure_threshold}
           providerServiceTier={providerServiceTier}
           providerWireApi={providerWireApi}
+          providerSupportsWebsockets={providerSupportsWebsockets}
+          setProviderSupportsWebsockets={setProviderSupportsWebsockets}
           providerImageDetailOriginalToAuto={providerImageDetailOriginalToAuto}
           secretVisible={secretVisible}
           setProviderApiKey={(value) => {
@@ -3330,6 +3338,18 @@ function RouteScreen({
                   (!appState.codex_models.length || selectedModelUnavailable))
               }
               onChange={(checked) => void onSaveClientConfig("codex", checked)}
+            />
+          </div>
+          <div className="route-toggle-line">
+            <div>
+              <strong>启用 WebSocket</strong>
+              <p>允许 Codex 使用 WS 连接本地路由。请为支持 WS 的供应商打开对应开关；其他供应商自动兼容 HTTP。保存后重启 Codex。</p>
+            </div>
+            <Toggle
+              checked={routerDraft.websockets_enabled}
+              disabled={busy}
+              label="启用 Codex WebSocket"
+              onChange={(websockets_enabled) => setRouterDraft({ ...routerDraft, websockets_enabled })}
             />
           </div>
           <div className="route-toggle-line">
@@ -4862,6 +4882,7 @@ function ProviderLatencyDialog({
               {!state.preparing && state.models.length === 0 && <option value="">没有可用模型</option>}
               {state.models.map((model) => <option key={model} value={model}>{model}</option>)}
             </select>
+            {state.providerKind === "codex" && <small>已开启 WebSocket 的供应商在流式测试中使用 WS；同步测试仍使用 HTTP。</small>}
           </label>
 
           <label className="field">
@@ -5301,6 +5322,8 @@ function ProviderEditor(props: {
   globalAutoDisableFailureThreshold: number;
   providerServiceTier: ProviderServiceTier;
   providerWireApi: ProviderWireApi;
+  providerSupportsWebsockets: boolean;
+  setProviderSupportsWebsockets: (value: boolean) => void;
   providerImageDetailOriginalToAuto: boolean;
   secretVisible: boolean;
   setAllowedModels: (models: string[]) => void;
@@ -5357,6 +5380,8 @@ function ProviderEditor(props: {
     globalAutoDisableFailureThreshold,
     providerServiceTier,
     providerWireApi,
+    providerSupportsWebsockets,
+    setProviderSupportsWebsockets,
     providerImageDetailOriginalToAuto,
     secretVisible,
     setAllowedModels,
@@ -5462,6 +5487,15 @@ function ProviderEditor(props: {
                   <option value="chat_completions">Chat Completions 兼容</option>
                 </select>
                 <small>上游不支持 Responses API 时选择 Chat Completions 兼容模式</small>
+              </label>
+              <label className="field">
+                <span className="fusion-toggle"><input
+                  type="checkbox"
+                  checked={providerWireApi === "responses" && providerSupportsWebsockets}
+                  disabled={providerWireApi !== "responses"}
+                  onChange={(event) => setProviderSupportsWebsockets(event.currentTarget.checked)}
+                /> 上游支持 WebSocket</span>
+                <small>仅适用于 Responses API。Codex 开启 WebSocket 后，此供应商使用持久连接；未开启的供应商继续使用 HTTP。</small>
               </label>
               <label className="field">
                 <span className="fusion-toggle"><input

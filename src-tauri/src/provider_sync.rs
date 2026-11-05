@@ -23,6 +23,7 @@ const COMMON_FIELDS: &[&str] = &[
 const CODEX_FIELDS: &[&str] = &[
     "config",
     "wire_api",
+    "supports_websockets",
     "image_detail_original_to_auto",
     "service_tier",
     "balance_query",
@@ -756,6 +757,7 @@ mod tests {
         .unwrap();
         p.allowed_models = vec!["model-a".into()];
         p.service_tier = "priority".into();
+        p.supports_websockets = true;
         p.balance_query.query_token = "fixture-balance-token".into();
         state.providers.push(p);
         let mut c = new_claude_provider("claude-one".into(), "Claude One".into()).unwrap();
@@ -787,6 +789,7 @@ mod tests {
         assert!(!serialized.contains("balance_status"));
         assert_eq!(snapshot.hash(), expected.hash());
         assert_eq!(snapshot.providers[0]["enabled"], true);
+        assert_eq!(snapshot.providers[0]["supports_websockets"], true);
         assert_eq!(snapshot.claude_providers[0]["enabled"], false);
         assert!(serialized.contains("fixture-key"));
         assert!(serialized.contains("fixture-balance-token"));
