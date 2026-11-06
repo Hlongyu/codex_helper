@@ -47,18 +47,19 @@
   --font-ui:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC",
     "Microsoft YaHei UI", sans-serif;
-  --font-size-meta: 11px;
-  --font-size-caption: 12px;
-  --font-size-body: 13px;
-  --font-size-section: 15px;
-  --font-size-title: 17px;
-  --font-size-page: 22px;
-  --line-height-caption: 18px;
-  --line-height-body: 20px;
-  --line-height-section: 22px;
-  --control-height: 32px;
-  --control-height-sm: 28px;
-  --field-height: 36px;
+  --font-size-meta: 12px;
+  --font-size-caption: 13px;
+  --font-size-body: 14px;
+  --font-size-section: 16px;
+  --font-size-title: 18px;
+  --font-size-page: 24px;
+  --line-height-meta: 18px;
+  --line-height-caption: 20px;
+  --line-height-body: 22px;
+  --line-height-section: 24px;
+  --control-height: 34px;
+  --control-height-sm: 30px;
+  --field-height: 38px;
   --button-primary: var(--accent);
   --button-primary-hover: var(--accent-strong);
   --button-primary-active: #065f44;

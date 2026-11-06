@@ -6,12 +6,16 @@ use tauri::tray::TrayIconEvent;
 #[cfg(not(target_os = "macos"))]
 use tauri::PhysicalSize;
 use tauri::{Emitter, PhysicalPosition, WebviewUrl, WebviewWindow};
+#[cfg(test)]
+use tray_surface::desktop::placement;
+#[cfg(any(not(target_os = "macos"), test))]
+use tray_surface::desktop::{placement_on_display, Bounds};
 
 const TRAY_ID: &str = "status";
 pub(super) const PANEL_LABEL: &str = tray_surface::LABEL;
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(test)]
 const PANEL_WIDTH: f64 = tray_surface::WIDTH;
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(test)]
 const PANEL_HEIGHT: f64 = tray_surface::HEIGHT;
 
 #[derive(Default)]
@@ -257,59 +261,6 @@ pub(super) fn tray_action(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
-#[cfg(any(not(target_os = "macos"), test))]
-struct Bounds {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-#[cfg(any(not(target_os = "macos"), test))]
-impl Bounds {
-    fn right(self) -> f64 {
-        self.x + self.width
-    }
-    fn bottom(self) -> f64 {
-        self.y + self.height
-    }
-}
-
-#[cfg(any(not(target_os = "macos"), test))]
-fn placement(work: Bounds, anchor: Option<Bounds>, scale: f64) -> Bounds {
-    let gap = (8.0 * scale)
-        .min(work.width / 4.0)
-        .min(work.height / 4.0)
-        .min(((work.width - 1.0) / 2.0).max(0.0))
-        .min(((work.height - 1.0) / 2.0).max(0.0));
-    let width = (PANEL_WIDTH * scale).min(work.width - 2.0 * gap).max(1.0);
-    let height = (PANEL_HEIGHT * scale).min(work.height - 2.0 * gap).max(1.0);
-    let (x, y) = match anchor {
-        Some(a) if a.bottom() <= work.y + 32.0 * scale => {
-            (a.x + a.width / 2.0 - width / 2.0, a.bottom() + gap)
-        }
-        Some(a) if a.y >= work.bottom() - 32.0 * scale => {
-            (a.x + a.width / 2.0 - width / 2.0, a.y - height - gap)
-        }
-        Some(a) if a.right() <= work.x + 32.0 * scale => {
-            (a.right() + gap, a.y + a.height / 2.0 - height / 2.0)
-        }
-        Some(a) if a.x >= work.right() - 32.0 * scale => {
-            (a.x - width - gap, a.y + a.height / 2.0 - height / 2.0)
-        }
-        _ => (work.right() - width - gap, work.y + gap),
-    };
-    Bounds {
-        x: x.clamp(work.x + gap, (work.right() - gap - width).max(work.x + gap)),
-        y: y.clamp(
-            work.y + gap,
-            (work.bottom() - gap - height).max(work.y + gap),
-        ),
-        width,
-        height,
-    }
-}
-
 #[cfg(not(target_os = "macos"))]
 fn show_panel(
     app: &tauri::AppHandle,
@@ -327,36 +278,57 @@ fn show_panel(
         .ok()
         .flatten()
         .or_else(|| window.primary_monitor().ok().flatten());
-    let anchor_point = click.map(|(_, point)| point).or_else(|| {
-        rect.map(|rect| {
+    let click_point = click.map(|(_, point)| point);
+    let anchor_point = rect
+        .and_then(|rect| {
             let scale = baseline
                 .as_ref()
                 .map_or(1.0, |monitor| monitor.scale_factor());
             let position = rect.position.to_physical::<f64>(scale);
             let size = rect.size.to_physical::<f64>(scale);
-            PhysicalPosition::new(
-                position.x + size.width / 2.0,
-                position.y + size.height / 2.0,
-            )
+            (size.width > 0.0 && size.height > 0.0).then(|| {
+                PhysicalPosition::new(
+                    position.x + size.width / 2.0,
+                    position.y + size.height / 2.0,
+                )
+            })
         })
-    });
+        .or(click_point)
+        .or_else(|| window.cursor_position().ok());
     let monitor = anchor_point
         .and_then(|point| window.monitor_from_point(point.x, point.y).ok().flatten())
         .or(baseline);
     if let Some(monitor) = monitor {
         let scale = monitor.scale_factor();
         let work = monitor.work_area();
-        let anchor = rect.map(|rect| {
-            let p = rect.position.to_physical::<f64>(scale);
-            let s = rect.size.to_physical::<f64>(scale);
+        let anchor = rect
+            .and_then(|rect| {
+                let p = rect.position.to_physical::<f64>(scale);
+                let s = rect.size.to_physical::<f64>(scale);
+                (s.width > 0.0 && s.height > 0.0).then_some(Bounds {
+                    x: p.x,
+                    y: p.y,
+                    width: s.width,
+                    height: s.height,
+                })
+            })
+            .or_else(|| {
+                anchor_point.map(|point| Bounds {
+                    x: point.x,
+                    y: point.y,
+                    width: 1.0,
+                    height: 1.0,
+                })
+            });
+        let display_position = monitor.position();
+        let display_size = monitor.size();
+        let position = placement_on_display(
             Bounds {
-                x: p.x,
-                y: p.y,
-                width: s.width,
-                height: s.height,
-            }
-        });
-        let position = placement(
+                x: display_position.x as f64,
+                y: display_position.y as f64,
+                width: display_size.width as f64,
+                height: display_size.height as f64,
+            },
             Bounds {
                 x: work.position.x as f64,
                 y: work.position.y as f64,
@@ -366,15 +338,33 @@ fn show_panel(
             anchor,
             scale,
         );
-        // Wayland can refuse absolute placement; the compositor still chooses a usable position.
-        let _ = window.set_position(PhysicalPosition::new(
-            position.x.round() as i32,
-            position.y.round() as i32,
-        ));
-        let _ = window.set_size(PhysicalSize::new(
+        let origin = PhysicalPosition::new(position.x.round() as i32, position.y.round() as i32);
+        // Move to the destination display first so its DPI change settles before
+        // setting the physical content size. Windows may adjust the frame during either step.
+        let moved = window.set_position(origin);
+        let sized = window.set_size(PhysicalSize::new(
             position.width.round() as u32,
             position.height.round() as u32,
         ));
+        #[cfg(target_os = "windows")]
+        {
+            moved.map_err(|error| format!("无法定位快捷面板：{error}"))?;
+            sized.map_err(|error| format!("无法设置快捷面板尺寸：{error}"))?;
+            // Borderless Windows with shadows still have an invisible native
+            // frame. Align the visible client area, then pin the final position
+            // after any WM_DPICHANGED size/position adjustment.
+            let inner = window.inner_position().map_err(|error| error.to_string())?;
+            let outer = window.outer_position().map_err(|error| error.to_string())?;
+            window
+                .set_position(PhysicalPosition::new(
+                    origin.x - (inner.x - outer.x),
+                    origin.y - (inner.y - outer.y),
+                ))
+                .map_err(|error| format!("无法对齐快捷面板：{error}"))?;
+        }
+        // Wayland can refuse absolute placement; the compositor chooses the position.
+        #[cfg(not(target_os = "windows"))]
+        let _ = (moved, sized);
     }
     app.state::<TrayRuntime>()
         .generation
@@ -609,6 +599,15 @@ mod tests {
     }
 
     #[test]
+    fn windows_overflow_tray_panel_stays_beside_the_clicked_icon() {
+        let work = bounds(0.0, 0.0, 1920.0, 1040.0);
+        // The hidden-icons flyout is inside the work area, above the taskbar.
+        let icon = bounds(1776.0, 900.0, 24.0, 24.0);
+        let panel = placement_on_display(bounds(0.0, 0.0, 1920.0, 1080.0), work, Some(icon), 1.0);
+        assert_eq!(panel.bottom(), icon.y - 8.0, "overflow icon must open the panel above its anchor, not at the screen's top-right corner");
+    }
+
+    #[test]
     fn panel_remains_inside_negative_origin_scaled_and_small_work_areas() {
         for scale in [1.0, 1.25, 1.5, 2.0] {
             for work in [
@@ -633,7 +632,7 @@ mod tests {
             }
         }
         let retina = placement(bounds(0.0, 48.0, 2880.0, 1752.0), None, 2.0);
-        assert_eq!((retina.width, retina.height), (840.0, 1140.0));
+        assert_eq!((retina.width, retina.height), (840.0, 1200.0));
     }
 
     #[test]
