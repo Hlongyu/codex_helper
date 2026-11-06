@@ -46,7 +46,7 @@ frontend:build:
     - pnpm config set store-dir .pnpm-store
     - pnpm install --frozen-lockfile
   script:
-    - pnpm build
+    - pnpm test:ui
   artifacts:
     expire_in: 1 week
     paths:
@@ -129,6 +129,24 @@ windows:preflight:
   script:
     - node --version
     - corepack --version
+
+windows:check:
+  stage: verify
+  tags:
+    - node
+    - windows
+    - nvm
+    - rust
+  needs:
+    - job: frontend:build
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH && $CI_PIPELINE_SOURCE != "merge_request_event"'
+      changes:
+        - src-tauri/**/*
+        - .gitlab-ci.yml
+  script:
+    - cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets
 
 release:validate-tag:
   extends: .docker-runner

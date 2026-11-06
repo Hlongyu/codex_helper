@@ -12,6 +12,7 @@ dist
 dist-ssr
 *.local
 preview-*.png
+/output/ui-redesign/
 
 # Editor directories and files
 .vscode/*

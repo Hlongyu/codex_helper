@@ -2,6 +2,8 @@ mod model_catalog;
 mod provider_import;
 mod provider_sync;
 mod responses_websocket;
+mod tray;
+mod tray_surface;
 
 use axum::{
     body::{Body, Bytes},
@@ -41,8 +43,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::menu::{Menu, MenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tauri_plugin_autostart::ManagerExt;
 use tokio::sync::oneshot;
@@ -90,8 +90,6 @@ const DEFAULT_AUTO_DISABLE_RESET_TIME: &str = "00:00";
 const DEFAULT_AUTO_DISABLE_RESET_WEEKDAY: u32 = 1;
 const DEFAULT_AUTO_DISABLE_RESET_DAY: u32 = 1;
 const MAIN_WINDOW_LABEL: &str = "main";
-const TRAY_SHOW_ID: &str = "show";
-const TRAY_QUIT_ID: &str = "quit";
 const AUTOSTART_ARG: &str = "--autostart";
 const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/Hlongyu/codex_helper/releases/latest";
@@ -14193,6 +14191,13 @@ fn save_client_configs(
     state.clients.codex.enabled = payload.codex_enabled;
     state.clients.claude.enabled = payload.claude_enabled;
     state.clients.pi.enabled = payload.pi_enabled;
+    commit_client_configs(state, router_runtime)
+}
+
+fn commit_client_configs(
+    mut state: ManagerState,
+    router_runtime: tauri::State<RouterRuntime>,
+) -> Result<AppState, String> {
     if state.clients.codex.enabled {
         if state.router.codex_model.trim().is_empty() {
             state.router.codex_model = codex_model_choices_for_state(&state)
@@ -14800,33 +14805,9 @@ pub fn run() {
             Some(vec![AUTOSTART_ARG]),
         ))
         .manage(RouterRuntime::default())
+        .manage(tray::TrayRuntime::default())
         .setup(|app| {
-            let show_item = MenuItem::with_id(app, TRAY_SHOW_ID, "显示主窗口", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "退出", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
-            let mut tray_builder = TrayIconBuilder::new()
-                .menu(&tray_menu)
-                .show_menu_on_left_click(false)
-                .tooltip("XXSwitch")
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    TRAY_SHOW_ID => show_main_window(app),
-                    TRAY_QUIT_ID => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        show_main_window(tray.app_handle());
-                    }
-                });
-            if let Some(icon) = app.default_window_icon() {
-                tray_builder = tray_builder.icon(icon.clone());
-            }
-            tray_builder.build(app)?;
+            tray::setup(app.handle())?;
 
             if launched_from_autostart() {
                 if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
@@ -14862,9 +14843,25 @@ pub fn run() {
                         eprintln!("隐藏主窗口失败: {err}");
                     }
                 }
+            } else if window.label() == tray::PANEL_LABEL {
+                match event {
+                    tauri::WindowEvent::Focused(true) => tray::on_focus(window.app_handle()),
+                    tauri::WindowEvent::Focused(false) => tray::on_blur(window.app_handle()),
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        tray::hide_panel(window.app_handle());
+                    }
+                    _ => {}
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
+            tray::get_tray_preferences,
+            tray::set_tray_visibility,
+            tray::load_tray_snapshot,
+            tray::update_tray_client,
+            tray::tray_action,
+            tray::take_tray_navigation,
             provider_sync::get_provider_sync,
             provider_sync::save_provider_sync,
             provider_sync::test_provider_sync,
@@ -14914,8 +14911,15 @@ pub fn run() {
             test_provider_connection_state,
             test_provider_latency_state
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            let _ = (app, &event);
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main_window(app);
+            }
+        });
 }
 
 #[cfg(test)]

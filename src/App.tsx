@@ -1,492 +1,101 @@
-import { type PointerEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import { type PointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Tabs } from "@radix-ui/themes";
+import { listen } from "@tauri-apps/api/event";
+import { TrayPreferenceSetting } from "./components/TrayPreferenceSetting";
+import { mergeTrayDraft } from "./trayState";
+import {
+  chartModelLabel,
+  fusionModelLabel,
+  requestModelLabel,
+} from "./modelLabels";
+import { UsageName } from "./components/UsageName";
+import {
+  Activity,
+  ArrowUpRight,
+  Blocks,
+  ChartNoAxesCombined,
+  CircleCheck,
+  Clock3,
+  Code2,
+  FileText,
+  LayoutDashboard,
+  Network,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plus,
+  Search,
+  Server,
+  Settings2,
+  Wallet,
+  Zap,
+} from "lucide-react";
+import {
+  Button,
+  Badge,
+  Card,
+  Checkbox,
+  ConfirmDialog,
+  Select,
+  SelectOption,
+  TextArea,
+  TextField,
+  Tooltip,
+  CopyButton,
+  DialogSurface,
+  EmptyState,
+  SegmentedControl,
+  Toggle,
+} from "./components/ui";
+import { AppearanceControl } from "./components/Appearance";
+import { UsageTrendChart } from "./components/UsageTrendChart";
+import type {
+  JsonValue,
+  BalanceQueryType,
+  NewApiBalanceTarget,
+  ProviderWireApi,
+  ProviderServiceTier,
+  AutoDisableResetPeriod,
+  SlowMode,
+  BalanceQueryConfig,
+  AiGateBalanceAccount,
+  BalanceStatus,
+  ProviderModelsResponse,
+  ModelMapping,
+  RouterConfig,
+  SkillLocationConfig,
+  ClientConfigs,
+  SkillClientView,
+  ClientSkillView,
+  SharedSkillView,
+  SkillManagementView,
+  RouterStatus,
+  ProviderConfig,
+  ClaudeProviderConfig,
+  ProviderSummary,
+  ProviderLatencyDialogState,
+  ProviderLatencyTestResponse,
+  RouteRequestLog,
+  RouteDebugCapture,
+  RouteLogFilter,
+  RouteLogFilterOption,
+  RouteLogsResponse,
+  RouteUsageBucket,
+  RouteUsageStats,
+  UpdateCheckInfo,
+  UpdateInstallResult,
+  AppState,
+  Screen,
+  EditorTab,
+  AgentClientKind,
+  ProviderKind,
+  TimeRange,
+  TrendMetric,
+} from "./types";
 import brandMark from "../output/icons/codex-helper-mark-transparent.png";
 import "./App.css";
 import { ProviderImport } from "./ProviderImport";
 import { ProviderSync } from "./ProviderSync";
-
-type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | JsonValue[]
-  | { [key: string]: JsonValue };
-
-type BalanceQueryType = "disabled" | "new_api" | "sub2_api" | "ai_gate";
-type NewApiBalanceTarget = "token_quota" | "account_balance";
-type BalanceAuthMode = "provider_token" | "separate_token";
-type ProviderWireApi = "responses" | "chat_completions";
-type ProviderServiceTier = "" | "priority" | "ultrafast";
-type ProviderStatus = "enabled" | "disabled" | "auto_disabled";
-type AutoDisableResetPeriod = "daily" | "weekly" | "monthly" | "never";
-type SlowMode = "off" | "fixed" | "random";
-
-type BalanceQueryConfig = {
-  enabled: boolean;
-  query_type: BalanceQueryType;
-  new_api_target: NewApiBalanceTarget;
-  endpoint: string;
-  path: string;
-  auth_mode: BalanceAuthMode;
-  query_token: string;
-  new_api_user_id: string;
-  ai_gate_account_id?: number | null;
-};
-
-type AiGateBalanceAccount = {
-  account_id: number;
-  account_name: string;
-  available_balance?: number | null;
-  unit: string;
-};
-
-type BalanceStatus = {
-  amount?: string | null;
-  label: string;
-  checked_at?: number | null;
-  error?: string | null;
-  accounts?: AiGateBalanceAccount[];
-};
-
-type ProviderModelsResponse = {
-  models: string[];
-};
-
-type ModelMapping = {
-  source: string;
-  target: string;
-};
-
-type RouterConfig = {
-  enabled: boolean;
-  debug_mode: boolean;
-  force_disable_openai_auth: boolean;
-  remote_compaction_enabled: boolean;
-  token_budget_enabled: boolean;
-  websockets_enabled: boolean;
-  zstd_decompression_enabled: boolean;
-  gpt56_long_context_enabled: boolean;
-  gpt56_long_context_window: number;
-  auto_disable_enabled: boolean;
-  auto_disable_failure_threshold: number;
-  model_provider: string;
-  codex_model: string;
-  host: string;
-  port: number;
-  local_token: string;
-  connect_timeout_secs: number;
-  response_header_timeout_secs: number;
-  stream_idle_timeout_secs: number;
-  slow_mode: SlowMode;
-  slow_delay_secs: number;
-  slow_delay_max_secs: number;
-};
-
-type SkillLocationConfig = {
-  path: string;
-  writable: boolean;
-};
-
-type ClientTargetConfig = {
-  enabled: boolean;
-  skill_locations: SkillLocationConfig[];
-  managed_skill_location: string;
-};
-
-type ClientConfigs = {
-  codex: ClientTargetConfig;
-  claude: ClientTargetConfig;
-  pi: ClientTargetConfig;
-};
-
-type SkillLocationView = SkillLocationConfig & {
-  managed: boolean;
-  exists: boolean;
-};
-
-type SkillClientView = {
-  client: AgentClientKind;
-  label: string;
-  managed_skill_location: string;
-  skill_locations: SkillLocationView[];
-};
-
-type ClientSkillView = {
-  client: AgentClientKind;
-  client_label: string;
-  skill_location: string;
-  path: string;
-  dir_name: string;
-  identity: string;
-  description: string;
-  managed: boolean;
-  shared: boolean;
-};
-
-type SkillOrigin = {
-  client: AgentClientKind;
-  skill_location: string;
-  original_path: string;
-  original_dir_name: string;
-};
-
-type SkillExposureView = {
-  client: AgentClientKind;
-  client_label: string;
-  path: string;
-  health: string;
-  message: string;
-};
-
-type SharedSkillView = {
-  identity: string;
-  description: string;
-  library_dir_name: string;
-  path: string;
-  sharing_scope: AgentClientKind[];
-  origin?: SkillOrigin | null;
-  exposures: SkillExposureView[];
-};
-
-type SkillConflictView = {
-  kind: string;
-  identity: string;
-  client?: AgentClientKind | null;
-  path: string;
-  message: string;
-};
-
-type SkillManagementView = {
-  library_root: string;
-  clients: SkillClientView[];
-  shared_skills: SharedSkillView[];
-  client_skills: ClientSkillView[];
-  conflicts: SkillConflictView[];
-};
-
-type RouterStatus = {
-  running: boolean;
-  address: string;
-  error?: string | null;
-};
-
-type ProviderConfig = {
-  id: string;
-  name: string;
-  status: ProviderStatus;
-  enabled: boolean;
-  fusion_enabled: boolean;
-  auto_disable_override: boolean;
-  auto_disable_enabled: boolean;
-  auto_disable_failure_threshold: number;
-  consecutive_failure_count: number;
-  auto_disabled_day?: string | null;
-  auto_disable_reset_period: AutoDisableResetPeriod;
-  auto_disable_reset_weekday: number;
-  auto_disable_reset_day: number;
-  auto_disable_reset_time: string;
-  last_failure_reason?: string | null;
-  last_failure_at_ms?: number | null;
-  config: JsonValue;
-  wire_api: ProviderWireApi;
-  image_detail_original_to_auto: boolean;
-  supports_websockets: boolean;
-  service_tier: string;
-  connection_test_model: string;
-  allowed_models: string[];
-  model_mappings: ModelMapping[];
-  balance_query: BalanceQueryConfig;
-  balance_status?: BalanceStatus | null;
-  connection_status?: unknown;
-};
-
-type ClaudeProviderConfig = {
-  id: string;
-  name: string;
-  status: ProviderStatus;
-  enabled: boolean;
-  fusion_enabled: boolean;
-  auto_disable_override: boolean;
-  auto_disable_enabled: boolean;
-  auto_disable_failure_threshold: number;
-  consecutive_failure_count: number;
-  auto_disabled_day?: string | null;
-  auto_disable_reset_period: AutoDisableResetPeriod;
-  auto_disable_reset_weekday: number;
-  auto_disable_reset_day: number;
-  auto_disable_reset_time: string;
-  last_failure_reason?: string | null;
-  last_failure_at_ms?: number | null;
-  base_url: string;
-  api_key: string;
-  connection_test_model: string;
-  allowed_models: string[];
-  model_mappings: ModelMapping[];
-  connection_status?: unknown;
-};
-
-type ProviderSummary = {
-  id: string;
-  name: string;
-  status: ProviderStatus;
-  enabled: boolean;
-  auto_disable_override: boolean;
-  auto_disable_enabled: boolean;
-  auto_disable_failure_threshold: number;
-  consecutive_failure_count: number;
-  auto_disabled_day?: string | null;
-  auto_disable_reset_period: AutoDisableResetPeriod;
-  auto_disable_reset_weekday: number;
-  auto_disable_reset_day: number;
-  auto_disable_reset_time: string;
-  last_failure_reason?: string | null;
-  last_failure_at_ms?: number | null;
-  pending_changes: number;
-  base_url: string;
-  provider_type: string;
-  balance_label: string;
-  balance_error?: string | null;
-  latency_ms?: number | null;
-  latency_label: string;
-  latency_error?: string | null;
-};
-
-type ProviderLatencyDialogState = {
-  provider: ProviderSummary;
-  providerKind: ProviderKind;
-  models: string[];
-  selectedModel: string;
-  prompt: string;
-  streaming: boolean;
-  preparing: boolean;
-  testing: boolean;
-  result: { ok: boolean; latencyMs?: number | null; message: string; reply?: string } | null;
-};
-
-type ProviderLatencyTestResponse = {
-  app_state: AppState;
-  ok: boolean;
-  latency_ms?: number | null;
-  error?: string | null;
-  reply: string;
-};
-
-type UsageSummary = {
-  request_count: number;
-  input_tokens: number;
-  uncached_input_tokens: number;
-  cached_input_tokens: number;
-  output_tokens: number;
-  reasoning_output_tokens: number;
-  total_tokens: number;
-};
-
-type RequestBodyInfo = {
-  content_type?: string | null;
-  content_encoding?: string | null;
-  zstd_detected: boolean;
-  decompression_enabled: boolean;
-  decompressed: boolean;
-  inbound_bytes: number;
-  decoded_bytes: number;
-  upstream_bytes: number;
-};
-
-type RouteRequestLog = {
-  id: string;
-  started_at_ms: number;
-  day: string;
-  hour: string;
-  method: string;
-  path: string;
-  model: string;
-  remote_compaction_v2?: {
-    trigger_received: boolean;
-    trigger_forwarded: boolean;
-    compaction_response_received: boolean;
-    compaction_response_forwarded: boolean;
-    compaction_item_reused: boolean;
-  } | null;
-  upstream_model?: string | null;
-  request_body?: RequestBodyInfo | null;
-  requested_service_tier?: string | null;
-  actual_service_tier?: string | null;
-  provider_id: string;
-  provider_name: string;
-  provider_order: number;
-  upstream_chain: string[];
-  status: "success" | "failed" | "running" | "cancelled" | string;
-  status_code?: number | null;
-  error?: string | null;
-  route_result: string;
-  route_attempts: number;
-  input_tokens: number;
-  uncached_input_tokens: number;
-  cached_input_tokens: number;
-  output_tokens: number;
-  reasoning_output_tokens: number;
-  total_tokens: number;
-  first_byte_ms?: number | null;
-  slow_delay_ms?: number | null;
-  upstream_started_ms?: number | null;
-  response_header_ms?: number | null;
-  upstream_request_id?: string | null;
-  debug_capture_available: boolean;
-  debug_capture_error?: string | null;
-  total_ms: number;
-};
-
-type DebugHeader = {
-  name: string;
-  value: string;
-};
-
-type DebugBodySnapshot = {
-  text: string;
-  captured_bytes: number;
-  total_bytes: number;
-  truncated: boolean;
-};
-
-type DebugRequestSnapshot = {
-  method: string;
-  url: string;
-  headers: DebugHeader[];
-  body: DebugBodySnapshot;
-};
-
-type DebugResponseSnapshot = {
-  status_code?: number | null;
-  headers: DebugHeader[];
-  body: DebugBodySnapshot;
-};
-
-type RouteDebugCapture = {
-  version: number;
-  request_id: string;
-  started_at_ms: number;
-  provider_name: string;
-  request_body?: RequestBodyInfo | null;
-  inbound_request: DebugRequestSnapshot;
-  upstream_request: DebugRequestSnapshot;
-  upstream_response: DebugResponseSnapshot;
-};
-
-type RouteLogFilter = {
-  query?: string;
-  status?: string;
-  provider_id?: string;
-  provider_name?: string;
-  model?: string;
-  start_day?: string;
-  end_day?: string;
-  page?: number;
-  page_size?: number;
-};
-
-type RouteLogFilterOption = {
-  id: string;
-  name: string;
-  request_count: number;
-};
-
-type RouteLogsResponse = {
-  logs: RouteRequestLog[];
-  total: number;
-  page: number;
-  page_size: number;
-  total_pages: number;
-  available_providers: RouteLogFilterOption[];
-  available_models: string[];
-  available_days: string[];
-};
-
-type RouteUsageBucket = {
-  label: string;
-  request_count: number;
-  input_tokens: number;
-  uncached_input_tokens: number;
-  cached_input_tokens: number;
-  output_tokens: number;
-  total_tokens: number;
-};
-
-type RouteUsageBreakdown = RouteUsageBucket & {
-  key: string;
-  label: string;
-};
-
-type RouteUsageStats = {
-  generated_at_ms: number;
-  filters: RouteLogFilter;
-  summary: UsageSummary;
-  today: UsageSummary;
-  failed_count: number;
-  success_count: number;
-  running_count: number;
-  average_first_byte_ms?: number | null;
-  average_total_ms?: number | null;
-  bucket_granularity: "hour" | "day" | "month" | string;
-  buckets: RouteUsageBucket[];
-  providers: RouteUsageBreakdown[];
-  models: RouteUsageBreakdown[];
-  details: RouteRequestLog[];
-  total: number;
-  page: number;
-  page_size: number;
-  total_pages: number;
-  available_providers: RouteLogFilterOption[];
-  available_models: string[];
-  available_days: string[];
-};
-
-type UpdateCheckInfo = {
-  current_version: string;
-  latest_version: string;
-  available: boolean;
-  installable: boolean;
-  asset_name?: string | null;
-  release_url: string;
-};
-
-type UpdateInstallResult = {
-  message: string;
-  manual_install: boolean;
-};
-
-type AppState = {
-  app_version: string;
-  codex_config_path: string;
-  claude_settings_path: string;
-  pi_models_path: string;
-  manager_dir: string;
-  current_config_raw: string;
-  current_config_exists: boolean;
-  active_provider_id: string;
-  active_claude_provider_id: string;
-  providers: ProviderSummary[];
-  claude_providers: ProviderSummary[];
-  active_provider: ProviderConfig | null;
-  active_claude_provider: ClaudeProviderConfig | null;
-  active_provider_toml: string;
-  final_preview_toml: string;
-  diffs: Array<{ path: string; action: string }>;
-  router: RouterConfig;
-  codex_models: string[];
-  capability_version: string;
-  capability_updated_at?: string | null;
-  clients: ClientConfigs;
-  multi_agent_enabled: boolean;
-  router_status: RouterStatus;
-};
-
-type Screen = "dashboard" | "route" | "providers" | "skills" | "usage" | "requests" | "settings";
-type EditorTab = "base" | "models" | "balance";
-type AgentClientKind = "codex" | "claude" | "pi";
-type ProviderKind = "codex" | "claude";
-type TimeRange = "today" | "week" | "month" | "all";
-type TrendMetric = "tokens" | "requests";
 
 const isTauriRuntime = "__TAURI_INTERNALS__" in window;
 const ROUTER_TIMEOUT_LIMITS = {
@@ -543,15 +152,20 @@ function routerConfigsEqual(left: RouterConfig, right: RouterConfig) {
   const leftKeys = Object.keys(left) as Array<keyof RouterConfig>;
   const rightKeys = Object.keys(right) as Array<keyof RouterConfig>;
   return (
-    leftKeys.length === rightKeys.length && leftKeys.every((key) => left[key] === right[key])
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) => left[key] === right[key])
   );
 }
 
-function routerSelectedModelUnavailable(router: RouterConfig, models: string[]) {
+function routerSelectedModelUnavailable(
+  router: RouterConfig,
+  models: string[],
+) {
   return Boolean(
     router.codex_model.trim() &&
       !models.some(
-        (model) => model.toLowerCase() === router.codex_model.trim().toLowerCase(),
+        (model) =>
+          model.toLowerCase() === router.codex_model.trim().toLowerCase(),
       ),
   );
 }
@@ -562,7 +176,9 @@ function effectiveRouterCodexModelError(
   codexEnabled: boolean,
 ) {
   const selectionError = routerCodexModelError(router, models);
-  return codexEnabled || routerSelectedModelUnavailable(router, models) ? selectionError : "";
+  return codexEnabled || routerSelectedModelUnavailable(router, models)
+    ? selectionError
+    : "";
 }
 
 function routerModelProviderError(router: RouterConfig) {
@@ -592,10 +208,12 @@ function routerTimeoutError(router: RouterConfig) {
     router.connect_timeout_secs > ROUTER_TIMEOUT_LIMITS.connect_timeout_secs ||
     !Number.isInteger(router.response_header_timeout_secs) ||
     router.response_header_timeout_secs < 1 ||
-    router.response_header_timeout_secs > ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs ||
+    router.response_header_timeout_secs >
+      ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs ||
     !Number.isInteger(router.stream_idle_timeout_secs) ||
     router.stream_idle_timeout_secs < 1 ||
-    router.stream_idle_timeout_secs > ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs
+    router.stream_idle_timeout_secs >
+      ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs
   ) {
     return "请输入允许范围内的整数秒数。";
   }
@@ -644,7 +262,6 @@ function routerSlowModeError(router: RouterConfig) {
   return "";
 }
 
-
 function routerLongContextWindowError(router: RouterConfig) {
   if (!router.gpt56_long_context_enabled) return "";
   if (
@@ -655,7 +272,6 @@ function routerLongContextWindowError(router: RouterConfig) {
   }
   return "";
 }
-
 
 function defaultClientConfigs(): ClientConfigs {
   return {
@@ -674,24 +290,35 @@ function agentClientLabel(client: AgentClientKind) {
 function jsonPath(value: JsonValue | undefined | null, path: string[]) {
   let current: JsonValue | undefined | null = value;
   for (const key of path) {
-    if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+    if (!current || typeof current !== "object" || Array.isArray(current))
+      return undefined;
     current = (current as Record<string, JsonValue>)[key];
   }
   return typeof current === "string" ? current : undefined;
 }
 
 function endpointFromBaseUrl(baseUrl: string) {
-  return baseUrl.trim().replace(/\/v1\/?$/, "").replace(/\/$/, "");
+  return baseUrl
+    .trim()
+    .replace(/\/v1\/?$/, "")
+    .replace(/\/$/, "");
 }
 
-function defaultBalancePath(queryType: BalanceQueryType, target: NewApiBalanceTarget) {
+function defaultBalancePath(
+  queryType: BalanceQueryType,
+  target: NewApiBalanceTarget,
+) {
   if (queryType === "sub2_api") return "/v1/usage";
   if (queryType === "ai_gate") return "/api/me/upstreams/usage";
-  if (queryType === "new_api" && target === "account_balance") return "/api/user/self";
+  if (queryType === "new_api" && target === "account_balance")
+    return "/api/user/self";
   return "/api/usage/token/";
 }
 
-function normalizeBalanceQuery(config?: BalanceQueryConfig | null, endpoint = "") {
+function normalizeBalanceQuery(
+  config?: BalanceQueryConfig | null,
+  endpoint = "",
+) {
   const queryType = config?.query_type ?? "disabled";
   const target = config?.new_api_target ?? "token_quota";
   const next = {
@@ -700,7 +327,10 @@ function normalizeBalanceQuery(config?: BalanceQueryConfig | null, endpoint = ""
     endpoint: config?.endpoint || endpoint,
     path: config?.path || defaultBalancePath(queryType, target),
   };
-  if (next.query_type === "new_api" && next.new_api_target === "account_balance") {
+  if (
+    next.query_type === "new_api" &&
+    next.new_api_target === "account_balance"
+  ) {
     next.auth_mode = "separate_token";
   } else if (next.query_type === "ai_gate") {
     next.auth_mode = "provider_token";
@@ -724,8 +354,10 @@ function normalizeModelNames(models: string[]) {
 
 function formatCompact(value: number) {
   const abs = Math.abs(value || 0);
-  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(abs >= 10_000_000 ? 1 : 2)}M`;
-  if (abs >= 1_000) return `${(value / 1_000).toFixed(abs >= 100_000 ? 0 : 1)}K`;
+  if (abs >= 1_000_000)
+    return `${(value / 1_000_000).toFixed(abs >= 10_000_000 ? 1 : 2)}M`;
+  if (abs >= 1_000)
+    return `${(value / 1_000).toFixed(abs >= 100_000 ? 0 : 1)}K`;
   return Math.round(value || 0).toLocaleString("zh-CN");
 }
 
@@ -740,7 +372,9 @@ function dateKey(date: Date) {
   return `${year}-${month}-${day}`;
 }
 
-function filterForRange(range: TimeRange): Pick<RouteLogFilter, "start_day" | "end_day"> {
+function filterForRange(
+  range: TimeRange,
+): Pick<RouteLogFilter, "start_day" | "end_day"> {
   if (range === "all") return { start_day: undefined, end_day: undefined };
   const end = new Date();
   const start = new Date(end);
@@ -767,11 +401,6 @@ function bucketGranularityLabel(value?: string) {
   return "按小时聚合";
 }
 
-function trendBucketValue(bucket: Pick<RouteUsageBucket, "total_tokens" | "request_count">, metric: TrendMetric) {
-  if (metric === "tokens") return bucket.total_tokens;
-  return bucket.request_count;
-}
-
 function emptyTrendBucket(label: string): RouteUsageBucket {
   return {
     label,
@@ -794,8 +423,12 @@ function completeTrendBuckets(
   range: TimeRange,
   granularity?: string,
 ): RouteUsageBucket[] {
-  const effectiveGranularity = granularity ?? (range === "all" ? "month" : range === "today" ? "hour" : "day");
-  const bucketByLabel = new Map(buckets.map((bucket) => [bucket.label, bucket]));
+  const effectiveGranularity =
+    granularity ??
+    (range === "all" ? "month" : range === "today" ? "hour" : "day");
+  const bucketByLabel = new Map(
+    buckets.map((bucket) => [bucket.label, bucket]),
+  );
 
   if (effectiveGranularity === "hour") {
     return Array.from({ length: 24 }, (_, hour) => {
@@ -819,40 +452,10 @@ function completeTrendBuckets(
     }
   }
 
-  const sorted = [...buckets].sort((left, right) => left.label.localeCompare(right.label));
+  const sorted = [...buckets].sort((left, right) =>
+    left.label.localeCompare(right.label),
+  );
   return sorted.length ? sorted : [emptyTrendBucket("暂无")];
-}
-
-function niceTrendMax(value: number) {
-  if (value <= 0) return 1;
-  const exponent = Math.floor(Math.log10(value));
-  const base = Math.pow(10, exponent);
-  const fraction = value / base;
-  const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
-  return niceFraction * base;
-}
-
-function trendTickIndexes(count: number, maxTicks = 6) {
-  if (count <= maxTicks) return Array.from({ length: count }, (_, index) => index);
-  const indexes = new Set<number>();
-  for (let index = 0; index < maxTicks; index += 1) {
-    indexes.add(Math.round((index * (count - 1)) / (maxTicks - 1)));
-  }
-  return [...indexes].sort((left, right) => left - right);
-}
-
-function formatTrendAxisValue(value: number, metric: TrendMetric) {
-  if (metric === "tokens") return formatTokenCount(value);
-  return String(Math.round(value));
-}
-
-function formatTrendXAxisLabel(label: string, granularity?: string) {
-  if (label === "暂无") return label;
-  if (granularity === "hour") return label;
-  if (granularity === "month") return label;
-  const [, month, day] = label.split("-");
-  if (month && day) return `${month}-${day}`;
-  return label;
 }
 
 function formatTokenTriplet(log: RouteRequestLog) {
@@ -868,7 +471,11 @@ function remoteCompactionV2AuditLabel(log: RouteRequestLog) {
     steps.push(audit.trigger_forwarded ? "V2 触发已转发" : "V2 触发未转发");
   }
   if (audit.compaction_response_received) {
-    steps.push(audit.compaction_response_forwarded ? "已返回 compaction" : "compaction 未透传");
+    steps.push(
+      audit.compaction_response_forwarded
+        ? "已返回 compaction"
+        : "compaction 未透传",
+    );
   }
   if (audit.compaction_item_reused) steps.push("已复用 compaction");
   return steps.join(" · ");
@@ -877,20 +484,6 @@ function remoteCompactionV2AuditLabel(log: RouteRequestLog) {
 function normalizedServiceTier(value?: string | null) {
   const tier = value?.trim().toLowerCase() || "";
   return tier === "fast" ? "priority" : tier;
-}
-
-function requestModelLabel(model: string): string {
-  const match = /^xxswitch-([0-9a-f]+)\/(.+)$/.exec(model)
-    ?? /^xxswitch-claude-([0-9a-f]+)--(.+)$/.exec(model);
-  return match ? match[2] : model;
-}
-
-function fusionModelLabel(model: string, providers: ProviderSummary[]): string {
-  const match = /^xxswitch-([0-9a-f]+)\/(.+)$/.exec(model)
-    ?? /^xxswitch-claude-([0-9a-f]+)--(.+)$/.exec(model);
-  if (!match) return model;
-  const provider = providers.find((p) => Array.from(new TextEncoder().encode(p.id), (byte) => byte.toString(16).padStart(2, "0")).join("") === match[1]);
-  return `${match[2]}（${provider?.name ?? "供应商已移除"}）`;
 }
 
 function serviceTierLabel(value?: string | null, emptyLabel = "未返回") {
@@ -915,7 +508,8 @@ function serviceTierResult(log: RouteRequestLog) {
 
 function formatMs(value?: number | null) {
   if (value == null) return "-";
-  if (value >= 1000) return `${(value / 1000).toFixed(value >= 10_000 ? 1 : 1)} s`;
+  if (value >= 1000)
+    return `${(value / 1000).toFixed(value >= 10_000 ? 1 : 1)} s`;
   return `${Math.round(value)} ms`;
 }
 
@@ -935,7 +529,9 @@ function routeTimingPhases(log: RouteRequestLog): RouteTimingPhase[] {
   const firstByte = log.first_byte_ms;
   const slowDelay = log.slow_delay_ms;
   if (upstreamStarted == null) {
-    return slowDelay == null ? [] : [{ label: "Slow 模式延迟", durationMs: slowDelay }];
+    return slowDelay == null
+      ? []
+      : [{ label: "Slow 模式延迟", durationMs: slowDelay }];
   }
 
   const phases: RouteTimingPhase[] = [];
@@ -945,7 +541,8 @@ function routeTimingPhases(log: RouteRequestLog): RouteTimingPhase[] {
   const beforeUpstream = Math.max(0, upstreamStarted - (slowDelay ?? 0));
   if (slowDelay == null || beforeUpstream > 0) {
     phases.push({
-      label: log.route_attempts > 1 ? "发起最终上游前（含前置重试）" : "发起上游前",
+      label:
+        log.route_attempts > 1 ? "发起最终上游前（含前置重试）" : "发起上游前",
       durationMs: beforeUpstream,
     });
   }
@@ -992,7 +589,9 @@ function formatTimingDetails(log: RouteRequestLog) {
     lines.push("分段耗时：旧记录未采集");
     return lines.join("\n");
   }
-  phases.forEach((phase) => lines.push(`${phase.label}：${formatDuration(phase.durationMs)}`));
+  phases.forEach((phase) =>
+    lines.push(`${phase.label}：${formatDuration(phase.durationMs)}`),
+  );
   return lines.join("\n");
 }
 
@@ -1030,7 +629,9 @@ function formatDebugBodyText(text: string) {
       formattedEvent = true;
       return [
         `${match[1]}${pretty[0]}`,
-        ...pretty.slice(1).map((part) => `${" ".repeat(match[1].length)}${part}`),
+        ...pretty
+          .slice(1)
+          .map((part) => `${" ".repeat(match[1].length)}${part}`),
       ].join("\n");
     } catch {
       return line;
@@ -1097,7 +698,9 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
     log.route_result,
     log.error ?? "",
   ]);
-  const csv = [headers, ...rows].map((row) => row.map(csvEscape).join(",")).join("\n");
+  const csv = [headers, ...rows]
+    .map((row) => row.map(csvEscape).join(","))
+    .join("\n");
   downloadTextFile(
     `\uFEFF${csv}`,
     "text/csv;charset=utf-8",
@@ -1106,14 +709,20 @@ function exportRouteLogsCsv(logs: RouteRequestLog[]) {
 }
 
 async function exportRouteDebugBundle(logs: RouteRequestLog[]) {
-  const captures: Array<{ route_log: RouteRequestLog; debug_capture: RouteDebugCapture }> = [];
+  const captures: Array<{
+    route_log: RouteRequestLog;
+    debug_capture: RouteDebugCapture;
+  }> = [];
   const failures: Array<{ request_id: string; error: string }> = [];
 
   for (const log of logs) {
     try {
-      const capture = await callCommand<RouteDebugCapture>("load_route_debug_capture", {
-        payload: { request_id: log.id },
-      });
+      const capture = await callCommand<RouteDebugCapture>(
+        "load_route_debug_capture",
+        {
+          payload: { request_id: log.id },
+        },
+      );
       captures.push({ route_log: log, debug_capture: capture });
     } catch (err) {
       failures.push({ request_id: log.id, error: String(err) });
@@ -1141,20 +750,30 @@ async function exportRouteDebugBundle(logs: RouteRequestLog[]) {
 
 function formatBalanceForCard(label: string) {
   if (!label || label === "未配置") return "";
-  return label.replace(/^账户余额\s*/, "").replace(/^Key额度\s*/, "").replace(/^余额\s*/, "");
+  return label
+    .replace(/^账户余额\s*/, "")
+    .replace(/^Key额度\s*/, "")
+    .replace(/^余额\s*/, "");
 }
 
 function providerBalanceMeta(provider: ProviderSummary) {
   const label = formatBalanceForCard(provider.balance_label);
   const error = provider.balance_error?.trim() ?? "";
-  if (provider.balance_label === "不适用" || provider.provider_type === "Claude") {
+  if (
+    provider.balance_label === "不适用" ||
+    provider.provider_type === "Claude"
+  ) {
     return { value: "不适用", detail: "无需余额查询", tone: "muted" };
   }
   if (!label || error === "未启用余额查询") {
     return { value: "未启用", detail: "余额查询", tone: "muted" };
   }
   if (error) {
-    return { value: label || "查询异常", detail: "检查余额配置", tone: "danger" };
+    return {
+      value: label || "查询异常",
+      detail: "检查余额配置",
+      tone: "danger",
+    };
   }
   return { value: label, detail: "账户余额", tone: "ok" };
 }
@@ -1167,17 +786,20 @@ function providerLatencyMeta(provider: ProviderSummary) {
     return { value: "未测试", detail: "点击测速", tone: "muted" };
   }
   return {
-    value: provider.latency_label && provider.latency_label !== "-"
-      ? provider.latency_label
-      : `${provider.latency_ms} ms`,
+    value:
+      provider.latency_label && provider.latency_label !== "-"
+        ? provider.latency_label
+        : `${provider.latency_ms} ms`,
     detail: provider.latency_ms > 500 ? "响应较慢" : "连接正常",
     tone: provider.latency_ms > 500 ? "warn" : "ok",
   };
 }
 
 function providerStatus(provider: ProviderSummary) {
-  if (provider.status === "auto_disabled") return { label: "自动禁用", tone: "danger" };
-  if (provider.status === "disabled" || !provider.enabled) return { label: "已停用", tone: "muted" };
+  if (provider.status === "auto_disabled")
+    return { label: "自动禁用", tone: "danger" };
+  if (provider.status === "disabled" || !provider.enabled)
+    return { label: "已停用", tone: "muted" };
   if (provider.latency_error) return { label: "异常", tone: "warn" };
   if (provider.latency_ms != null && provider.latency_ms > 500) {
     return { label: "高延迟", tone: "warn" };
@@ -1239,7 +861,8 @@ function savedApiKeyLabel(value: string) {
 }
 
 function providerFields(provider: ProviderConfig | null | undefined) {
-  const baseUrl = jsonPath(provider?.config, ["model_providers", "custom", "base_url"]) ?? "";
+  const baseUrl =
+    jsonPath(provider?.config, ["model_providers", "custom", "base_url"]) ?? "";
   const apiKey =
     jsonPath(provider?.config, [
       "model_providers",
@@ -1257,180 +880,49 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>) {
 }
 
 function NavIcon({ type }: { type: Screen }) {
-  const common = {
-    fill: "none",
-    stroke: "currentColor",
-    viewBox: "0 0 24 24",
+  const icons = {
+    dashboard: LayoutDashboard,
+    route: Network,
+    providers: Server,
+    skills: Blocks,
+    usage: ChartNoAxesCombined,
+    requests: FileText,
+    settings: Settings2,
   };
-  return (
-    <svg
-      aria-hidden="true"
-      className="nav-glyph"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      strokeWidth={1.8}
-      {...common}
-    >
-      {type === "dashboard" && (
-        <>
-          <path d="M4 4h7v7H4z" />
-          <path d="M13 4h7v5h-7z" />
-          <path d="M4 13h7v7H4z" />
-          <path d="M13 11h7v9h-7z" />
-        </>
-      )}
-      {type === "route" && (
-        <>
-          <path d="M5 12h6" />
-          <path d="M13 6h6" />
-          <path d="M13 18h6" />
-          <path d="M11 12c2.2 0 2.2-6 4.8-6" />
-          <path d="M11 12c2.2 0 2.2 6 4.8 6" />
-          <circle cx="5" cy="12" r="2" />
-          <circle cx="19" cy="6" r="2" />
-          <circle cx="19" cy="18" r="2" />
-        </>
-      )}
-      {type === "providers" && (
-        <>
-          <path d="M6 5h12v14H6z" />
-          <path d="M9 9h6" />
-          <path d="M9 13h6" />
-          <path d="M9 17h3" />
-        </>
-      )}
-      {type === "skills" && (
-        <>
-          <path d="M5 5h6v6H5z" />
-          <path d="M13 5h6v6h-6z" />
-          <path d="M5 13h6v6H5z" />
-          <path d="M14 14h4" />
-          <path d="M16 12v4" />
-          <path d="M11 8h2" />
-          <path d="M8 11v2" />
-        </>
-      )}
-      {type === "usage" && (
-        <>
-          <path d="M4 19V5" />
-          <path d="M4 19h16" />
-          <path d="m7 15 3.5-4 3 2.5L19 7" />
-        </>
-      )}
-      {type === "requests" && (
-        <>
-          <rect height="16" rx="2" width="14" x="5" y="4" />
-          <path d="M8.5 8.5h7" />
-          <path d="M8.5 12h5.5" />
-          <path d="M8.5 15.5h7" />
-        </>
-      )}
-      {type === "settings" && (
-        <>
-          <circle cx="12" cy="12" r="3" />
-          <path d="M12 2.8v3" />
-          <path d="M12 18.2v3" />
-          <path d="m4.2 4.2 2.1 2.1" />
-          <path d="m17.7 17.7 2.1 2.1" />
-          <path d="M2.8 12h3" />
-          <path d="M18.2 12h3" />
-          <path d="m4.2 19.8 2.1-2.1" />
-          <path d="m17.7 6.3 2.1-2.1" />
-        </>
-      )}
-    </svg>
-  );
-}
-
-function Toggle({
-  checked,
-  onChange,
-  disabled,
-  label,
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-  disabled?: boolean;
-  label?: string;
-}) {
-  return (
-    <button
-      aria-label={label}
-      aria-pressed={checked}
-      className={`switch ${checked ? "on" : ""}`}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      type="button"
-    >
-      <span />
-    </button>
-  );
+  const Icon = icons[type];
+  return <Icon aria-hidden="true" className="nav-glyph" strokeWidth={1.8} />;
 }
 
 function StatusPill({ ok }: { ok: boolean }) {
   return (
-    <div className={`service-pill ${ok ? "ok" : "warn"}`}>
+    <Badge className={`service-pill ${ok ? "ok" : "warn"}`}>
       <span />
       {ok ? "服务正常" : "服务未接管"}
-    </div>
+    </Badge>
   );
 }
 
-function ToolIcon({ type }: { type: "settings" | "models" | "latency" | "balance" }) {
-  return (
-    <svg
-      aria-hidden="true"
-      fill="none"
-      stroke="currentColor"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      strokeWidth={2}
-      viewBox="0 0 24 24"
-    >
-      {type === "settings" && (
-        <>
-          <circle cx="12" cy="12" r="3" />
-          <path d="M12 3v3" />
-          <path d="M12 18v3" />
-          <path d="m5.6 5.6 2.1 2.1" />
-          <path d="m16.3 16.3 2.1 2.1" />
-          <path d="M3 12h3" />
-          <path d="M18 12h3" />
-          <path d="m5.6 18.4 2.1-2.1" />
-          <path d="m16.3 7.7 2.1-2.1" />
-        </>
-      )}
-      {type === "models" && (
-        <>
-          <path d="M5 6.5 12 3l7 3.5-7 3.5-7-3.5Z" />
-          <path d="m5 11 7 3.5 7-3.5" />
-          <path d="m5 15.5 7 3.5 7-3.5" />
-        </>
-      )}
-      {type === "latency" && (
-        <>
-          <path d="M4 13a8 8 0 1 1 16 0" />
-          <path d="M12 13l4-4" />
-          <path d="M8 20h8" />
-          <path d="M12 17v3" />
-        </>
-      )}
-      {type === "balance" && (
-        <>
-          <path d="M20 7h-9a4 4 0 0 0 0 8h9" />
-          <path d="M16 11h4v8H6a4 4 0 0 1-4-4V7a4 4 0 0 1 4-4h12" />
-          <path d="M17 15h.01" />
-          <path d="M7 7h.01" />
-        </>
-      )}
-    </svg>
-  );
+function ToolIcon({
+  type,
+}: {
+  type: "settings" | "models" | "latency" | "balance";
+}) {
+  const icons = {
+    settings: Settings2,
+    models: Blocks,
+    latency: Activity,
+    balance: Wallet,
+  };
+  const Icon = icons[type];
+  return <Icon aria-hidden="true" size={16} strokeWidth={1.8} />;
 }
 
 function App() {
   const [appState, setAppState] = useState<AppState | null>(null);
-  const [skillManagement, setSkillManagement] = useState<SkillManagementView | null>(null);
-  const [routeUsageStats, setRouteUsageStats] = useState<RouteUsageStats | null>(null);
+  const [skillManagement, setSkillManagement] =
+    useState<SkillManagementView | null>(null);
+  const [routeUsageStats, setRouteUsageStats] =
+    useState<RouteUsageStats | null>(null);
   const [routeLogs, setRouteLogs] = useState<RouteLogsResponse | null>(null);
   const [usageRange, setUsageRange] = useState<TimeRange>("today");
   const [usageFilter, setUsageFilter] = useState<RouteLogFilter>(() => ({
@@ -1439,9 +931,13 @@ function App() {
     ...filterForRange("today"),
   }));
   const [trendMetric, setTrendMetric] = useState<TrendMetric>("tokens");
-  const [requestFilter, setRequestFilter] = useState<RouteLogFilter>({ model: "", page_size: 20 });
+  const [requestFilter, setRequestFilter] = useState<RouteLogFilter>({
+    model: "",
+    page_size: 20,
+  });
   const [requestAutoRefresh, setRequestAutoRefresh] = useState(true);
   const [screen, setScreen] = useState<Screen>("dashboard");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [pendingScreen, setPendingScreen] = useState<Screen | null>(null);
   const [providerKind, setProviderKind] = useState<ProviderKind>("codex");
   const [busy, setBusy] = useState(false);
@@ -1450,7 +946,9 @@ function App() {
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateConfirming, setUpdateConfirming] = useState(false);
   const [updateMessage, setUpdateMessage] = useState("");
-  const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
+  const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(
+    null,
+  );
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorKind, setEditorKind] = useState<ProviderKind>("codex");
@@ -1466,17 +964,32 @@ function App() {
   const [fusionEnabled, setFusionEnabled] = useState(false);
   const [modelListCleared, setModelListCleared] = useState(false);
   const [providerEnabledDirty, setProviderEnabledDirty] = useState(false);
-  const [providerAutoDisableResetPeriod, setProviderAutoDisableResetPeriod] = useState<AutoDisableResetPeriod>("daily");
-  const [providerAutoDisableResetWeekday, setProviderAutoDisableResetWeekday] = useState(1);
-  const [providerAutoDisableResetDay, setProviderAutoDisableResetDay] = useState(1);
-  const [providerAutoDisableResetTime, setProviderAutoDisableResetTime] = useState("00:00");
-  const [providerAutoDisableOverride, setProviderAutoDisableOverride] = useState(false);
-  const [providerAutoDisableEnabled, setProviderAutoDisableEnabled] = useState(true);
-  const [providerAutoDisableFailureThreshold, setProviderAutoDisableFailureThreshold] = useState(3);
-  const [providerWireApi, setProviderWireApi] = useState<ProviderWireApi>("responses");
-  const [providerSupportsWebsockets, setProviderSupportsWebsockets] = useState(false);
-  const [providerImageDetailOriginalToAuto, setProviderImageDetailOriginalToAuto] = useState(false);
-  const [providerServiceTier, setProviderServiceTier] = useState<ProviderServiceTier>("");
+  const [providerAutoDisableResetPeriod, setProviderAutoDisableResetPeriod] =
+    useState<AutoDisableResetPeriod>("daily");
+  const [providerAutoDisableResetWeekday, setProviderAutoDisableResetWeekday] =
+    useState(1);
+  const [providerAutoDisableResetDay, setProviderAutoDisableResetDay] =
+    useState(1);
+  const [providerAutoDisableResetTime, setProviderAutoDisableResetTime] =
+    useState("00:00");
+  const [providerAutoDisableOverride, setProviderAutoDisableOverride] =
+    useState(false);
+  const [providerAutoDisableEnabled, setProviderAutoDisableEnabled] =
+    useState(true);
+  const [
+    providerAutoDisableFailureThreshold,
+    setProviderAutoDisableFailureThreshold,
+  ] = useState(3);
+  const [providerWireApi, setProviderWireApi] =
+    useState<ProviderWireApi>("responses");
+  const [providerSupportsWebsockets, setProviderSupportsWebsockets] =
+    useState(false);
+  const [
+    providerImageDetailOriginalToAuto,
+    setProviderImageDetailOriginalToAuto,
+  ] = useState(false);
+  const [providerServiceTier, setProviderServiceTier] =
+    useState<ProviderServiceTier>("");
   const [providerTestModel, setProviderTestModel] = useState("");
   const [providerModels, setProviderModels] = useState<string[]>([]);
   const [allowedModels, setAllowedModels] = useState<string[]>([]);
@@ -1484,14 +997,24 @@ function App() {
   const [balanceQuery, setBalanceQuery] = useState<BalanceQueryConfig>(() =>
     defaultBalanceQuery(),
   );
-  const [balanceTestStatus, setBalanceTestStatus] = useState<BalanceStatus | null>(null);
-  const [balanceAccountOptions, setBalanceAccountOptions] = useState<AiGateBalanceAccount[]>([]);
-  const [routerDraft, setRouterDraft] = useState<RouterConfig>(() => defaultRouterConfig());
-  const [proxyDraft, setProxyDraft] = useState<RouterConfig>(() => defaultRouterConfig());
+  const [balanceTestStatus, setBalanceTestStatus] =
+    useState<BalanceStatus | null>(null);
+  const [balanceAccountOptions, setBalanceAccountOptions] = useState<
+    AiGateBalanceAccount[]
+  >([]);
+  const [routerDraft, setRouterDraft] = useState<RouterConfig>(() =>
+    defaultRouterConfig(),
+  );
+  const [proxyDraft, setProxyDraft] = useState<RouterConfig>(() =>
+    defaultRouterConfig(),
+  );
   const [secretVisible, setSecretVisible] = useState(false);
   const [balanceTokenVisible, setBalanceTokenVisible] = useState(false);
-  const [latencyDialog, setLatencyDialog] = useState<ProviderLatencyDialogState | null>(null);
+  const [latencyDialog, setLatencyDialog] =
+    useState<ProviderLatencyDialogState | null>(null);
   const [newProviderCount, setNewProviderCount] = useState(1);
+  const [pendingSharedSkillDeletion, setPendingSharedSkillDeletion] =
+    useState<SharedSkillView | null>(null);
   const didInitialRefresh = useRef(false);
   const shellRef = useRef<HTMLElement>(null);
 
@@ -1513,7 +1036,9 @@ function App() {
 
   async function refreshRouteUsage(filter = usageFilter) {
     const sequence = ++usageRequestSequence.current;
-    const usage = await callCommand<RouteUsageStats>("load_route_usage_stats", { payload: { filter } });
+    const usage = await callCommand<RouteUsageStats>("load_route_usage_stats", {
+      payload: { filter },
+    });
     if (sequence === usageRequestSequence.current) setRouteUsageStats(usage);
   }
 
@@ -1521,7 +1046,9 @@ function App() {
     const sequence = ++logRequestSequence.current;
     logRequestsInFlight.current += 1;
     try {
-      const logs = await callCommand<RouteLogsResponse>("load_route_logs", { payload: { filter } });
+      const logs = await callCommand<RouteLogsResponse>("load_route_logs", {
+        payload: { filter },
+      });
       if (sequence === logRequestSequence.current) setRouteLogs(logs);
     } finally {
       logRequestsInFlight.current -= 1;
@@ -1536,7 +1063,9 @@ function App() {
   }
 
   async function refreshSkillManagement() {
-    const view = await callCommand<SkillManagementView>("load_skill_management");
+    const view = await callCommand<SkillManagementView>(
+      "load_skill_management",
+    );
     setSkillManagement(view);
   }
 
@@ -1544,7 +1073,8 @@ function App() {
     await refreshAppState();
     try {
       if (screen === "requests") await refreshRouteLogs();
-      else if (screen === "dashboard" || screen === "usage") await refreshRouteUsage();
+      else if (screen === "dashboard" || screen === "usage")
+        await refreshRouteUsage();
     } catch {
       setRouteUsageStats(null);
       setRouteLogs(null);
@@ -1566,7 +1096,8 @@ function App() {
   }
 
   async function installUpdate() {
-    if (!updateCheck?.available || !updateCheck.installable || updateBusy) return;
+    if (!updateCheck?.available || !updateCheck.installable || updateBusy)
+      return;
     setUpdateBusy(true);
     setUpdateConfirming(false);
     setUpdateMessage(
@@ -1606,6 +1137,73 @@ function App() {
   useEffect(() => {
     refresh().catch((err) => setError(String(err)));
   }, []);
+
+  const trayStateRef = useRef(appState);
+  trayStateRef.current = appState;
+  const trayNavigateRef = useRef(navigateToScreen);
+  trayNavigateRef.current = navigateToScreen;
+  useEffect(() => {
+    if (
+      !appState ||
+      !isTauriRuntime ||
+      (import.meta.env.DEV && import.meta.env.MODE === "ui-preview")
+    )
+      return;
+    let cancelled = false;
+    let sequence = 0;
+    async function sync() {
+      const request = ++sequence;
+      const previous = trayStateRef.current;
+      try {
+        const next = await callCommand<AppState>("load_app_state");
+        if (cancelled || request !== sequence) return;
+        setAppState(next);
+        setRouterDraft((draft) =>
+          mergeTrayDraft(draft, previous?.router, next.router),
+        );
+        setProxyDraft((draft) =>
+          mergeTrayDraft(draft, previous?.router, next.router),
+        );
+      } catch (err) {
+        if (!cancelled) setError(String(err));
+      }
+    }
+    async function navigate() {
+      try {
+        const next = await callCommand<Screen | null>("take_tray_navigation");
+        if (
+          !cancelled &&
+          next &&
+          ["dashboard", "route", "providers", "usage", "settings"].includes(
+            next,
+          )
+        )
+          trayNavigateRef.current(next);
+      } catch (err) {
+        if (!cancelled) setError(String(err));
+      }
+    }
+    const subscriptions = Promise.all([
+      listen("tray-state-changed", () => void sync()),
+      listen("tray-navigate", () => void navigate()),
+    ]);
+    void subscriptions
+      .then(() => {
+        if (!cancelled) {
+          void sync();
+          void navigate();
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setError(String(err));
+      });
+    return () => {
+      cancelled = true;
+      void subscriptions
+        .then((unlisten) => unlisten.forEach((fn) => fn()))
+        .catch(() => {});
+    };
+  }, [appState !== null]);
 
   useEffect(() => {
     if (!didInitialRefresh.current) {
@@ -1654,7 +1252,9 @@ function App() {
     if (shellRef.current) shellRef.current.scrollTop = 0;
   }, [screen]);
 
-  const routeDirty = Boolean(appState && !routerConfigsEqual(routerDraft, appState.router));
+  const routeDirty = Boolean(
+    appState && !routerConfigsEqual(routerDraft, appState.router),
+  );
 
   useEffect(() => {
     if (!routeDirty) return;
@@ -1669,12 +1269,17 @@ function App() {
   const activeProvider = useMemo(() => {
     if (!appState) return null;
     return (
-      appState.providers.find((provider) => provider.id === appState.active_provider_id) ??
+      appState.providers.find(
+        (provider) => provider.id === appState.active_provider_id,
+      ) ??
       appState.providers[0] ??
       null
     );
   }, [appState]);
-  const requestCount = routeUsageStats?.success_count ?? routeUsageStats?.summary.request_count ?? 0;
+  const requestCount =
+    routeUsageStats?.success_count ??
+    routeUsageStats?.summary.request_count ??
+    0;
   const uncachedInput = routeUsageStats?.summary.uncached_input_tokens ?? 0;
   const cachedInput = routeUsageStats?.summary.cached_input_tokens ?? 0;
   const outputTokens = routeUsageStats?.summary.output_tokens ?? 0;
@@ -1688,9 +1293,15 @@ function App() {
     .slice(0, 3);
   const failedCount = routeUsageStats?.failed_count ?? 0;
   const totalFinishedCount = requestCount + failedCount;
-  const successRate = totalFinishedCount ? (requestCount / totalFinishedCount) * 100 : 0;
+  const successRate = totalFinishedCount
+    ? (requestCount / totalFinishedCount) * 100
+    : 0;
 
-  function fillProviderEditor(targetFull: ProviderConfig, summary: ProviderSummary | null, tab: EditorTab) {
+  function fillProviderEditor(
+    targetFull: ProviderConfig,
+    summary: ProviderSummary | null,
+    tab: EditorTab,
+  ) {
     const fields = providerFields(targetFull);
     setEditorKind("codex");
     setEditingId(summary?.id ?? targetFull.id);
@@ -1702,12 +1313,30 @@ function App() {
     setProviderEnabledDirty(false);
     setFusionEnabled(targetFull.fusion_enabled ?? false);
     setModelListCleared(false);
-    setProviderAutoDisableResetPeriod(targetFull.auto_disable_reset_period ?? summary?.auto_disable_reset_period ?? "daily");
-    setProviderAutoDisableResetWeekday(targetFull.auto_disable_reset_weekday ?? summary?.auto_disable_reset_weekday ?? 1);
-    setProviderAutoDisableResetDay(targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1);
-    setProviderAutoDisableResetTime(targetFull.auto_disable_reset_time ?? summary?.auto_disable_reset_time ?? "00:00");
+    setProviderAutoDisableResetPeriod(
+      targetFull.auto_disable_reset_period ??
+        summary?.auto_disable_reset_period ??
+        "daily",
+    );
+    setProviderAutoDisableResetWeekday(
+      targetFull.auto_disable_reset_weekday ??
+        summary?.auto_disable_reset_weekday ??
+        1,
+    );
+    setProviderAutoDisableResetDay(
+      targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1,
+    );
+    setProviderAutoDisableResetTime(
+      targetFull.auto_disable_reset_time ??
+        summary?.auto_disable_reset_time ??
+        "00:00",
+    );
     setProviderAutoDisableOverride(targetFull.auto_disable_override ?? false);
-    setProviderAutoDisableEnabled(targetFull.auto_disable_enabled ?? appState?.router.auto_disable_enabled ?? true);
+    setProviderAutoDisableEnabled(
+      targetFull.auto_disable_enabled ??
+        appState?.router.auto_disable_enabled ??
+        true,
+    );
     setProviderAutoDisableFailureThreshold(
       targetFull.auto_disable_failure_threshold ??
         appState?.router.auto_disable_failure_threshold ??
@@ -1715,7 +1344,9 @@ function App() {
     );
     setProviderWireApi(targetFull.wire_api ?? "responses");
     setProviderSupportsWebsockets(targetFull.supports_websockets ?? false);
-    setProviderImageDetailOriginalToAuto(targetFull.image_detail_original_to_auto ?? false);
+    setProviderImageDetailOriginalToAuto(
+      targetFull.image_detail_original_to_auto ?? false,
+    );
     const serviceTier = targetFull.service_tier?.trim().toLowerCase();
     setProviderServiceTier(
       serviceTier === "priority" || serviceTier === "fast"
@@ -1725,7 +1356,13 @@ function App() {
           : "",
     );
     setProviderTestModel(targetFull.connection_test_model ?? "");
-    setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
+    setProviderModels(
+      targetFull.allowed_models?.length
+        ? targetFull.allowed_models
+        : targetFull.connection_test_model
+          ? [targetFull.connection_test_model]
+          : [],
+    );
     setAllowedModels(targetFull.allowed_models ?? []);
     setModelMappings(targetFull.model_mappings ?? []);
     setBalanceQuery(
@@ -1742,7 +1379,10 @@ function App() {
     setEditorOpen(true);
   }
 
-  function fillClaudeProviderEditor(targetFull: ClaudeProviderConfig, summary: ProviderSummary | null) {
+  function fillClaudeProviderEditor(
+    targetFull: ClaudeProviderConfig,
+    summary: ProviderSummary | null,
+  ) {
     setEditorKind("claude");
     setEditingId(summary?.id ?? targetFull.id);
     setProviderName(summary?.name ?? targetFull.name ?? "");
@@ -1753,19 +1393,43 @@ function App() {
     setProviderEnabledDirty(false);
     setFusionEnabled(targetFull.fusion_enabled ?? false);
     setModelListCleared(false);
-    setProviderAutoDisableResetPeriod(targetFull.auto_disable_reset_period ?? summary?.auto_disable_reset_period ?? "daily");
-    setProviderAutoDisableResetWeekday(targetFull.auto_disable_reset_weekday ?? summary?.auto_disable_reset_weekday ?? 1);
-    setProviderAutoDisableResetDay(targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1);
-    setProviderAutoDisableResetTime(targetFull.auto_disable_reset_time ?? summary?.auto_disable_reset_time ?? "00:00");
+    setProviderAutoDisableResetPeriod(
+      targetFull.auto_disable_reset_period ??
+        summary?.auto_disable_reset_period ??
+        "daily",
+    );
+    setProviderAutoDisableResetWeekday(
+      targetFull.auto_disable_reset_weekday ??
+        summary?.auto_disable_reset_weekday ??
+        1,
+    );
+    setProviderAutoDisableResetDay(
+      targetFull.auto_disable_reset_day ?? summary?.auto_disable_reset_day ?? 1,
+    );
+    setProviderAutoDisableResetTime(
+      targetFull.auto_disable_reset_time ??
+        summary?.auto_disable_reset_time ??
+        "00:00",
+    );
     setProviderAutoDisableOverride(targetFull.auto_disable_override ?? false);
-    setProviderAutoDisableEnabled(targetFull.auto_disable_enabled ?? appState?.router.auto_disable_enabled ?? true);
+    setProviderAutoDisableEnabled(
+      targetFull.auto_disable_enabled ??
+        appState?.router.auto_disable_enabled ??
+        true,
+    );
     setProviderAutoDisableFailureThreshold(
       targetFull.auto_disable_failure_threshold ??
         appState?.router.auto_disable_failure_threshold ??
         3,
     );
     setProviderTestModel(targetFull.connection_test_model ?? "");
-    setProviderModels(targetFull.allowed_models?.length ? targetFull.allowed_models : targetFull.connection_test_model ? [targetFull.connection_test_model] : []);
+    setProviderModels(
+      targetFull.allowed_models?.length
+        ? targetFull.allowed_models
+        : targetFull.connection_test_model
+          ? [targetFull.connection_test_model]
+          : [],
+    );
     setAllowedModels(targetFull.allowed_models ?? []);
     setModelMappings(targetFull.model_mappings ?? []);
     setEditorTab("base");
@@ -1773,7 +1437,10 @@ function App() {
     setEditorOpen(true);
   }
 
-  async function openProviderEditor(provider?: ProviderSummary, tab: EditorTab = "base") {
+  async function openProviderEditor(
+    provider?: ProviderSummary,
+    tab: EditorTab = "base",
+  ) {
     const targetSummary = provider ?? activeProvider;
     if (!targetSummary) return;
     await run(async () => {
@@ -1788,9 +1455,12 @@ function App() {
     const targetSummary = provider ?? appState?.claude_providers[0] ?? null;
     if (!targetSummary) return;
     await run(async () => {
-      const targetFull = await callCommand<ClaudeProviderConfig>("get_claude_provider", {
-        providerId: targetSummary.id,
-      });
+      const targetFull = await callCommand<ClaudeProviderConfig>(
+        "get_claude_provider",
+        {
+          providerId: targetSummary.id,
+        },
+      );
       fillClaudeProviderEditor(targetFull, targetSummary);
     });
   }
@@ -1801,7 +1471,9 @@ function App() {
       const state = await callCommand<AppState>("add_provider", { name });
       setNewProviderCount((value) => value + 1);
       setAppState(state);
-      const created = state.providers.find((provider) => provider.id === state.active_provider_id);
+      const created = state.providers.find(
+        (provider) => provider.id === state.active_provider_id,
+      );
       if (created) {
         const targetFull = await callCommand<ProviderConfig>("get_provider", {
           providerId: created.id,
@@ -1814,14 +1486,21 @@ function App() {
   async function addClaudeProvider() {
     await run(async () => {
       const name = `新 Claude 供应商 ${newProviderCount}`;
-      const state = await callCommand<AppState>("add_claude_provider", { name });
+      const state = await callCommand<AppState>("add_claude_provider", {
+        name,
+      });
       setNewProviderCount((value) => value + 1);
       setAppState(state);
-      const created = state.claude_providers.find((provider) => provider.id === state.active_claude_provider_id);
+      const created = state.claude_providers.find(
+        (provider) => provider.id === state.active_claude_provider_id,
+      );
       if (created) {
-        const targetFull = await callCommand<ClaudeProviderConfig>("get_claude_provider", {
-          providerId: created.id,
-        });
+        const targetFull = await callCommand<ClaudeProviderConfig>(
+          "get_claude_provider",
+          {
+            providerId: created.id,
+          },
+        );
         fillClaudeProviderEditor(targetFull, created);
       }
     });
@@ -1833,9 +1512,13 @@ function App() {
     try {
       const state = await callCommand<AppState>("update_model_capabilities");
       setAppState(state);
-      setCapabilityMessage(`能力目录已更新为 ${state.capability_version}，请彻底重启 Codex 以刷新模型列表。`);
+      setCapabilityMessage(
+        `能力目录已更新为 ${state.capability_version}，请彻底重启 Codex 以刷新模型列表。`,
+      );
     } catch (error) {
-      setCapabilityMessage(`更新失败：${String(error)}。继续使用已有能力目录。`);
+      setCapabilityMessage(
+        `更新失败：${String(error)}。继续使用已有能力目录。`,
+      );
     } finally {
       setCapabilityBusy(false);
     }
@@ -1850,7 +1533,9 @@ function App() {
       );
       if (thresholdError) throw new Error(thresholdError);
       if (modelListCleared && allowedModels.length === 0) {
-        throw new Error("模型列表已清空，请重新获取或手动添加模型后保存；如需停止使用供应商，请将其停用。");
+        throw new Error(
+          "模型列表已清空，请重新获取或手动添加模型后保存；如需停止使用供应商，请将其停用。",
+        );
       }
       const nextBalance = {
         ...balanceQuery,
@@ -1862,7 +1547,8 @@ function App() {
         config_toml: "",
         base_url: providerBaseUrl,
         wire_api: providerWireApi,
-        supports_websockets: providerWireApi === "responses" && providerSupportsWebsockets,
+        supports_websockets:
+          providerWireApi === "responses" && providerSupportsWebsockets,
         image_detail_original_to_auto: providerImageDetailOriginalToAuto,
         service_tier: providerServiceTier,
         auto_disable_reset_period: providerAutoDisableResetPeriod,
@@ -1902,7 +1588,9 @@ function App() {
       );
       if (thresholdError) throw new Error(thresholdError);
       if (modelListCleared && allowedModels.length === 0) {
-        throw new Error("模型列表已清空，请重新获取或手动添加模型后保存；如需停止使用供应商，请将其停用。");
+        throw new Error(
+          "模型列表已清空，请重新获取或手动添加模型后保存；如需停止使用供应商，请将其停用。",
+        );
       }
       const payload: Record<string, unknown> = {
         provider_id: editingId,
@@ -1977,9 +1665,12 @@ function App() {
         payload,
       });
       setAppState(state);
-      const queriedProvider = await callCommand<ProviderConfig>("get_provider", {
-        providerId: editingId,
-      });
+      const queriedProvider = await callCommand<ProviderConfig>(
+        "get_provider",
+        {
+          providerId: editingId,
+        },
+      );
       const status = queriedProvider.balance_status ?? null;
       setBalanceTestStatus(status);
       setBalanceAccountOptions(status?.accounts ?? []);
@@ -1995,15 +1686,19 @@ function App() {
         api_key: null,
         balance_query: {
           ...balanceQuery,
-          endpoint: balanceQuery.endpoint || endpointFromBaseUrl(providerBaseUrl),
+          endpoint:
+            balanceQuery.endpoint || endpointFromBaseUrl(providerBaseUrl),
         },
       };
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
       }
-      const result = await callCommand<ProviderModelsResponse>("load_provider_models", {
-        payload,
-      });
+      const result = await callCommand<ProviderModelsResponse>(
+        "load_provider_models",
+        {
+          payload,
+        },
+      );
       setProviderModels(result.models);
       if (allowedModels.length === 0 && result.models.length > 0) {
         setAllowedModels(result.models);
@@ -2025,9 +1720,12 @@ function App() {
       if (providerApiKeyDirty) {
         payload.api_key = providerApiKey;
       }
-      const result = await callCommand<ProviderModelsResponse>("load_claude_provider_models", {
-        payload,
-      });
+      const result = await callCommand<ProviderModelsResponse>(
+        "load_claude_provider_models",
+        {
+          payload,
+        },
+      );
       setProviderModels(result.models);
       if (allowedModels.length === 0 && result.models.length > 0) {
         setAllowedModels(result.models);
@@ -2053,7 +1751,10 @@ function App() {
     });
   }
 
-  async function toggleClaudeProvider(provider: ProviderSummary, enabled: boolean) {
+  async function toggleClaudeProvider(
+    provider: ProviderSummary,
+    enabled: boolean,
+  ) {
     await run(async () => {
       const state = await callCommand<AppState>("save_claude_provider", {
         payload: {
@@ -2085,7 +1786,10 @@ function App() {
     });
   }
 
-  async function openProviderLatencyDialog(provider: ProviderSummary, kind: ProviderKind) {
+  async function openProviderLatencyDialog(
+    provider: ProviderSummary,
+    kind: ProviderKind,
+  ) {
     setLatencyDialog({
       provider,
       providerKind: kind,
@@ -2099,9 +1803,14 @@ function App() {
     });
 
     try {
-      const config = kind === "claude"
-        ? await callCommand<ClaudeProviderConfig>("get_claude_provider", { providerId: provider.id })
-        : await callCommand<ProviderConfig>("get_provider", { providerId: provider.id });
+      const config =
+        kind === "claude"
+          ? await callCommand<ClaudeProviderConfig>("get_claude_provider", {
+              providerId: provider.id,
+            })
+          : await callCommand<ProviderConfig>("get_provider", {
+              providerId: provider.id,
+            });
       let models = normalizeModelNames([
         ...config.allowed_models,
         ...config.model_mappings.map((mapping) => mapping.target),
@@ -2109,7 +1818,9 @@ function App() {
       ]);
       try {
         const response = await callCommand<ProviderModelsResponse>(
-          kind === "claude" ? "load_claude_provider_models" : "load_provider_models",
+          kind === "claude"
+            ? "load_claude_provider_models"
+            : "load_provider_models",
           { payload: { provider_id: provider.id } },
         );
         if (response.models.length > 0) models = response.models;
@@ -2117,60 +1828,79 @@ function App() {
         if (models.length === 0) throw err;
       }
       const preferredModel = config.connection_test_model.trim();
-      const selectedModel = models.find((model) => model.toLowerCase() === preferredModel.toLowerCase())
-        ?? models[0]
-        ?? "";
-      setLatencyDialog((current) => current?.provider.id === provider.id
-        ? { ...current, models, selectedModel, preparing: false }
-        : current);
+      const selectedModel =
+        models.find(
+          (model) => model.toLowerCase() === preferredModel.toLowerCase(),
+        ) ??
+        models[0] ??
+        "";
+      setLatencyDialog((current) =>
+        current?.provider.id === provider.id
+          ? { ...current, models, selectedModel, preparing: false }
+          : current,
+      );
     } catch (err) {
-      setLatencyDialog((current) => current?.provider.id === provider.id
-        ? {
-            ...current,
-            preparing: false,
-            result: { ok: false, message: String(err) },
-          }
-        : current);
+      setLatencyDialog((current) =>
+        current?.provider.id === provider.id
+          ? {
+              ...current,
+              preparing: false,
+              result: { ok: false, message: String(err) },
+            }
+          : current,
+      );
     }
   }
 
   async function testProviderLatency() {
-    if (!latencyDialog || !latencyDialog.selectedModel || !latencyDialog.prompt.trim()) return;
+    if (
+      !latencyDialog ||
+      !latencyDialog.selectedModel ||
+      !latencyDialog.prompt.trim()
+    )
+      return;
     const target = latencyDialog;
     setLatencyDialog({ ...target, testing: true, result: null });
     try {
-      const response = await callCommand<ProviderLatencyTestResponse>("test_provider_latency_state", {
-        payload: {
-          provider_id: target.provider.id,
-          provider_kind: target.providerKind,
-          model: target.selectedModel,
-          prompt: target.prompt.trim(),
-          stream: target.streaming,
+      const response = await callCommand<ProviderLatencyTestResponse>(
+        "test_provider_latency_state",
+        {
+          payload: {
+            provider_id: target.provider.id,
+            provider_kind: target.providerKind,
+            model: target.selectedModel,
+            prompt: target.prompt.trim(),
+            stream: target.streaming,
+          },
         },
-      });
+      );
       setAppState(response.app_state);
-      setLatencyDialog((current) => current?.provider.id === target.provider.id
-        ? {
-            ...current,
-            testing: false,
-            result: {
-              ok: response.ok,
-              latencyMs: response.latency_ms,
-              message: response.ok
-                ? `${target.selectedModel} ${target.streaming ? "流式响应完成" : "同步响应正常"}`
-                : response.error || "测速失败",
-              reply: response.reply,
-            },
-          }
-        : current);
+      setLatencyDialog((current) =>
+        current?.provider.id === target.provider.id
+          ? {
+              ...current,
+              testing: false,
+              result: {
+                ok: response.ok,
+                latencyMs: response.latency_ms,
+                message: response.ok
+                  ? `${target.selectedModel} ${target.streaming ? "流式响应完成" : "同步响应正常"}`
+                  : response.error || "测速失败",
+                reply: response.reply,
+              },
+            }
+          : current,
+      );
     } catch (err) {
-      setLatencyDialog((current) => current?.provider.id === target.provider.id
-        ? {
-            ...current,
-            testing: false,
-            result: { ok: false, message: String(err) },
-          }
-        : current);
+      setLatencyDialog((current) =>
+        current?.provider.id === target.provider.id
+          ? {
+              ...current,
+              testing: false,
+              result: { ok: false, message: String(err) },
+            }
+          : current,
+      );
     }
   }
 
@@ -2232,63 +1962,81 @@ function App() {
     managedSkillLocation: string,
   ) {
     await run(async () => {
-      const view = await callCommand<SkillManagementView>("save_skill_client_config", {
-        payload: {
-          client,
-          skill_locations: skillLocations,
-          managed_skill_location: managedSkillLocation,
+      const view = await callCommand<SkillManagementView>(
+        "save_skill_client_config",
+        {
+          payload: {
+            client,
+            skill_locations: skillLocations,
+            managed_skill_location: managedSkillLocation,
+          },
         },
-      });
+      );
       setSkillManagement(view);
     });
   }
 
   async function promoteClientSkill(skill: ClientSkillView) {
     await run(async () => {
-      const view = await callCommand<SkillManagementView>("promote_client_skill", {
-        payload: {
-          client: skill.client,
-          skill_path: skill.path,
-          sharing_scope: [skill.client],
+      const view = await callCommand<SkillManagementView>(
+        "promote_client_skill",
+        {
+          payload: {
+            client: skill.client,
+            skill_path: skill.path,
+            sharing_scope: [skill.client],
+          },
         },
-      });
+      );
       setSkillManagement(view);
     });
   }
 
   async function useExistingSharedSkill(skill: ClientSkillView) {
     await run(async () => {
-      const view = await callCommand<SkillManagementView>("replace_client_skill_with_shared", {
-        payload: {
-          client: skill.client,
-          skill_path: skill.path,
+      const view = await callCommand<SkillManagementView>(
+        "replace_client_skill_with_shared",
+        {
+          payload: {
+            client: skill.client,
+            skill_path: skill.path,
+          },
         },
-      });
+      );
       setSkillManagement(view);
     });
   }
 
-  async function setSkillSharingScope(skill: SharedSkillView, scope: AgentClientKind[]) {
+  async function setSkillSharingScope(
+    skill: SharedSkillView,
+    scope: AgentClientKind[],
+  ) {
     await run(async () => {
-      const view = await callCommand<SkillManagementView>("set_skill_sharing_scope", {
-        payload: {
-          skill_identity: skill.identity,
-          sharing_scope: scope,
+      const view = await callCommand<SkillManagementView>(
+        "set_skill_sharing_scope",
+        {
+          payload: {
+            skill_identity: skill.identity,
+            sharing_scope: scope,
+          },
         },
-      });
+      );
       setSkillManagement(view);
     });
   }
 
   async function deleteSharedSkill(skill: SharedSkillView) {
-    if (!window.confirm(`删除 Shared Skill「${skill.identity}」并移除所有 exposure？`)) return;
     await run(async () => {
-      const view = await callCommand<SkillManagementView>("delete_shared_skill", {
-        payload: {
-          skill_identity: skill.identity,
+      const view = await callCommand<SkillManagementView>(
+        "delete_shared_skill",
+        {
+          payload: {
+            skill_identity: skill.identity,
+          },
         },
-      });
+      );
       setSkillManagement(view);
+      setPendingSharedSkillDeletion(null);
     });
   }
 
@@ -2327,7 +2075,10 @@ function App() {
       if (patch.new_api_target) {
         next.path = defaultBalancePath(next.query_type, patch.new_api_target);
       }
-      if (next.query_type === "new_api" && next.new_api_target === "account_balance") {
+      if (
+        next.query_type === "new_api" &&
+        next.new_api_target === "account_balance"
+      ) {
         next.auth_mode = "separate_token";
       } else if (next.query_type === "ai_gate") {
         next.auth_mode = "provider_token";
@@ -2344,7 +2095,7 @@ function App() {
         </div>
         <strong>XXSwitch</strong>
         <p>{error || "正在加载本地网关状态"}</p>
-        {error && <button onClick={() => refresh()}>重试</button>}
+        {error && <Button onClick={() => refresh()}>重试</Button>}
       </main>
     );
   }
@@ -2400,7 +2151,7 @@ function App() {
   ] as const;
 
   return (
-    <main className="app">
+    <main className={`app ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-logo">
@@ -2408,16 +2159,18 @@ function App() {
           </div>
           <div>
             <strong>XXSwitch</strong>
-            <small>LOCAL AI GATEWAY</small>
+            <small>你的本地 AI 工作区</small>
           </div>
         </div>
 
-        <nav className="nav">
+        <nav aria-label="主导航" className="nav">
           {navGroups.map((group) => (
             <div className="nav-section" key={group.label}>
               <span className="nav-section-label">{group.label}</span>
               {group.items.map(([key, label]) => (
-                <button
+                <Button
+                  aria-current={screen === key ? "page" : undefined}
+                  title={label}
                   className={screen === key ? "active" : ""}
                   key={key}
                   onClick={() => navigateToScreen(key as Screen)}
@@ -2425,61 +2178,92 @@ function App() {
                 >
                   <NavIcon type={key as Screen} />
                   <span>{label}</span>
-                </button>
+                </Button>
               ))}
             </div>
           ))}
         </nav>
 
-        <div className="sidebar-meta">
-          <span className={routerOn ? "online" : "offline"}>
-            <i />
-            {routerOn ? "网关运行中" : "网关未运行"}
-          </span>
-          <small>v{appState.app_version}</small>
+        <div className="sidebar-footer">
+          <div className="gateway-status">
+            <span
+              className={`gateway-status-icon ${routerOn ? "online" : "offline"}`}
+            >
+              <Network size={18} aria-hidden="true" />
+            </span>
+            <div>
+              <strong>
+                本地网关
+                <span className={`dot ${routerOn ? "ok" : "muted"}`} />
+              </strong>
+              <code>
+                {appState.router.host}:{appState.router.port}
+              </code>
+            </div>
+          </div>
+          <div className="sidebar-meta">
+            <small>{appState.app_version.replace(/^v?/, "v")}</small>
+            <AppearanceControl />
+          </div>
         </div>
       </aside>
 
       <section className="shell" ref={shellRef}>
         <header className="topbar">
-          <div>
+          <Button
+            aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+            className="icon-button sidebar-toggle"
+            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+          >
+            {sidebarCollapsed ? (
+              <PanelLeftOpen size={18} aria-hidden="true" />
+            ) : (
+              <PanelLeftClose size={18} aria-hidden="true" />
+            )}
+          </Button>
+          <div className="topbar-heading">
             <h1>
               {screen === "dashboard"
                 ? "总览"
                 : screen === "route"
                   ? "路由"
-                : screen === "providers"
-                  ? "供应商"
-                  : screen === "skills"
-                    ? "Skill 管理"
-                  : screen === "usage"
-                    ? "使用统计"
-                    : screen === "requests"
-                      ? "请求记录"
-                      : "设置"}
+                  : screen === "providers"
+                    ? "供应商"
+                    : screen === "skills"
+                      ? "Skill 管理"
+                      : screen === "usage"
+                        ? "使用统计"
+                        : screen === "requests"
+                          ? "请求记录"
+                          : "设置"}
             </h1>
             <p>
               {screen === "dashboard"
                 ? "用量、供应商与请求质量"
                 : screen === "route"
                   ? "管理 Codex、Claude 与 Pi 的本地接管"
-                : screen === "providers"
-                  ? "管理上游连接、余额监控与路由顺序"
-                  : screen === "skills"
-                    ? "管理 Codex、Claude 与 Pi 之间的本机 Shared Skills"
-                : screen === "usage"
-                    ? "分析经过路由的调用、Token 与供应商使用情况"
-                    : screen === "requests"
-                      ? "经 XXSwitch 转发的请求"
-                      : "本地网关运行参数"}
+                  : screen === "providers"
+                    ? "管理上游连接、余额监控与路由顺序"
+                    : screen === "skills"
+                      ? "管理 Codex、Claude 与 Pi 之间的本机 Shared Skills"
+                      : screen === "usage"
+                        ? "分析经过路由的调用、Token 与供应商使用情况"
+                        : screen === "requests"
+                          ? "经 XXSwitch 转发的请求"
+                          : "本地网关运行参数"}
             </p>
           </div>
           <div className="top-actions">
+            {import.meta.env.DEV && import.meta.env.MODE === "ui-preview" && (
+              <Badge className="preview-badge">模拟数据 · 独立预览</Badge>
+            )}
             <StatusPill ok={routerOn} />
             <div className="client-switch">
+              <Code2 size={14} aria-hidden="true" />
               <span>Codex</span>
               <Toggle
                 checked={appState.clients.codex.enabled}
+                label="接管 Codex"
                 disabled={busy}
                 onChange={(checked) => void saveClientConfig("codex", checked)}
               />
@@ -2488,6 +2272,7 @@ function App() {
               <span>Claude</span>
               <Toggle
                 checked={appState.clients.claude.enabled}
+                label="接管 Claude Code"
                 disabled={busy}
                 onChange={(checked) => void saveClientConfig("claude", checked)}
               />
@@ -2496,37 +2281,50 @@ function App() {
               <span>Pi</span>
               <Toggle
                 checked={appState.clients.pi.enabled}
+                label="接管 Pi"
                 disabled={busy}
                 onChange={(checked) => void saveClientConfig("pi", checked)}
               />
             </div>
             {screen === "route" && (
               <div className="topbar-route-actions">
-                <button
+                <Button
                   className="ghost"
                   disabled={busy || !routeDirty}
                   onClick={() => setRouterDraft(savedRouter)}
                   type="button"
                 >
                   撤销修改
-                </button>
-                <button
+                </Button>
+                <Button
                   className="primary"
                   disabled={routeSaveDisabled}
                   onClick={() => void saveRouter(routerDraft, true)}
                   type="button"
                 >
                   保存修改
-                </button>
+                </Button>
               </div>
             )}
           </div>
         </header>
 
-        {error && <div className="error-banner">{error}</div>}
+        {error && !editorOpen && (
+          <div className="error-banner" role="alert">
+            {error}
+            <Button
+              aria-label="关闭错误提示"
+              className="close"
+              onClick={() => setError("")}
+            >
+              ×
+            </Button>
+          </div>
+        )}
 
         {screen === "dashboard" && (
           <Dashboard
+            onManageProviders={() => navigateToScreen("providers")}
             activeProvider={activeProvider}
             cachedInput={cachedInput}
             modelRows={modelRows}
@@ -2567,19 +2365,38 @@ function App() {
               }
             }}
             onKindChange={setProviderKind}
-            onRefreshBalance={providerKind === "claude" ? async (_provider) => undefined : refreshProviderBalance}
-            onReorder={providerKind === "claude" ? reorderClaudeProviders : reorderProviders}
-            onTestLatency={(provider) => openProviderLatencyDialog(provider, providerKind)}
-            onToggle={providerKind === "claude" ? toggleClaudeProvider : toggleProvider}
+            onRefreshBalance={
+              providerKind === "claude"
+                ? async (_provider) => undefined
+                : refreshProviderBalance
+            }
+            onReorder={
+              providerKind === "claude"
+                ? reorderClaudeProviders
+                : reorderProviders
+            }
+            onTestLatency={(provider) =>
+              openProviderLatencyDialog(provider, providerKind)
+            }
+            onToggle={
+              providerKind === "claude" ? toggleClaudeProvider : toggleProvider
+            }
             providerKind={providerKind}
-            providers={providerKind === "claude" ? appState.claude_providers : appState.providers}
+            providers={
+              providerKind === "claude"
+                ? appState.claude_providers
+                : appState.providers
+            }
           />
         )}
 
         {screen === "skills" && (
           <SkillManagementScreen
             busy={busy}
-            onDeleteSharedSkill={deleteSharedSkill}
+            onDeleteSharedSkill={async (skill) => {
+              setError("");
+              setPendingSharedSkillDeletion(skill);
+            }}
             onPromote={promoteClientSkill}
             onRefresh={refreshSkillManagement}
             onSaveClientConfig={saveSkillClientConfig}
@@ -2591,7 +2408,10 @@ function App() {
 
         {screen === "usage" && (
           <UsageScreen
-            configuredProviders={[...appState.providers, ...appState.claude_providers]}
+            configuredProviders={[
+              ...appState.providers,
+              ...appState.claude_providers,
+            ]}
             filter={usageFilter}
             onFilter={applyUsageFilter}
             onRangeChange={applyUsageRange}
@@ -2617,9 +2437,11 @@ function App() {
 
         {screen === "settings" && (
           <section className="settings-grid">
-            <ProviderSync onDownloaded={async () => {
-              setAppState(await callCommand<AppState>("load_app_state"));
-            }} />
+            <ProviderSync
+              onDownloaded={async () => {
+                setAppState(await callCommand<AppState>("load_app_state"));
+              }}
+            />
             <LocalProxySettings
               appState={appState}
               busy={busy}
@@ -2628,7 +2450,7 @@ function App() {
               routerOn={routerOn}
               setRouterDraft={setProxyDraft}
             />
-            <article className="page-panel">
+            <Card className="page-panel">
               <div className="panel-head">
                 <div>
                   <h2>应用</h2>
@@ -2637,7 +2459,15 @@ function App() {
               </div>
               <div className="settings-list">
                 <div className="settings-row application-setting-row">
-                  <div>
+                  <div className="settings-row-description">
+                    <span>界面外观</span>
+                    <small>选择浅色、深色，或自动跟随系统。</small>
+                  </div>
+                  <AppearanceControl />
+                </div>
+                <TrayPreferenceSetting />
+                <div className="settings-row application-setting-row">
+                  <div className="settings-row-description">
                     <span>开机自启</span>
                     <small>登录系统后在后台启动 XXSwitch</small>
                   </div>
@@ -2653,28 +2483,49 @@ function App() {
                   <strong>{appState.app_version}</strong>
                 </div>
                 <div className="settings-row update-check-row">
-                  <div>
+                  <div className="settings-row-description">
                     <span>模型能力目录</span>
-                    <small>OpenAI · DeepSeek · 默认模板 / {appState.capability_version}</small>
-                    <small>{appState.capability_updated_at ? `上次获取：${appState.capability_updated_at}` : "正在使用安装包目录快照"}</small>
-                    {capabilityMessage && <small role="status">{capabilityMessage}</small>}
+                    <small>
+                      OpenAI · DeepSeek · 默认模板 /{" "}
+                      {appState.capability_version}
+                    </small>
+                    <small>
+                      {appState.capability_updated_at
+                        ? `上次获取：${appState.capability_updated_at}`
+                        : "正在使用安装包目录快照"}
+                    </small>
+                    {capabilityMessage && (
+                      <small role="status">{capabilityMessage}</small>
+                    )}
                   </div>
-                  <button className="ghost" disabled={capabilityBusy || busy} onClick={() => void updateModelCapabilities()} type="button">
+                  <Button
+                    className="ghost"
+                    disabled={capabilityBusy || busy}
+                    onClick={() => void updateModelCapabilities()}
+                    type="button"
+                  >
                     {capabilityBusy ? "正在获取…" : "更新模型能力"}
-                  </button>
+                  </Button>
                 </div>
                 <div className="settings-row update-check-row">
-                  <div>
+                  <div className="settings-row-description">
                     <span>远端更新</span>
                     <small>从 GitHub Release 获取最新稳定版本</small>
                   </div>
-                  <button className="ghost" disabled={updateBusy} onClick={() => void checkForUpdate()} type="button">
+                  <Button
+                    className="ghost"
+                    disabled={updateBusy}
+                    onClick={() => void checkForUpdate()}
+                    type="button"
+                  >
                     {updateBusy ? "正在检查…" : "检查更新"}
-                  </button>
+                  </Button>
                 </div>
               </div>
               {updateCheck && (
-                <div className={`update-result ${updateCheck.available ? "available" : "latest"}`}>
+                <div
+                  className={`update-result ${updateCheck.available ? "available" : "latest"}`}
+                >
                   <div>
                     <strong>
                       {updateCheck.available
@@ -2693,17 +2544,23 @@ function App() {
                     <div className="update-actions">
                       {updateConfirming && !updateBusy && (
                         <span className="update-confirm-text">
-                          {updateCheck.asset_name?.toLowerCase().endsWith(".dmg")
+                          {updateCheck.asset_name
+                            ?.toLowerCase()
+                            .endsWith(".dmg")
                             ? "确认后将自动替换当前应用并重启；没有写入权限时 macOS 会请求管理员授权。"
                             : "确认后将下载安装包并退出当前应用。"}
                         </span>
                       )}
                       {updateConfirming && !updateBusy && (
-                        <button className="ghost" onClick={() => setUpdateConfirming(false)} type="button">
+                        <Button
+                          className="ghost"
+                          onClick={() => setUpdateConfirming(false)}
+                          type="button"
+                        >
                           取消
-                        </button>
+                        </Button>
                       )}
-                      <button
+                      <Button
                         className="primary"
                         disabled={updateBusy}
                         onClick={() => {
@@ -2716,70 +2573,105 @@ function App() {
                         }}
                         type="button"
                       >
-                        {updateBusy ? "正在更新…" : updateConfirming ? "确认更新" : "一键更新"}
-                      </button>
+                        {updateBusy
+                          ? "正在更新…"
+                          : updateConfirming
+                            ? "确认更新"
+                            : "一键更新"}
+                      </Button>
                     </div>
                   )}
                 </div>
               )}
-              {updateMessage && <div className="update-message">{updateMessage}</div>}
-            </article>
+              {updateMessage && (
+                <div className="update-message">{updateMessage}</div>
+              )}
+            </Card>
           </section>
         )}
       </section>
 
-      <ProviderImport onImported={async () => {
-        // Preserve unsaved route and provider drafts while updating the saved list.
-        setAppState(await callCommand<AppState>("load_app_state"));
-      }} />
+      <ProviderImport
+        onImported={async () => {
+          // Preserve unsaved route and provider drafts while updating the saved list.
+          setAppState(await callCommand<AppState>("load_app_state"));
+        }}
+      />
+
+      {pendingSharedSkillDeletion && (
+        <ConfirmDialog
+          title="删除共享 Skill"
+          busy={busy}
+          error={error}
+          onClose={() => setPendingSharedSkillDeletion(null)}
+          onConfirm={() => deleteSharedSkill(pendingSharedSkillDeletion)}
+        >
+          删除 Shared Skill「{pendingSharedSkillDeletion.identity}」并移除所有
+          exposure？
+        </ConfirmDialog>
+      )}
 
       {pendingScreen && (
-        <div
-          className="latency-dialog-backdrop"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setPendingScreen(null);
-          }}
+        <DialogSurface
+          title="未保存路由设置"
+          className="unsaved-route-dialog"
+          onClose={() => setPendingScreen(null)}
         >
-          <section
-            aria-labelledby="unsaved-route-dialog-title"
-            aria-modal="true"
-            className="latency-dialog unsaved-route-dialog"
-            role="dialog"
-          >
-            <header>
-              <div>
-                <h2 id="unsaved-route-dialog-title">未保存路由设置</h2>
-                <p>离开当前页面将丢失这些修改。</p>
-              </div>
-            </header>
-            <div className="unsaved-route-dialog-body">
-              你对路由配置所做的修改尚未保存。可以继续编辑并使用右上角的保存按钮，或放弃本次修改。
+          <header>
+            <div>
+              <h2 id="unsaved-route-dialog-title">未保存路由设置</h2>
+              <p>离开当前页面将丢失这些修改。</p>
             </div>
-            <footer>
-              <button autoFocus className="ghost" onClick={() => setPendingScreen(null)} type="button">
-                继续编辑
-              </button>
-              <button className="danger" onClick={discardRouteChangesAndNavigate} type="button">
-                放弃修改
-              </button>
-            </footer>
-          </section>
-        </div>
+          </header>
+          <div className="unsaved-route-dialog-body">
+            你对路由配置所做的修改尚未保存。可以继续编辑并使用右上角的保存按钮，或放弃本次修改。
+          </div>
+          <footer>
+            <Button
+              autoFocus
+              className="ghost"
+              onClick={() => setPendingScreen(null)}
+              type="button"
+            >
+              继续编辑
+            </Button>
+            <Button
+              className="danger"
+              onClick={discardRouteChangesAndNavigate}
+              type="button"
+            >
+              放弃修改
+            </Button>
+          </footer>
+        </DialogSurface>
       )}
 
       {latencyDialog && (
         <ProviderLatencyDialog
           state={latencyDialog}
           onClose={() => setLatencyDialog(null)}
-          onPromptChange={(prompt) => setLatencyDialog((current) => current ? { ...current, prompt, result: null } : current)}
-          onModelChange={(selectedModel) => setLatencyDialog((current) => current ? { ...current, selectedModel, result: null } : current)}
-          onStreamingChange={(streaming) => setLatencyDialog((current) => current ? { ...current, streaming, result: null } : current)}
+          onPromptChange={(prompt) =>
+            setLatencyDialog((current) =>
+              current ? { ...current, prompt, result: null } : current,
+            )
+          }
+          onModelChange={(selectedModel) =>
+            setLatencyDialog((current) =>
+              current ? { ...current, selectedModel, result: null } : current,
+            )
+          }
+          onStreamingChange={(streaming) =>
+            setLatencyDialog((current) =>
+              current ? { ...current, streaming, result: null } : current,
+            )
+          }
           onTest={() => void testProviderLatency()}
         />
       )}
 
       {editorOpen && editorKind === "codex" && (
         <ProviderEditor
+          error={error}
           balanceAccountOptions={balanceAccountOptions}
           balanceQuery={balanceQuery}
           balanceTestStatus={balanceTestStatus}
@@ -2813,9 +2705,13 @@ function App() {
           providerAutoDisableResetTime={providerAutoDisableResetTime}
           providerAutoDisableOverride={providerAutoDisableOverride}
           providerAutoDisableEnabled={providerAutoDisableEnabled}
-          providerAutoDisableFailureThreshold={providerAutoDisableFailureThreshold}
+          providerAutoDisableFailureThreshold={
+            providerAutoDisableFailureThreshold
+          }
           globalAutoDisableEnabled={appState.router.auto_disable_enabled}
-          globalAutoDisableFailureThreshold={appState.router.auto_disable_failure_threshold}
+          globalAutoDisableFailureThreshold={
+            appState.router.auto_disable_failure_threshold
+          }
           providerServiceTier={providerServiceTier}
           providerWireApi={providerWireApi}
           providerSupportsWebsockets={providerSupportsWebsockets}
@@ -2841,21 +2737,28 @@ function App() {
           setModelMappings={setModelMappings}
           setProviderName={setProviderName}
           setProviderAutoDisableResetPeriod={setProviderAutoDisableResetPeriod}
-          setProviderAutoDisableResetWeekday={setProviderAutoDisableResetWeekday}
+          setProviderAutoDisableResetWeekday={
+            setProviderAutoDisableResetWeekday
+          }
           setProviderAutoDisableResetDay={setProviderAutoDisableResetDay}
           setProviderAutoDisableResetTime={setProviderAutoDisableResetTime}
           setProviderAutoDisableOverride={setProviderAutoDisableOverride}
           setProviderAutoDisableEnabled={setProviderAutoDisableEnabled}
-          setProviderAutoDisableFailureThreshold={setProviderAutoDisableFailureThreshold}
+          setProviderAutoDisableFailureThreshold={
+            setProviderAutoDisableFailureThreshold
+          }
           setProviderServiceTier={setProviderServiceTier}
           setProviderWireApi={setProviderWireApi}
-          setProviderImageDetailOriginalToAuto={setProviderImageDetailOriginalToAuto}
+          setProviderImageDetailOriginalToAuto={
+            setProviderImageDetailOriginalToAuto
+          }
           setSecretVisible={setSecretVisible}
           tab={editorTab}
         />
       )}
       {editorOpen && editorKind === "claude" && (
         <ClaudeProviderEditor
+          error={error}
           modelListCleared={modelListCleared}
           onClearModels={() => {
             setAllowedModels([]);
@@ -2881,9 +2784,13 @@ function App() {
           providerAutoDisableResetTime={providerAutoDisableResetTime}
           providerAutoDisableOverride={providerAutoDisableOverride}
           providerAutoDisableEnabled={providerAutoDisableEnabled}
-          providerAutoDisableFailureThreshold={providerAutoDisableFailureThreshold}
+          providerAutoDisableFailureThreshold={
+            providerAutoDisableFailureThreshold
+          }
           globalAutoDisableEnabled={appState.router.auto_disable_enabled}
-          globalAutoDisableFailureThreshold={appState.router.auto_disable_failure_threshold}
+          globalAutoDisableFailureThreshold={
+            appState.router.auto_disable_failure_threshold
+          }
           secretVisible={secretVisible}
           setAllowedModels={setAllowedModels}
           setModelMappings={setModelMappings}
@@ -2901,12 +2808,16 @@ function App() {
           }}
           setProviderName={setProviderName}
           setProviderAutoDisableResetPeriod={setProviderAutoDisableResetPeriod}
-          setProviderAutoDisableResetWeekday={setProviderAutoDisableResetWeekday}
+          setProviderAutoDisableResetWeekday={
+            setProviderAutoDisableResetWeekday
+          }
           setProviderAutoDisableResetDay={setProviderAutoDisableResetDay}
           setProviderAutoDisableResetTime={setProviderAutoDisableResetTime}
           setProviderAutoDisableOverride={setProviderAutoDisableOverride}
           setProviderAutoDisableEnabled={setProviderAutoDisableEnabled}
-          setProviderAutoDisableFailureThreshold={setProviderAutoDisableFailureThreshold}
+          setProviderAutoDisableFailureThreshold={
+            setProviderAutoDisableFailureThreshold
+          }
           setSecretVisible={setSecretVisible}
         />
       )}
@@ -2935,15 +2846,22 @@ function LocalProxySettings({
     routerDraft.auto_disable_enabled,
     routerDraft.auto_disable_failure_threshold,
   );
-  const endpointError = routerDraft.enabled && !routerDraft.host.trim()
-    ? "监听地址不能为空。"
-    : routerDraft.enabled && (!Number.isInteger(routerDraft.port) || routerDraft.port < 1 || routerDraft.port > 65_535)
-      ? "监听端口必须是 1 到 65535 之间的整数。"
-      : "";
+  const endpointError =
+    routerDraft.enabled && !routerDraft.host.trim()
+      ? "监听地址不能为空。"
+      : routerDraft.enabled &&
+          (!Number.isInteger(routerDraft.port) ||
+            routerDraft.port < 1 ||
+            routerDraft.port > 65_535)
+        ? "监听端口必须是 1 到 65535 之间的整数。"
+        : "";
   const proxySettingsValid =
     !endpointError && !timeoutError && !slowModeError && !autoDisableError;
   const updateTimeout = (
-    field: "connect_timeout_secs" | "response_header_timeout_secs" | "stream_idle_timeout_secs",
+    field:
+      | "connect_timeout_secs"
+      | "response_header_timeout_secs"
+      | "stream_idle_timeout_secs",
     rawValue: string,
   ) => {
     const value = Number(rawValue);
@@ -2976,30 +2894,35 @@ function LocalProxySettings({
   };
 
   return (
-    <article className="page-panel local-proxy-settings">
+    <Card className="page-panel local-proxy-settings">
       <div className="panel-head">
         <div>
           <h2>本地代理</h2>
           <p>配置网关监听、上游超时与请求延迟。</p>
         </div>
-        <span className={`state-pill ${routerOn ? "ok" : "warn"}`}>
+        <Badge className={`state-pill ${routerOn ? "ok" : "warn"}`}>
           <span />
           {routerOn ? "运行中" : "未运行"}
-        </span>
+        </Badge>
       </div>
 
       <div className="route-form-grid">
         <label className="compact-field">
           <span>监听地址</span>
-          <input
+          <TextField
             aria-invalid={Boolean(endpointError && !routerDraft.host.trim())}
             value={routerDraft.host}
-            onChange={(event) => setRouterDraft({ ...routerDraft, host: event.currentTarget.value })}
+            onChange={(event) =>
+              setRouterDraft({
+                ...routerDraft,
+                host: event.currentTarget.value,
+              })
+            }
           />
         </label>
         <label className="compact-field">
           <span>监听端口</span>
-          <input
+          <TextField
             aria-invalid={Boolean(endpointError && routerDraft.host.trim())}
             inputMode="numeric"
             value={String(routerDraft.port)}
@@ -3012,7 +2935,9 @@ function LocalProxySettings({
           />
         </label>
       </div>
-      {endpointError ? <small className="settings-error">{endpointError}</small> : null}
+      {endpointError ? (
+        <small className="settings-error">{endpointError}</small>
+      ) : null}
 
       <div className="route-timeout-settings">
         <div>
@@ -3022,27 +2947,31 @@ function LocalProxySettings({
         <div className="route-timeout-grid">
           <label className="compact-field">
             <span>连接超时（秒）</span>
-            <input
+            <TextField
               aria-invalid={
                 routerDraft.connect_timeout_secs < 1 ||
-                routerDraft.connect_timeout_secs > ROUTER_TIMEOUT_LIMITS.connect_timeout_secs
+                routerDraft.connect_timeout_secs >
+                  ROUTER_TIMEOUT_LIMITS.connect_timeout_secs
               }
               max={ROUTER_TIMEOUT_LIMITS.connect_timeout_secs}
               min={1}
               step={1}
               type="number"
               value={routerDraft.connect_timeout_secs}
-              onChange={(event) => updateTimeout("connect_timeout_secs", event.currentTarget.value)}
+              onChange={(event) =>
+                updateTimeout("connect_timeout_secs", event.currentTarget.value)
+              }
             />
           </label>
           <label className="compact-field">
             <span>响应头超时（秒）</span>
-            <input
+            <TextField
               aria-invalid={
                 routerDraft.response_header_timeout_secs < 1 ||
                 routerDraft.response_header_timeout_secs >
                   ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs ||
-                routerDraft.response_header_timeout_secs < routerDraft.connect_timeout_secs
+                routerDraft.response_header_timeout_secs <
+                  routerDraft.connect_timeout_secs
               }
               max={ROUTER_TIMEOUT_LIMITS.response_header_timeout_secs}
               min={1}
@@ -3050,24 +2979,34 @@ function LocalProxySettings({
               type="number"
               value={routerDraft.response_header_timeout_secs}
               onChange={(event) =>
-                updateTimeout("response_header_timeout_secs", event.currentTarget.value)
+                updateTimeout(
+                  "response_header_timeout_secs",
+                  event.currentTarget.value,
+                )
               }
             />
           </label>
           <label className="compact-field">
             <span>流空闲超时（秒）</span>
-            <input
+            <TextField
               aria-invalid={
                 routerDraft.stream_idle_timeout_secs < 1 ||
-                routerDraft.stream_idle_timeout_secs > ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs ||
-                routerDraft.stream_idle_timeout_secs < routerDraft.response_header_timeout_secs
+                routerDraft.stream_idle_timeout_secs >
+                  ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs ||
+                routerDraft.stream_idle_timeout_secs <
+                  routerDraft.response_header_timeout_secs
               }
               max={ROUTER_TIMEOUT_LIMITS.stream_idle_timeout_secs}
               min={1}
               step={1}
               type="number"
               value={routerDraft.stream_idle_timeout_secs}
-              onChange={(event) => updateTimeout("stream_idle_timeout_secs", event.currentTarget.value)}
+              onChange={(event) =>
+                updateTimeout(
+                  "stream_idle_timeout_secs",
+                  event.currentTarget.value,
+                )
+              }
             />
           </label>
         </div>
@@ -3080,25 +3019,27 @@ function LocalProxySettings({
             <strong>Slow 模式</strong>
             <p>流式请求等待期间保持连接，延迟结束后再连接上游。</p>
           </div>
-          <div className="slow-mode-control" role="group" aria-label="Slow 模式">
-            {(["off", "fixed", "random"] as const).map((mode) => (
-              <button
-                aria-pressed={routerDraft.slow_mode === mode}
-                className={routerDraft.slow_mode === mode ? "active" : ""}
-                key={mode}
-                onClick={() => selectSlowMode(mode)}
-                type="button"
-              >
-                {mode === "off" ? "关闭" : mode === "fixed" ? "固定" : "随机"}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl
+            className="slow-mode-control"
+            label="Slow 模式"
+            value={routerDraft.slow_mode}
+            onChange={selectSlowMode}
+            options={[
+              { value: "off", label: "关闭" },
+              { value: "fixed", label: "固定" },
+              { value: "random", label: "随机" },
+            ]}
+          />
         </div>
         {routerDraft.slow_mode !== "off" ? (
           <div className="route-slow-grid">
             <label className="compact-field">
-              <span>{routerDraft.slow_mode === "fixed" ? "延迟（秒）" : "最小延迟（秒）"}</span>
-              <input
+              <span>
+                {routerDraft.slow_mode === "fixed"
+                  ? "延迟（秒）"
+                  : "最小延迟（秒）"}
+              </span>
+              <TextField
                 aria-invalid={
                   routerDraft.slow_delay_secs < 1 ||
                   routerDraft.slow_delay_secs > MAX_SLOW_DELAY_SECS
@@ -3108,24 +3049,32 @@ function LocalProxySettings({
                 step={1}
                 type="number"
                 value={routerDraft.slow_delay_secs}
-                onChange={(event) => updateSlowDelay("slow_delay_secs", event.currentTarget.value)}
+                onChange={(event) =>
+                  updateSlowDelay("slow_delay_secs", event.currentTarget.value)
+                }
               />
             </label>
             {routerDraft.slow_mode === "random" ? (
               <label className="compact-field">
                 <span>最大延迟（秒）</span>
-                <input
+                <TextField
                   aria-invalid={
                     routerDraft.slow_delay_max_secs < 1 ||
                     routerDraft.slow_delay_max_secs > MAX_SLOW_DELAY_SECS ||
-                    routerDraft.slow_delay_max_secs < routerDraft.slow_delay_secs
+                    routerDraft.slow_delay_max_secs <
+                      routerDraft.slow_delay_secs
                   }
                   max={MAX_SLOW_DELAY_SECS}
                   min={1}
                   step={1}
                   type="number"
                   value={routerDraft.slow_delay_max_secs}
-                  onChange={(event) => updateSlowDelay("slow_delay_max_secs", event.currentTarget.value)}
+                  onChange={(event) =>
+                    updateSlowDelay(
+                      "slow_delay_max_secs",
+                      event.currentTarget.value,
+                    )
+                  }
                 />
               </label>
             ) : null}
@@ -3137,9 +3086,12 @@ function LocalProxySettings({
       <div className="route-toggle-line">
         <div>
           <strong>自动禁用供应商</strong>
-          <p>连续失败达到次数后停用供应商，并按供应商的刷新周期自动恢复。供应商可单独覆盖此策略。</p>
+          <p>
+            连续失败达到次数后停用供应商，并按供应商的刷新周期自动恢复。供应商可单独覆盖此策略。
+          </p>
         </div>
         <Toggle
+          label="自动停用故障供应商"
           checked={routerDraft.auto_disable_enabled}
           disabled={busy}
           onChange={(auto_disable_enabled) =>
@@ -3150,7 +3102,7 @@ function LocalProxySettings({
       {routerDraft.auto_disable_enabled ? (
         <label className="compact-field">
           <span>连续失败次数</span>
-          <input
+          <TextField
             aria-invalid={Boolean(autoDisableError)}
             max={MAX_AUTO_DISABLE_FAILURE_THRESHOLD}
             min={1}
@@ -3160,7 +3112,9 @@ function LocalProxySettings({
             onChange={(event) =>
               setRouterDraft({
                 ...routerDraft,
-                auto_disable_failure_threshold: Number(event.currentTarget.value),
+                auto_disable_failure_threshold: Number(
+                  event.currentTarget.value,
+                ),
               })
             }
           />
@@ -3171,9 +3125,13 @@ function LocalProxySettings({
       <div className="route-toggle-line debug-mode-toggle">
         <div>
           <strong>以未压缩 JSON 转发</strong>
-          <p>始终本地解压读取模型。关闭时保留 zstd 压缩传输，改写请求后重新压缩；开启时向上游发送未压缩 JSON。</p>
+          <p>
+            始终本地解压读取模型。关闭时保留 zstd
+            压缩传输，改写请求后重新压缩；开启时向上游发送未压缩 JSON。
+          </p>
         </div>
         <Toggle
+          label="以未压缩 JSON 转发"
           checked={routerDraft.zstd_decompression_enabled}
           disabled={busy}
           onChange={(zstd_decompression_enabled) =>
@@ -3187,9 +3145,12 @@ function LocalProxySettings({
           <p>保存入站请求、实际上游请求和上游原始响应；认证信息会脱敏。</p>
         </div>
         <Toggle
+          label="启用 Debug 模式"
           checked={routerDraft.debug_mode}
           disabled={busy}
-          onChange={(debug_mode) => setRouterDraft({ ...routerDraft, debug_mode })}
+          onChange={(debug_mode) =>
+            setRouterDraft({ ...routerDraft, debug_mode })
+          }
         />
       </div>
       <div className="route-toggle-line">
@@ -3197,6 +3158,7 @@ function LocalProxySettings({
           <strong>启动程序后自动运行代理</strong>
         </div>
         <Toggle
+          label="启动程序后自动运行代理"
           checked={routerDraft.enabled}
           disabled={busy}
           onChange={(enabled) => setRouterDraft({ ...routerDraft, enabled })}
@@ -3210,25 +3172,32 @@ function LocalProxySettings({
         <Toggle
           checked={routerDraft.host !== "127.0.0.1"}
           onChange={(checked) =>
-            setRouterDraft({ ...routerDraft, host: checked ? "0.0.0.0" : "127.0.0.1" })
+            setRouterDraft({
+              ...routerDraft,
+              host: checked ? "0.0.0.0" : "127.0.0.1",
+            })
           }
         />
       </div>
 
       <div className="route-footer-actions">
-        <button className="ghost" onClick={() => setRouterDraft(appState.router)} type="button">
+        <Button
+          className="ghost"
+          onClick={() => setRouterDraft(appState.router)}
+          type="button"
+        >
           撤销修改
-        </button>
-        <button
+        </Button>
+        <Button
           className="primary"
           disabled={busy || !proxySettingsValid}
           onClick={() => onSaveRouter(routerDraft, true)}
           type="button"
         >
           保存代理设置
-        </button>
+        </Button>
       </div>
-    </article>
+    </Card>
   );
 }
 
@@ -3242,11 +3211,15 @@ function RouteScreen({
 }: {
   appState: AppState;
   busy: boolean;
-  onSaveClientConfig: (kind: AgentClientKind, enabled: boolean) => Promise<void>;
+  onSaveClientConfig: (
+    kind: AgentClientKind,
+    enabled: boolean,
+  ) => Promise<void>;
   onSaveMultiAgentEnabled: (enabled: boolean) => Promise<void>;
   routerDraft: RouterConfig;
   setRouterDraft: (router: RouterConfig) => void;
 }) {
+  const [showDiff, setShowDiff] = useState(false);
   const providerNameError = routerModelProviderError(routerDraft);
   const selectedModelUnavailable = routerSelectedModelUnavailable(
     routerDraft,
@@ -3265,71 +3238,123 @@ function RouteScreen({
         <h2>路由配置</h2>
       </div>
 
+      {showDiff && (
+        <DialogSurface
+          title="客户端配置变更"
+          onClose={() => setShowDiff(false)}
+        >
+          <header>
+            <div>
+              <h2>客户端配置变更</h2>
+              <p>由 XXSwitch 管理的配置字段。</p>
+            </div>
+            <Button className="close" onClick={() => setShowDiff(false)}>
+              ×
+            </Button>
+          </header>
+          <div className="latency-dialog-body">
+            {appState.diffs.length ? (
+              appState.diffs.map((diff, index) => (
+                <div className="config-diff" key={`${diff.path}-${index}`}>
+                  <code>{diff.path}</code>
+                  <span>{diff.action}</span>
+                </div>
+              ))
+            ) : (
+              <EmptyState
+                title="暂无待应用变更"
+                description="当前客户端配置已与网关设置保持一致。"
+              />
+            )}
+          </div>
+          <footer>
+            <Button className="primary" onClick={() => setShowDiff(false)}>
+              完成
+            </Button>
+          </footer>
+        </DialogSurface>
+      )}
       <div className="route-config-grid">
-        <article className="route-card route-codex-card">
+        <Card className="route-card route-codex-card">
           <div className="route-card-head">
             <h3>Codex 接管</h3>
-            <span className={`state-pill ${appState.clients.codex.enabled ? "ok" : "warn"}`}>
+            <Badge
+              className={`state-pill ${appState.clients.codex.enabled ? "ok" : "warn"}`}
+            >
               <span />
               {appState.clients.codex.enabled ? "已接管" : "未接管"}
-            </span>
+            </Badge>
           </div>
-          <label className="compact-field">
+          <div className="compact-field">
             <span>配置文件</span>
             <div className="copy-field">
               <strong>{appState.codex_config_path}</strong>
-              <button className="ghost small">打开文件</button>
+              <CopyButton
+                label="复制 Codex 配置路径"
+                text={appState.codex_config_path}
+              />
             </div>
-          </label>
-          <label className="compact-field">
+          </div>
+          <div className="compact-field">
             <span>当前接管地址</span>
             <div className="copy-field accent">
               <strong>{routeBaseUrl(routerDraft)}</strong>
-              <button className="ghost small">复制</button>
+              <CopyButton
+                label="复制 Codex 接管地址"
+                text={routeBaseUrl(routerDraft)}
+              />
             </div>
-          </label>
+          </div>
           <label className="compact-field route-provider-field">
             <span>Provider 名称</span>
-            <input
+            <TextField
               aria-invalid={Boolean(providerNameError)}
               maxLength={64}
               spellCheck={false}
               value={routerDraft.model_provider}
               onChange={(event) =>
-                setRouterDraft({ ...routerDraft, model_provider: event.currentTarget.value })
+                setRouterDraft({
+                  ...routerDraft,
+                  model_provider: event.currentTarget.value,
+                })
               }
             />
             {providerNameError ? <small>{providerNameError}</small> : null}
           </label>
           <label className="compact-field route-model-field">
             <span>Codex 默认模型</span>
-            <select
+            <Select
               aria-invalid={Boolean(codexModelError)}
               disabled={busy || appState.codex_models.length === 0}
               value={routerDraft.codex_model}
-              onChange={(event) =>
-                setRouterDraft({ ...routerDraft, codex_model: event.currentTarget.value })
+              onValueChange={(value) =>
+                setRouterDraft({
+                  ...routerDraft,
+                  codex_model: value,
+                })
               }
             >
-              <option value="">
+              <SelectOption value="">
                 {appState.codex_models.length ? "选择模型" : "暂无可路由模型"}
-              </option>
+              </SelectOption>
               {selectedModelUnavailable ? (
-                <option value={routerDraft.codex_model}>
+                <SelectOption value={routerDraft.codex_model}>
                   {routerDraft.codex_model}（当前不可路由）
-                </option>
+                </SelectOption>
               ) : null}
               {appState.codex_models.map((model) => (
-                <option key={model} value={model}>
+                <SelectOption key={model} value={model}>
                   {fusionModelLabel(model, appState.providers)}
-                </option>
+                </SelectOption>
               ))}
-            </select>
+            </Select>
             {codexModelError ? <small>{codexModelError}</small> : null}
           </label>
           <div className="route-diff-row">
             <span>openai_base_url → 本地代理地址</span>
-            <button className="ghost small">查看变更</button>
+            <Button className="ghost small" onClick={() => setShowDiff(true)}>
+              查看变更
+            </Button>
             <Toggle
               checked={appState.clients.codex.enabled}
               disabled={
@@ -3337,30 +3362,39 @@ function RouteScreen({
                 (!appState.clients.codex.enabled &&
                   (!appState.codex_models.length || selectedModelUnavailable))
               }
+              label="接管 Codex"
               onChange={(checked) => void onSaveClientConfig("codex", checked)}
             />
           </div>
           <div className="route-toggle-line">
             <div>
               <strong>启用 WebSocket</strong>
-              <p>允许 Codex 使用 WS 连接本地路由。请为支持 WS 的供应商打开对应开关；其他供应商自动兼容 HTTP。保存后重启 Codex。</p>
+              <p>
+                允许 Codex 使用 WS 连接本地路由。请为支持 WS
+                的供应商打开对应开关；其他供应商自动兼容 HTTP。保存后重启
+                Codex。
+              </p>
             </div>
             <Toggle
               checked={routerDraft.websockets_enabled}
               disabled={busy}
               label="启用 Codex WebSocket"
-              onChange={(websockets_enabled) => setRouterDraft({ ...routerDraft, websockets_enabled })}
+              onChange={(websockets_enabled) =>
+                setRouterDraft({ ...routerDraft, websockets_enabled })
+              }
             />
           </div>
           <div className="route-toggle-line">
             <div>
               <strong>启用远程压缩</strong>
               <p>
-                开启时将 model_providers.{routerDraft.model_provider || "custom"}.name 设为
+                开启时将 model_providers.
+                {routerDraft.model_provider || "custom"}.name 设为
                 OpenAI；关闭时与 Provider 名称一致。
               </p>
             </div>
             <Toggle
+              label="启用远程压缩"
               checked={routerDraft.remote_compaction_enabled}
               disabled={busy}
               onChange={(remote_compaction_enabled) =>
@@ -3371,7 +3405,10 @@ function RouteScreen({
           <div className="route-toggle-line">
             <div>
               <strong>实验性上下文接力</strong>
-              <p>启用 Token Budget，使用 Notes 保存进度并在新窗口通过 History 恢复。</p>
+              <p>
+                启用 Token Budget，使用 Notes 保存进度并在新窗口通过 History
+                恢复。
+              </p>
             </div>
             <Toggle
               checked={routerDraft.token_budget_enabled}
@@ -3385,12 +3422,14 @@ function RouteScreen({
           <div className="route-toggle-line long-context-setting">
             <div>
               <strong>GPT-5.6 及以上长上下文</strong>
-              <p>按模型版本号识别 GPT-5.6 及以上模型，包含模型后缀和融合条目。</p>
+              <p>
+                按模型版本号识别 GPT-5.6 及以上模型，包含模型后缀和融合条目。
+              </p>
             </div>
             <div className="long-context-controls">
               <label className="compact-field">
                 <span>上下文大小（Token）</span>
-                <input
+                <TextField
                   aria-invalid={Boolean(longContextWindowError)}
                   disabled={busy || !routerDraft.gpt56_long_context_enabled}
                   inputMode="numeric"
@@ -3401,11 +3440,15 @@ function RouteScreen({
                   onChange={(event) =>
                     setRouterDraft({
                       ...routerDraft,
-                      gpt56_long_context_window: Number(event.currentTarget.value),
+                      gpt56_long_context_window: Number(
+                        event.currentTarget.value,
+                      ),
                     })
                   }
                 />
-                {longContextWindowError ? <small>{longContextWindowError}</small> : null}
+                {longContextWindowError ? (
+                  <small>{longContextWindowError}</small>
+                ) : null}
               </label>
               <Toggle
                 checked={routerDraft.gpt56_long_context_enabled}
@@ -3422,11 +3465,12 @@ function RouteScreen({
             <div>
               <strong>强制不使用 OpenAI 登录态</strong>
               <p>
-                开启时 requires_openai_auth 固定为 false；关闭时只检测是否配置 ChatGPT
-                登录态，不校验过期。
+                开启时 requires_openai_auth 固定为 false；关闭时只检测是否配置
+                ChatGPT 登录态，不校验过期。
               </p>
             </div>
             <Toggle
+              label="强制不使用 OpenAI 登录态"
               checked={routerDraft.force_disable_openai_auth}
               disabled={busy}
               onChange={(force_disable_openai_auth) =>
@@ -3446,79 +3490,97 @@ function RouteScreen({
               onChange={(enabled) => void onSaveMultiAgentEnabled(enabled)}
             />
           </div>
-        </article>
+        </Card>
 
-        <article className="route-card">
+        <Card className="route-card">
           <div className="route-card-head">
             <h3>Claude 接管</h3>
-            <span className={`state-pill ${appState.clients.claude.enabled ? "ok" : "warn"}`}>
+            <Badge
+              className={`state-pill ${appState.clients.claude.enabled ? "ok" : "warn"}`}
+            >
               <span />
               {appState.clients.claude.enabled ? "已接管" : "未接管"}
-            </span>
+            </Badge>
           </div>
-          <label className="compact-field">
+          <div className="compact-field">
             <span>设置文件</span>
             <div className="copy-field">
               <strong>{appState.claude_settings_path}</strong>
-              <button className="ghost small">打开文件</button>
+              <CopyButton
+                label="复制 Claude 配置路径"
+                text={appState.claude_settings_path}
+              />
             </div>
-          </label>
-          <label className="compact-field">
+          </div>
+          <div className="compact-field">
             <span>Claude Base URL</span>
             <div className="copy-field accent">
               <strong>{claudeBaseUrl(routerDraft)}</strong>
-              <button className="ghost small">复制</button>
+              <CopyButton
+                label="复制 Claude 接管地址"
+                text={claudeBaseUrl(routerDraft)}
+              />
             </div>
-          </label>
+          </div>
           <div className="route-diff-row">
             <span>ANTHROPIC_BASE_URL → 本地代理地址</span>
-            <button className="ghost small">查看变更</button>
+            <Button className="ghost small" onClick={() => setShowDiff(true)}>
+              查看变更
+            </Button>
             <Toggle
               checked={appState.clients.claude.enabled}
               disabled={busy}
+              label="接管 Claude Code"
               onChange={(checked) => void onSaveClientConfig("claude", checked)}
             />
           </div>
-        </article>
+        </Card>
 
-        <article className="route-card">
+        <Card className="route-card">
           <div className="route-card-head">
             <h3>Pi 接管</h3>
-            <span className={`state-pill ${appState.clients.pi.enabled ? "ok" : "warn"}`}>
+            <Badge
+              className={`state-pill ${appState.clients.pi.enabled ? "ok" : "warn"}`}
+            >
               <span />
               {appState.clients.pi.enabled ? "已接管" : "未接管"}
-            </span>
+            </Badge>
           </div>
-          <label className="compact-field">
+          <div className="compact-field">
             <span>模型配置</span>
             <div className="copy-field">
               <strong>{appState.pi_models_path}</strong>
-              <button className="ghost small">打开文件</button>
+              <CopyButton
+                label="复制 Pi 配置路径"
+                text={appState.pi_models_path}
+              />
             </div>
-          </label>
-          <label className="compact-field">
+          </div>
+          <div className="compact-field">
             <span>Responses Base URL</span>
             <div className="copy-field accent">
               <strong>{routeBaseUrl(routerDraft)}</strong>
-              <button className="ghost small">复制</button>
+              <CopyButton
+                label="复制 Pi 接管地址"
+                text={routeBaseUrl(routerDraft)}
+              />
             </div>
-          </label>
+          </div>
           <div className="route-diff-row">
             <span>models.json → xxswitch provider</span>
-            <button className="ghost small">自动同步</button>
+            <Badge className="skill-pill">自动同步</Badge>
             <Toggle
               checked={appState.clients.pi.enabled}
               disabled={busy}
+              label="接管 Pi"
               onChange={(checked) => void onSaveClientConfig("pi", checked)}
             />
           </div>
-        </article>
-
+        </Card>
       </div>
     </section>
   );
 }
-
 
 function SkillClientConfigCard({
   busy,
@@ -3536,10 +3598,14 @@ function SkillClientConfigCard({
   const [locationsText, setLocationsText] = useState(() =>
     client.skill_locations.map((location) => location.path).join("\n"),
   );
-  const [managedLocation, setManagedLocation] = useState(client.managed_skill_location);
+  const [managedLocation, setManagedLocation] = useState(
+    client.managed_skill_location,
+  );
 
   useEffect(() => {
-    setLocationsText(client.skill_locations.map((location) => location.path).join("\n"));
+    setLocationsText(
+      client.skill_locations.map((location) => location.path).join("\n"),
+    );
     setManagedLocation(client.managed_skill_location);
   }, [client.client, client.managed_skill_location, client.skill_locations]);
 
@@ -3550,45 +3616,53 @@ function SkillClientConfigCard({
     .map((path) => ({ path, writable: true }));
 
   return (
-    <article className="skill-card">
+    <Card className="skill-card">
       <div className="card-head">
         <div>
           <h3>{client.label}</h3>
-          <p>扫描 Skill Location 的直接子目录；新 exposure 只写入 Managed Skill Location。</p>
+          <p>
+            扫描 Skill Location 的直接子目录；新 exposure 只写入 Managed Skill
+            Location。
+          </p>
         </div>
-        <button
+        <Button
           className="ghost"
           disabled={busy}
-          onClick={() => void onSave(client.client, parsedLocations, managedLocation)}
+          onClick={() =>
+            void onSave(client.client, parsedLocations, managedLocation)
+          }
           type="button"
         >
           保存路径
-        </button>
+        </Button>
       </div>
       <label className="field skill-field">
-        <span>Skill Locations（一行一个）</span>
-        <textarea
+        <span>扫描路径（每行一个）</span>
+        <TextArea
           onChange={(event) => setLocationsText(event.currentTarget.value)}
           rows={4}
           value={locationsText}
         />
       </label>
       <label className="field skill-field">
-        <span>Managed Skill Location</span>
-        <input
+        <span>共享写入路径</span>
+        <TextField
           onChange={(event) => setManagedLocation(event.currentTarget.value)}
           value={managedLocation}
         />
       </label>
       <div className="skill-location-list">
         {client.skill_locations.map((location) => (
-          <span className={location.exists ? "skill-pill ok" : "skill-pill warn"} key={location.path}>
+          <Badge
+            className={location.exists ? "skill-pill ok" : "skill-pill warn"}
+            key={location.path}
+          >
             {location.managed ? "Managed · " : "Scan · "}
             {location.exists ? "存在" : "缺失"}
-          </span>
+          </Badge>
         ))}
       </div>
-    </article>
+    </Card>
   );
 }
 
@@ -3611,13 +3685,20 @@ function SkillManagementScreen({
     skillLocations: SkillLocationConfig[],
     managedSkillLocation: string,
   ) => Promise<void>;
-  onSetSharingScope: (skill: SharedSkillView, scope: AgentClientKind[]) => Promise<void>;
+  onSetSharingScope: (
+    skill: SharedSkillView,
+    scope: AgentClientKind[],
+  ) => Promise<void>;
   onUseExistingSharedSkill: (skill: ClientSkillView) => Promise<void>;
   view: SkillManagementView | null;
 }) {
   const clients: AgentClientKind[] = ["codex", "claude", "pi"];
 
-  function nextScope(skill: SharedSkillView, client: AgentClientKind, checked: boolean) {
+  function nextScope(
+    skill: SharedSkillView,
+    client: AgentClientKind,
+    checked: boolean,
+  ) {
     const current = new Set(skill.sharing_scope);
     if (checked) current.add(client);
     else current.delete(client);
@@ -3627,13 +3708,20 @@ function SkillManagementScreen({
   if (!view) {
     return (
       <section className="skills-page">
-        <article className="page-panel empty-state">
+        <Card className="page-panel empty-state">
           <h2>Skill 管理</h2>
-          <p>扫描本机已知 Agent Client 的 Skill Locations，发现可共享的 Skill。</p>
-          <button className="primary" disabled={busy} onClick={() => void onRefresh()} type="button">
+          <p>
+            扫描本机已知 Agent Client 的 Skill Locations，发现可共享的 Skill。
+          </p>
+          <Button
+            className="primary"
+            disabled={busy}
+            onClick={() => void onRefresh()}
+            type="button"
+          >
             扫描 Skills
-          </button>
-        </article>
+          </Button>
+        </Card>
       </section>
     );
   }
@@ -3642,12 +3730,17 @@ function SkillManagementScreen({
     <section className="skills-page">
       <div className="section-title">
         <div>
-          <h2>Skill Management</h2>
-          <p className="muted">Skill Library Root: {view.library_root}</p>
+          <h2>Skills 工作区</h2>
+          <p className="muted">共享库 · {view.library_root}</p>
         </div>
-        <button className="primary" disabled={busy} onClick={() => void onRefresh()} type="button">
+        <Button
+          className="primary"
+          disabled={busy}
+          onClick={() => void onRefresh()}
+          type="button"
+        >
           重新扫描
-        </button>
+        </Button>
       </div>
 
       <div className="skill-client-grid">
@@ -3662,7 +3755,7 @@ function SkillManagementScreen({
       </div>
 
       {view.conflicts.length > 0 && (
-        <article className="page-panel skill-section">
+        <Card className="page-panel skill-section">
           <div className="panel-head">
             <div>
               <h2>冲突</h2>
@@ -3671,28 +3764,41 @@ function SkillManagementScreen({
           </div>
           <div className="skill-list">
             {view.conflicts.map((conflict) => (
-              <div className="skill-row conflict" key={`${conflict.kind}-${conflict.path}`}>
+              <div
+                className="skill-row conflict"
+                key={`${conflict.kind}-${conflict.path}`}
+              >
                 <div>
                   <strong>{conflict.identity}</strong>
-                  <small>{conflict.client ? agentClientLabel(conflict.client) : "Library"} · {conflict.path}</small>
+                  <small>
+                    {conflict.client
+                      ? agentClientLabel(conflict.client)
+                      : "Library"}{" "}
+                    · {conflict.path}
+                  </small>
                 </div>
-                <span className="skill-pill warn">{conflict.kind}</span>
+                <Badge className="skill-pill warn">{conflict.kind}</Badge>
                 <p>{conflict.message}</p>
               </div>
             ))}
           </div>
-        </article>
+        </Card>
       )}
 
-      <article className="page-panel skill-section">
+      <Card className="page-panel skill-section">
         <div className="panel-head">
           <div>
-            <h2>Shared Skills</h2>
-            <p>每个 Shared Skill 的 Sharing Scope 保存后立即应用为 symlink exposure。</p>
+            <h2>共享 Skills</h2>
+            <p>选择可使用这项 Skill 的客户端，更改后立即生效。</p>
           </div>
         </div>
         <div className="skill-list">
-          {view.shared_skills.length === 0 && <p className="muted">暂无 Shared Skill。</p>}
+          {view.shared_skills.length === 0 && (
+            <EmptyState
+              title="暂无共享 Skill"
+              description="将客户端中的 Skill 设为共享，即可在这里管理。"
+            />
+          )}
           {view.shared_skills.map((skill) => (
             <div className="shared-skill" key={skill.identity}>
               <div className="shared-skill-main">
@@ -3700,23 +3806,33 @@ function SkillManagementScreen({
                   <strong>{skill.identity}</strong>
                   <small>{skill.description || skill.path}</small>
                   {skill.origin && (
-                    <small>Origin: {agentClientLabel(skill.origin.client)} · {skill.origin.original_path}</small>
+                    <small>
+                      来源：{agentClientLabel(skill.origin.client)} ·{" "}
+                      {skill.origin.original_path}
+                    </small>
                   )}
                 </div>
-                <button className="ghost danger" disabled={busy} onClick={() => void onDeleteSharedSkill(skill)} type="button">
+                <Button
+                  className="ghost danger"
+                  disabled={busy}
+                  onClick={() => void onDeleteSharedSkill(skill)}
+                  type="button"
+                >
                   删除
-                </button>
+                </Button>
               </div>
               <div className="scope-row">
                 {clients.map((client) => (
                   <label key={client}>
-                    <input
+                    <Checkbox
                       checked={skill.sharing_scope.includes(client)}
                       disabled={busy}
-                      onChange={(event) =>
-                        void onSetSharingScope(skill, nextScope(skill, client, event.currentTarget.checked))
+                      onCheckedChange={(checked) =>
+                        void onSetSharingScope(
+                          skill,
+                          nextScope(skill, client, checked),
+                        )
                       }
-                      type="checkbox"
                     />
                     {agentClientLabel(client)}
                   </label>
@@ -3724,10 +3840,15 @@ function SkillManagementScreen({
               </div>
               <div className="exposure-list">
                 {skill.exposures.map((exposure) => (
-                  <div className="exposure-row" key={`${skill.identity}-${exposure.client}-${exposure.path}`}>
-                    <span className={`skill-pill ${exposure.health === "healthy" ? "ok" : "warn"}`}>
+                  <div
+                    className="exposure-row"
+                    key={`${skill.identity}-${exposure.client}-${exposure.path}`}
+                  >
+                    <Badge
+                      className={`skill-pill ${exposure.health === "healthy" ? "ok" : "warn"}`}
+                    >
                       {exposure.client_label} · {exposure.health}
-                    </span>
+                    </Badge>
                     <code>{exposure.path || "未创建"}</code>
                     <small>{exposure.message}</small>
                   </div>
@@ -3736,42 +3857,54 @@ function SkillManagementScreen({
             </div>
           ))}
         </div>
-      </article>
+      </Card>
 
-      <article className="page-panel skill-section">
+      <Card className="page-panel skill-section">
         <div className="panel-head">
           <div>
-            <h2>Client Skills</h2>
-            <p>从已知 Agent Client 的 Skill Locations 发现；公用后会进入 Skill Library。</p>
+            <h2>客户端 Skills</h2>
+            <p>从各客户端发现的 Skills，设为共享后可供其他客户端使用。</p>
           </div>
         </div>
         <div className="skill-list">
-          {view.client_skills.length === 0 && <p className="muted">暂无未共享 Client Skill。</p>}
+          {view.client_skills.length === 0 && (
+            <EmptyState
+              title="暂无客户端 Skill"
+              description="检查上方的扫描路径，或重新扫描客户端目录。"
+            />
+          )}
           {view.client_skills.map((skill) => (
             <div className="skill-row" key={`${skill.client}-${skill.path}`}>
               <div>
                 <strong>{skill.identity}</strong>
-                <small>{skill.client_label} · {skill.path}</small>
+                <small>
+                  {skill.client_label} · {skill.path}
+                </small>
                 {skill.description && <small>{skill.description}</small>}
               </div>
               {skill.shared ? (
-                <button
+                <Button
                   className="ghost"
                   disabled={busy}
                   onClick={() => void onUseExistingSharedSkill(skill)}
                   type="button"
                 >
-                  使用已有 Shared Skill
-                </button>
+                  使用已有共享 Skill
+                </Button>
               ) : (
-                <button className="primary" disabled={busy} onClick={() => void onPromote(skill)} type="button">
+                <Button
+                  className="primary"
+                  disabled={busy}
+                  onClick={() => void onPromote(skill)}
+                  type="button"
+                >
                   公用
-                </button>
+                </Button>
               )}
             </div>
           ))}
         </div>
-      </article>
+      </Card>
     </section>
   );
 }
@@ -3797,6 +3930,10 @@ function UsageScreen({
   timeRange: TimeRange;
   trendMetric: TrendMetric;
 }) {
+  const [distribution, setDistribution] = useState<"models" | "providers">(
+    "models",
+  );
+  const distributionRows = stats?.[distribution] ?? [];
   const summary = stats?.summary ?? {
     request_count: 0,
     input_tokens: 0,
@@ -3809,7 +3946,8 @@ function UsageScreen({
   const trendBuckets = stats?.buckets.length
     ? stats.buckets
     : [emptyTrendBucket("00:00")];
-  const totalCalls = (stats?.models ?? []).reduce((total, row) => total + row.request_count, 0) || 1;
+  const totalCalls =
+    distributionRows.reduce((total, row) => total + row.request_count, 0) || 1;
   const availableProviders = usageProviderOptions(
     stats?.available_providers ?? [],
     configuredProviders,
@@ -3819,66 +3957,100 @@ function UsageScreen({
     <section className="usage-page">
       <div className="section-title">
         <h2>统计概览</h2>
-        <button className="ghost" onClick={onRefresh} type="button">
+        <Button className="ghost" onClick={onRefresh} type="button">
           重新统计
-        </button>
+        </Button>
       </div>
 
       <div className="usage-filter-bar">
-        <div className="range-tabs">
-          {(["today", "week", "month", "all"] as TimeRange[]).map((range) => (
-            <button
-              className={timeRange === range ? "active" : ""}
-              key={range}
-              onClick={() => onRangeChange(range)}
-              type="button"
-            >
-              {rangeLabel(range)}
-            </button>
-          ))}
-        </div>
-        <select value={filter.provider_id ?? ""} onChange={(event) => onFilter({ provider_id: event.currentTarget.value })}>
-          <option value="">全部供应商</option>
+        <SegmentedControl
+          className="range-tabs"
+          label="统计时间范围"
+          value={timeRange}
+          onChange={onRangeChange}
+          options={(["today", "week", "month", "all"] as TimeRange[]).map(
+            (range) => ({ value: range, label: rangeLabel(range) }),
+          )}
+        />
+        <Select
+          aria-label="统计供应商"
+          value={filter.provider_id ?? ""}
+          onValueChange={(value) => onFilter({ provider_id: value })}
+        >
+          <SelectOption value="">全部供应商</SelectOption>
           {availableProviders.map((provider) => (
-            <option key={provider.id} value={provider.id}>{provider.name}</option>
+            <SelectOption key={provider.id} value={provider.id}>
+              {provider.name}
+            </SelectOption>
           ))}
-        </select>
-        <select value={filter.model ?? ""} onChange={(event) => onFilter({ model: event.currentTarget.value })}>
-          <option value="">全部模型</option>
+        </Select>
+        <Select
+          aria-label="统计模型"
+          value={filter.model ?? ""}
+          onValueChange={(value) => onFilter({ model: value })}
+        >
+          <SelectOption value="">全部模型</SelectOption>
           {(stats?.available_models ?? []).map((model) => (
-            <option key={model} value={model}>{model}</option>
+            <SelectOption key={model} value={model}>
+              {model}
+            </SelectOption>
           ))}
-        </select>
-        <button className="ghost" type="button">{bucketGranularityLabel(stats?.bucket_granularity)}</button>
+        </Select>
+        <span className="filter-hint">
+          {bucketGranularityLabel(stats?.bucket_granularity)}
+        </span>
         <small>本程序路由日志</small>
       </div>
 
       <div className="metric-grid">
-        <Metric title="调用次数" value={String(stats?.success_count ?? summary.request_count)} tone="green" />
-        <Metric title="总 Token" value={formatCompact(summary.total_tokens)} tone="purple" sub={rangeLabel(timeRange)} />
-        <Metric title="非缓存输入" value={formatCompact(summary.uncached_input_tokens)} tone="cyan" sub={`${formatCompact(summary.input_tokens)} 输入`} />
-        <Metric title="输出 Token" value={formatCompact(summary.output_tokens)} tone="amber" sub="路由响应" />
+        <Metric
+          title="调用次数"
+          value={String(stats?.success_count ?? summary.request_count)}
+          tone="green"
+        />
+        <Metric
+          title="总 Token"
+          value={formatCompact(summary.total_tokens)}
+          tone="purple"
+          sub={rangeLabel(timeRange)}
+        />
+        <Metric
+          title="非缓存输入"
+          value={formatCompact(summary.uncached_input_tokens)}
+          tone="cyan"
+          sub={`${formatCompact(summary.input_tokens)} 输入`}
+        />
+        <Metric
+          title="输出 Token"
+          value={formatCompact(summary.output_tokens)}
+          tone="amber"
+          sub="路由响应"
+        />
       </div>
 
       <div className="usage-main-grid">
-        <article className="card route-trend-card">
+        <Card className="card route-trend-card">
           <div className="card-head">
             <div>
               <h3>使用趋势</h3>
-              <p>{rangeLabel(timeRange)} {bucketGranularityLabel(stats?.bucket_granularity)}的{trendMetricLabel(trendMetric)}</p>
+              <p>
+                {rangeLabel(timeRange)}{" "}
+                {bucketGranularityLabel(stats?.bucket_granularity)}的
+                {trendMetricLabel(trendMetric)}
+              </p>
             </div>
-            <div className="mini-tabs">
-              {(["tokens", "requests"] as TrendMetric[]).map((metric) => (
-                <button
-                  className={trendMetric === metric ? "active" : ""}
-                  key={metric}
-                  onClick={() => onTrendMetricChange(metric)}
-                  type="button"
-                >
-                  {trendMetricLabel(metric)}
-                </button>
-              ))}
-            </div>
+            <SegmentedControl
+              className="mini-tabs"
+              label="趋势指标"
+              value={trendMetric}
+              onChange={onTrendMetricChange}
+              options={(["tokens", "requests"] as TrendMetric[]).map(
+                (metric) => ({
+                  value: metric,
+                  label: trendMetricLabel(metric),
+                }),
+              )}
+            />
           </div>
           <TrendLineChart
             buckets={trendBuckets}
@@ -3886,33 +4058,62 @@ function UsageScreen({
             metric={trendMetric}
             range={timeRange}
           />
-        </article>
+        </Card>
 
-        <article className="card call-distribution">
+        <Card className="card call-distribution">
           <div className="card-head">
             <div>
               <h3>调用分布</h3>
-              <p>按模型统计成功调用</p>
+              <p>
+                {distribution === "models" ? "按模型" : "按供应商"}统计成功调用
+              </p>
             </div>
-            <div className="mini-tabs">
-              <button className="active">按模型</button>
-              <button>按供应商</button>
-            </div>
+            <SegmentedControl
+              className="mini-tabs"
+              label="调用分布维度"
+              value={distribution}
+              onChange={setDistribution}
+              options={[
+                { value: "models", label: "按模型" },
+                { value: "providers", label: "按供应商" },
+              ]}
+            />
           </div>
-          {(stats?.models ?? []).slice(0, 4).map((row) => (
+          {distributionRows.slice(0, 4).map((row) => (
             <div className="distribution-row" key={row.key}>
               <div>
-                <strong>{row.label}</strong>
+                <UsageName
+                  name={row.label}
+                  label={
+                    distribution === "models"
+                      ? chartModelLabel(row.label, configuredProviders)
+                      : row.label
+                  }
+                />
                 <b>{row.request_count} 次</b>
               </div>
-              <span><i style={{ width: `${Math.max(3, (row.request_count / totalCalls) * 100)}%` }} /></span>
-              <small>{Math.round((row.request_count / totalCalls) * 100)}%</small>
+              <span>
+                <i
+                  style={{
+                    width: `${Math.max(3, (row.request_count / totalCalls) * 100)}%`,
+                  }}
+                />
+              </span>
+              <small>
+                {Math.round((row.request_count / totalCalls) * 100)}%
+              </small>
             </div>
           ))}
-        </article>
+          {distributionRows.length === 0 && (
+            <EmptyState
+              title="暂无调用分布"
+              description="当前筛选范围内还没有成功调用。"
+            />
+          )}
+        </Card>
       </div>
 
-      <article className="route-table-card usage-detail-card">
+      <Card className="route-table-card usage-detail-card">
         <div className="panel-head">
           <div>
             <h2>用量明细</h2>
@@ -3943,7 +4144,13 @@ function UsageScreen({
             </div>
           ))}
         </div>
-      </article>
+        {!stats?.details.length && (
+          <EmptyState
+            title="暂无用量明细"
+            description="经过网关的调用会显示在这里。"
+          />
+        )}
+      </Card>
     </section>
   );
 }
@@ -3967,21 +4174,19 @@ function RequestLogsScreen({
 }) {
   const rows = logs?.logs ?? [];
   const [selectedLog, setSelectedLog] = useState<RouteRequestLog | null>(null);
-  const [selectedDebugLogs, setSelectedDebugLogs] = useState<Record<string, RouteRequestLog>>({});
+  const [selectedDebugLogs, setSelectedDebugLogs] = useState<
+    Record<string, RouteRequestLog>
+  >({});
   const [debugExporting, setDebugExporting] = useState(false);
   const [debugExportStatus, setDebugExportStatus] = useState("");
-  const selectPageDebugRef = useRef<HTMLInputElement>(null);
   const selectableRows = rows.filter((log) => log.debug_capture_available);
   const selectedDebugCount = Object.keys(selectedDebugLogs).length;
-  const selectedPageDebugCount = selectableRows.filter((log) => Boolean(selectedDebugLogs[log.id])).length;
-  const allPageDebugSelected = selectableRows.length > 0
-    && selectableRows.every((log) => Boolean(selectedDebugLogs[log.id]));
-
-  useEffect(() => {
-    if (selectPageDebugRef.current) {
-      selectPageDebugRef.current.indeterminate = selectedPageDebugCount > 0 && !allPageDebugSelected;
-    }
-  }, [allPageDebugSelected, selectedPageDebugCount]);
+  const selectedPageDebugCount = selectableRows.filter((log) =>
+    Boolean(selectedDebugLogs[log.id]),
+  ).length;
+  const allPageDebugSelected =
+    selectableRows.length > 0 &&
+    selectableRows.every((log) => Boolean(selectedDebugLogs[log.id]));
 
   const toggleDebugSelection = (log: RouteRequestLog, checked: boolean) => {
     setSelectedDebugLogs((current) => {
@@ -4030,11 +4235,15 @@ function RequestLogsScreen({
         <h2>请求列表</h2>
         <div className="request-export-actions">
           {debugExportStatus ? <small>{debugExportStatus}</small> : null}
-          <button className="ghost" onClick={() => exportRouteLogsCsv(rows)} type="button">
+          <Button
+            className="ghost"
+            onClick={() => exportRouteLogsCsv(rows)}
+            type="button"
+          >
             导出当前页 CSV
-          </button>
+          </Button>
           {selectedDebugCount > 0 ? (
-            <button
+            <Button
               className="ghost"
               disabled={debugExporting}
               onClick={() => {
@@ -4044,48 +4253,70 @@ function RequestLogsScreen({
               type="button"
             >
               清空选择
-            </button>
+            </Button>
           ) : null}
-          <button
+          <Button
             className="ghost"
             disabled={selectedDebugCount === 0 || debugExporting}
             onClick={() => void exportSelectedDebugLogs()}
             type="button"
           >
-            {debugExporting ? "正在导出…" : `导出 Debug JSON (${selectedDebugCount})`}
-          </button>
+            {debugExporting
+              ? "正在导出…"
+              : `导出 Debug JSON (${selectedDebugCount})`}
+          </Button>
         </div>
       </div>
       <div className="request-filter-bar">
         <div className="search-box">
-          <span />
-          <input
+          <Search size={15} aria-hidden="true" />
+          <TextField
+            aria-label="搜索请求"
             placeholder="搜索请求 ID 或错误信息"
             value={filter.query ?? ""}
             onChange={(event) => onFilter({ query: event.currentTarget.value })}
           />
         </div>
-        <select value={filter.status ?? ""} onChange={(event) => onFilter({ status: event.currentTarget.value })}>
-          <option value="">全部状态</option>
-          <option value="success">成功</option>
-          <option value="failed">失败</option>
-          <option value="cancelled">已取消</option>
-        </select>
-        <select value={filter.provider_id ?? ""} onChange={(event) => onFilter({ provider_id: event.currentTarget.value })}>
-          <option value="">全部供应商</option>
+        <Select
+          aria-label="请求状态"
+          value={filter.status ?? ""}
+          onValueChange={(value) => onFilter({ status: value })}
+        >
+          <SelectOption value="">全部状态</SelectOption>
+          <SelectOption value="success">成功</SelectOption>
+          <SelectOption value="failed">失败</SelectOption>
+          <SelectOption value="cancelled">已取消</SelectOption>
+        </Select>
+        <Select
+          aria-label="请求供应商"
+          value={filter.provider_id ?? ""}
+          onValueChange={(value) => onFilter({ provider_id: value })}
+        >
+          <SelectOption value="">全部供应商</SelectOption>
           {(logs?.available_providers ?? []).map((provider) => (
-            <option key={provider.id} value={provider.id}>{provider.name}</option>
+            <SelectOption key={provider.id} value={provider.id}>
+              {provider.name}
+            </SelectOption>
           ))}
-        </select>
-        <select value={filter.model ?? ""} onChange={(event) => onFilter({ model: event.currentTarget.value })}>
-          <option value="">全部模型</option>
+        </Select>
+        <Select
+          aria-label="请求模型"
+          value={filter.model ?? ""}
+          onValueChange={(value) => onFilter({ model: value })}
+        >
+          <SelectOption value="">全部模型</SelectOption>
           {(logs?.available_models ?? []).map((model) => (
-            <option key={model} value={model}>{model}</option>
+            <SelectOption key={model} value={model}>
+              {model}
+            </SelectOption>
           ))}
-        </select>
-        <button className="ghost" onClick={onToday} type="button">今日</button>
+        </Select>
+        <Button className="ghost" onClick={onToday} type="button">
+          今日
+        </Button>
         <span>实时刷新</span>
         <Toggle
+          label="实时刷新请求记录"
           checked={autoRefresh}
           onChange={(checked) => {
             onSetAutoRefresh(checked);
@@ -4095,19 +4326,25 @@ function RequestLogsScreen({
         <small>共 {logs?.total ?? 0} 条</small>
       </div>
 
-      <article className="route-table-card request-log-card">
+      <Card className="route-table-card request-log-card">
         <div className="request-log-table">
           <header>
-            <label className="request-debug-checkbox" title="全选当前页 Debug 快照">
-              <input
-                aria-label="全选当前页 Debug 快照"
-                checked={allPageDebugSelected}
-                disabled={selectableRows.length === 0}
-                onChange={(event) => toggleCurrentPageDebugSelection(event.currentTarget.checked)}
-                ref={selectPageDebugRef}
-                type="checkbox"
-              />
-            </label>
+            <Tooltip content="全选当前页 Debug 快照">
+              <label className="request-debug-checkbox">
+                <Checkbox
+                  aria-label="全选当前页 Debug 快照"
+                  checked={
+                    selectedPageDebugCount > 0 && !allPageDebugSelected
+                      ? "indeterminate"
+                      : allPageDebugSelected
+                  }
+                  disabled={selectableRows.length === 0}
+                  onCheckedChange={(checked) =>
+                    toggleCurrentPageDebugSelection(checked)
+                  }
+                />
+              </label>
+            </Tooltip>
             <span>状态</span>
             <span>时间</span>
             <span>模型</span>
@@ -4125,7 +4362,9 @@ function RequestLogsScreen({
                 className={[
                   log.route_attempts > 1 ? "selected" : "",
                   selectedLog?.id === log.id ? "active" : "",
-                ].filter(Boolean).join(" ")}
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
                 key={log.id}
                 onClick={() => setSelectedLog(log)}
                 onKeyDown={(event) => {
@@ -4137,20 +4376,28 @@ function RequestLogsScreen({
                 role="button"
                 tabIndex={0}
               >
-                <div
-                  className="request-debug-checkbox"
-                  onClick={(event) => event.stopPropagation()}
-                  onKeyDown={(event) => event.stopPropagation()}
-                  title={log.debug_capture_available ? "选择 Debug 快照" : "该请求没有 Debug 快照"}
+                <Tooltip
+                  content={
+                    log.debug_capture_available
+                      ? "选择 Debug 快照"
+                      : "该请求没有 Debug 快照"
+                  }
                 >
-                  <input
-                    aria-label={`选择请求 ${log.id} 的 Debug 快照`}
-                    checked={Boolean(selectedDebugLogs[log.id])}
-                    disabled={!log.debug_capture_available}
-                    onChange={(event) => toggleDebugSelection(log, event.currentTarget.checked)}
-                    type="checkbox"
-                  />
-                </div>
+                  <div
+                    className="request-debug-checkbox"
+                    onClick={(event) => event.stopPropagation()}
+                    onKeyDown={(event) => event.stopPropagation()}
+                  >
+                    <Checkbox
+                      aria-label={`选择请求 ${log.id} 的 Debug 快照`}
+                      checked={Boolean(selectedDebugLogs[log.id])}
+                      disabled={!log.debug_capture_available}
+                      onCheckedChange={(checked) =>
+                        toggleDebugSelection(log, checked)
+                      }
+                    />
+                  </div>
+                </Tooltip>
                 <div className="status-cell">
                   <span className={`dot ${status.tone}`} />
                   <b className={`${status.tone}-text`}>{status.label}</b>
@@ -4160,14 +4407,24 @@ function RequestLogsScreen({
                 <strong>{log.provider_name}</strong>
                 <span>{formatTokenTriplet(log)}</span>
                 <b>{formatMs(log.first_byte_ms)}</b>
-                <b title={formatTimingDetails(log)}>{formatDuration(log.total_ms)}</b>
-                <span className={`route-result ${routeResultTone(log.route_result)}`}>
+                <Tooltip content={formatTimingDetails(log)}>
+                  <b>{formatDuration(log.total_ms)}</b>
+                </Tooltip>
+                <span
+                  className={`route-result ${routeResultTone(log.route_result)}`}
+                >
                   {log.route_result}
                 </span>
               </div>
             );
           })}
         </div>
+        {rows.length === 0 && (
+          <EmptyState
+            title="暂无匹配的请求"
+            description="调整筛选条件，或等待客户端通过网关发起调用。"
+          />
+        )}
         <footer className="table-pagination">
           <span>
             {selectedDebugCount > 0
@@ -4175,34 +4432,55 @@ function RequestLogsScreen({
               : "点击任意记录查看路由时间线、Token 明细和错误详情。"}
           </span>
           <div>
-            <button className="ghost small" disabled={(logs?.page ?? 1) <= 1} onClick={() => onFilter({ page: (logs?.page ?? 1) - 1 })}>‹</button>
+            <Button
+              aria-label="上一页"
+              className="ghost small"
+              disabled={(logs?.page ?? 1) <= 1}
+              onClick={() => onFilter({ page: (logs?.page ?? 1) - 1 })}
+            >
+              ‹
+            </Button>
             <b>{logs?.page ?? 1}</b>
-            <button className="ghost small" disabled={(logs?.page ?? 1) >= (logs?.total_pages ?? 1)} onClick={() => onFilter({ page: (logs?.page ?? 1) + 1 })}>›</button>
+            <Button
+              aria-label="下一页"
+              className="ghost small"
+              disabled={(logs?.page ?? 1) >= (logs?.total_pages ?? 1)}
+              onClick={() => onFilter({ page: (logs?.page ?? 1) + 1 })}
+            >
+              ›
+            </Button>
           </div>
         </footer>
-      </article>
-      {selectedLog ? <RequestLogDialog log={selectedLog} onClose={() => setSelectedLog(null)} /> : null}
+      </Card>
+      {selectedLog ? (
+        <RequestLogDialog
+          log={selectedLog}
+          onClose={() => setSelectedLog(null)}
+        />
+      ) : null}
     </section>
   );
 }
 
-function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () => void }) {
+function RequestLogDialog({
+  log,
+  onClose,
+}: {
+  log: RouteRequestLog;
+  onClose: () => void;
+}) {
   const status = statusMeta(log.status);
   const tierResult = serviceTierResult(log);
   const phases = routeTimingPhases(log);
   const compactionAudit = remoteCompactionV2AuditLabel(log);
-  const [debugCapture, setDebugCapture] = useState<RouteDebugCapture | null>(null);
+  const [debugCapture, setDebugCapture] = useState<RouteDebugCapture | null>(
+    null,
+  );
   const [debugError, setDebugError] = useState(log.debug_capture_error || "");
   const [debugLoading, setDebugLoading] = useState(log.debug_capture_available);
-  const [debugView, setDebugView] = useState<"inbound" | "upstream" | "response">("inbound");
-
-  useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [onClose]);
+  const [debugView, setDebugView] = useState<
+    "inbound" | "upstream" | "response"
+  >("inbound");
 
   useEffect(() => {
     let cancelled = false;
@@ -4244,211 +4522,340 @@ function RequestLogDialog({ log, onClose }: { log: RouteRequestLog; onClose: () 
   const requestBody = log.request_body || debugCapture?.request_body || null;
 
   return (
-    <div
-      className="latency-dialog-backdrop"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
+    <DialogSurface
+      title="请求详情"
+      className="request-log-dialog"
+      onClose={onClose}
     >
-      <section
-        aria-labelledby="request-log-dialog-title"
-        aria-modal="true"
-        className="latency-dialog request-log-dialog"
-        role="dialog"
-      >
-        <header>
-          <div className="request-log-dialog-heading">
-            <div>
-              <h2 id="request-log-dialog-title">请求详情</h2>
-              <p title={log.id}>{log.id}</p>
-            </div>
-            <span className={`request-detail-status ${status.tone}`}>
-              <span className={`dot ${status.tone}`} />
-              {status.label}
-            </span>
+      <header>
+        <div className="request-log-dialog-heading">
+          <div>
+            <h2 id="request-log-dialog-title">请求详情</h2>
+            <Tooltip content={log.id}>
+              <p>{log.id}</p>
+            </Tooltip>
           </div>
-          <button aria-label="关闭" className="close" onClick={onClose} title="关闭" type="button">×</button>
-        </header>
+          <span className={`request-detail-status ${status.tone}`}>
+            <span className={`dot ${status.tone}`} />
+            {status.label}
+          </span>
+        </div>
+        <Button
+          aria-label="关闭"
+          className="close"
+          onClick={onClose}
+          title="关闭"
+          type="button"
+        >
+          ×
+        </Button>
+      </header>
 
-        <div className="latency-dialog-body request-log-dialog-body">
+      <div className="latency-dialog-body request-log-dialog-body">
+        <section className="request-detail-section">
+          <header>
+            <h3>请求概况</h3>
+            <span>{formatLogDateTime(log.started_at_ms)}</span>
+          </header>
+          <div className="request-detail-grid">
+            <div>
+              <span>请求</span>
+              <strong>
+                {log.method} {log.path}
+              </strong>
+            </div>
+            <div>
+              <span>状态码</span>
+              <strong>{log.status_code ?? "-"}</strong>
+            </div>
+            <div>
+              <span>模型</span>
+              <strong>{requestModelLabel(log.model) || "-"}</strong>
+            </div>
+            <div>
+              <span>上游模型</span>
+              <strong>
+                {requestModelLabel(log.upstream_model || log.model) || "-"}
+              </strong>
+            </div>
+            <div>
+              <span>供应商</span>
+              <strong>{log.provider_name}</strong>
+            </div>
+            <div>
+              <span>路由尝试</span>
+              <strong>{log.route_attempts} 次</strong>
+            </div>
+            <div>
+              <span>请求服务层级</span>
+              <strong>
+                {serviceTierLabel(log.requested_service_tier, "未强制")}
+              </strong>
+            </div>
+            <div>
+              <span>实际服务层级</span>
+              <strong>{serviceTierLabel(log.actual_service_tier)}</strong>
+            </div>
+            <div>
+              <span>服务层级验证</span>
+              <strong className={`service-tier-result ${tierResult.tone}`}>
+                {tierResult.label}
+              </strong>
+            </div>
+            {log.slow_delay_ms != null ? (
+              <div>
+                <span>Slow 延迟</span>
+                <strong>{formatDuration(log.slow_delay_ms)}</strong>
+              </div>
+            ) : null}
+          </div>
+        </section>
+
+        {requestBody ? (
           <section className="request-detail-section">
             <header>
-              <h3>请求概况</h3>
-              <span>{formatLogDateTime(log.started_at_ms)}</span>
+              <h3>请求体处理</h3>
             </header>
             <div className="request-detail-grid">
-              <div><span>请求</span><strong>{log.method} {log.path}</strong></div>
-              <div><span>状态码</span><strong>{log.status_code ?? "-"}</strong></div>
-              <div><span>模型</span><strong>{requestModelLabel(log.model) || "-"}</strong></div>
-              <div><span>上游模型</span><strong>{requestModelLabel(log.upstream_model || log.model) || "-"}</strong></div>
-              <div><span>供应商</span><strong>{log.provider_name}</strong></div>
-              <div><span>路由尝试</span><strong>{log.route_attempts} 次</strong></div>
               <div>
-                <span>请求服务层级</span>
-                <strong>{serviceTierLabel(log.requested_service_tier, "未强制")}</strong>
+                <span>Content-Type</span>
+                <strong>{requestBody.content_type || "未设置"}</strong>
               </div>
               <div>
-                <span>实际服务层级</span>
-                <strong>{serviceTierLabel(log.actual_service_tier)}</strong>
+                <span>Content-Encoding</span>
+                <strong>{requestBody.content_encoding || "未设置"}</strong>
               </div>
               <div>
-                <span>服务层级验证</span>
-                <strong className={`service-tier-result ${tierResult.tone}`}>{tierResult.label}</strong>
+                <span>本地解析</span>
+                <strong>
+                  {requestBody.decompression_enabled ? "开启" : "关闭"}
+                </strong>
               </div>
-              {log.slow_delay_ms != null ? (
-                <div><span>Slow 延迟</span><strong>{formatDuration(log.slow_delay_ms)}</strong></div>
-              ) : null}
+              <div>
+                <span>zstd 识别</span>
+                <strong>{requestBody.zstd_detected ? "是" : "否"}</strong>
+              </div>
+              <div>
+                <span>处理结果</span>
+                <strong>
+                  {!requestBody.decompression_enabled
+                    ? "未处理"
+                    : requestBody.decompressed
+                      ? "已解压"
+                      : "无需解压"}
+                </strong>
+              </div>
+              <div>
+                <span>入站原始</span>
+                <strong>
+                  {requestBody.inbound_bytes.toLocaleString()} bytes
+                </strong>
+              </div>
+              <div>
+                <span>解压后</span>
+                <strong>
+                  {requestBody.decoded_bytes.toLocaleString()} bytes
+                </strong>
+              </div>
+              <div>
+                <span>上游转发</span>
+                <strong>
+                  {requestBody.upstream_bytes.toLocaleString()} bytes
+                </strong>
+              </div>
             </div>
           </section>
+        ) : null}
 
-          {requestBody ? (
-            <section className="request-detail-section">
-              <header><h3>请求体处理</h3></header>
-              <div className="request-detail-grid">
-                <div>
-                  <span>Content-Type</span>
-                  <strong>{requestBody.content_type || "未设置"}</strong>
-                </div>
-                <div>
-                  <span>Content-Encoding</span>
-                  <strong>{requestBody.content_encoding || "未设置"}</strong>
-                </div>
-                <div>
-                  <span>本地解析</span>
-                  <strong>{requestBody.decompression_enabled ? "开启" : "关闭"}</strong>
-                </div>
-                <div><span>zstd 识别</span><strong>{requestBody.zstd_detected ? "是" : "否"}</strong></div>
-                <div>
-                  <span>处理结果</span>
-                  <strong>
-                    {!requestBody.decompression_enabled
-                      ? "未处理"
-                      : requestBody.decompressed
-                        ? "已解压"
-                        : "无需解压"}
-                  </strong>
-                </div>
-                <div><span>入站原始</span><strong>{requestBody.inbound_bytes.toLocaleString()} bytes</strong></div>
-                <div><span>解压后</span><strong>{requestBody.decoded_bytes.toLocaleString()} bytes</strong></div>
-                <div><span>上游转发</span><strong>{requestBody.upstream_bytes.toLocaleString()} bytes</strong></div>
-              </div>
-            </section>
-          ) : null}
-
-          <section className="request-detail-section">
-            <header>
-              <h3>耗时阶段</h3>
-              <strong>{formatDuration(log.total_ms)}</strong>
-            </header>
-            {phases.length > 0 ? (
-              <div className="request-timing-list">
-                {phases.map((phase) => {
-                  const width = log.total_ms > 0
-                    ? Math.max(phase.durationMs > 0 ? 2 : 0, (phase.durationMs / log.total_ms) * 100)
+        <section className="request-detail-section">
+          <header>
+            <h3>耗时阶段</h3>
+            <strong>{formatDuration(log.total_ms)}</strong>
+          </header>
+          {phases.length > 0 ? (
+            <div className="request-timing-list">
+              {phases.map((phase) => {
+                const width =
+                  log.total_ms > 0
+                    ? Math.max(
+                        phase.durationMs > 0 ? 2 : 0,
+                        (phase.durationMs / log.total_ms) * 100,
+                      )
                     : 0;
-                  return (
-                    <div className="request-timing-row" key={phase.label}>
-                      <span>{phase.label}</span>
-                      <div><i style={{ width: `${Math.min(100, width)}%` }} /></div>
-                      <strong>{formatDuration(phase.durationMs)}</strong>
+                return (
+                  <div className="request-timing-row" key={phase.label}>
+                    <span>{phase.label}</span>
+                    <div>
+                      <i style={{ width: `${Math.min(100, width)}%` }} />
                     </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <p className="request-detail-empty">该记录创建时尚未采集分段耗时。</p>
-            )}
-          </section>
-
-          <section className="request-detail-section">
-            <header><h3>Token 明细</h3></header>
-            <div className="request-token-grid">
-              <div><span>输入</span><strong>{formatTokenCount(log.input_tokens)}</strong></div>
-              <div><span>非缓存</span><strong>{formatTokenCount(log.uncached_input_tokens)}</strong></div>
-              <div><span>缓存</span><strong>{formatTokenCount(log.cached_input_tokens)}</strong></div>
-              <div><span>输出</span><strong>{formatTokenCount(log.output_tokens)}</strong></div>
-              <div><span>推理输出</span><strong>{formatTokenCount(log.reasoning_output_tokens)}</strong></div>
-              <div><span>总计</span><strong>{formatTokenCount(log.total_tokens)}</strong></div>
+                    <strong>{formatDuration(phase.durationMs)}</strong>
+                  </div>
+                );
+              })}
             </div>
-          </section>
+          ) : (
+            <p className="request-detail-empty">
+              该记录创建时尚未采集分段耗时。
+            </p>
+          )}
+        </section>
 
-          <section className="request-detail-section">
-            <header><h3>路由详情</h3></header>
-            <dl className="request-route-details">
-              <div><dt>路由结果</dt><dd>{log.route_result}</dd></div>
-              <div><dt>上游链路</dt><dd>{log.upstream_chain.join(" → ") || "-"}</dd></div>
-              <div><dt>本地请求 ID</dt><dd><code>{log.id}</code></dd></div>
-              <div><dt>上游请求 ID</dt><dd><code>{log.upstream_request_id || "未返回"}</code></dd></div>
-              {compactionAudit ? <div><dt>远程压缩</dt><dd>{compactionAudit}</dd></div> : null}
-            </dl>
-          </section>
+        <section className="request-detail-section">
+          <header>
+            <h3>Token 明细</h3>
+          </header>
+          <div className="request-token-grid">
+            <div>
+              <span>输入</span>
+              <strong>{formatTokenCount(log.input_tokens)}</strong>
+            </div>
+            <div>
+              <span>非缓存</span>
+              <strong>{formatTokenCount(log.uncached_input_tokens)}</strong>
+            </div>
+            <div>
+              <span>缓存</span>
+              <strong>{formatTokenCount(log.cached_input_tokens)}</strong>
+            </div>
+            <div>
+              <span>输出</span>
+              <strong>{formatTokenCount(log.output_tokens)}</strong>
+            </div>
+            <div>
+              <span>推理输出</span>
+              <strong>{formatTokenCount(log.reasoning_output_tokens)}</strong>
+            </div>
+            <div>
+              <span>总计</span>
+              <strong>{formatTokenCount(log.total_tokens)}</strong>
+            </div>
+          </div>
+        </section>
 
-          {debugLoading || debugCapture || debugError ? (
-            <section className="request-detail-section request-debug-section">
-              <header>
-                <h3>Debug 快照</h3>
-                {debugCapture ? <span>{debugCapture.provider_name}</span> : null}
-              </header>
-              {debugLoading ? <p className="request-detail-empty">正在读取快照…</p> : null}
-              {debugError ? <pre className="request-debug-error">{debugError}</pre> : null}
-              {debugCapture && activeDebug ? (
-                <>
-                  <div className="request-debug-tabs" role="tablist" aria-label="Debug 快照视图">
-                    {([
+        <section className="request-detail-section">
+          <header>
+            <h3>路由详情</h3>
+          </header>
+          <dl className="request-route-details">
+            <div>
+              <dt>路由结果</dt>
+              <dd>{log.route_result}</dd>
+            </div>
+            <div>
+              <dt>上游链路</dt>
+              <dd>{log.upstream_chain.join(" → ") || "-"}</dd>
+            </div>
+            <div>
+              <dt>本地请求 ID</dt>
+              <dd>
+                <code>{log.id}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>上游请求 ID</dt>
+              <dd>
+                <code>{log.upstream_request_id || "未返回"}</code>
+              </dd>
+            </div>
+            {compactionAudit ? (
+              <div>
+                <dt>远程压缩</dt>
+                <dd>{compactionAudit}</dd>
+              </div>
+            ) : null}
+          </dl>
+        </section>
+
+        {debugLoading || debugCapture || debugError ? (
+          <section className="request-detail-section request-debug-section">
+            <header>
+              <h3>Debug 快照</h3>
+              {debugCapture ? <span>{debugCapture.provider_name}</span> : null}
+            </header>
+            {debugLoading ? (
+              <p className="request-detail-empty">正在读取快照…</p>
+            ) : null}
+            {debugError ? (
+              <pre className="request-debug-error">{debugError}</pre>
+            ) : null}
+            {debugCapture && activeDebug ? (
+              <Tabs.Root
+                value={debugView}
+                onValueChange={(value) =>
+                  setDebugView(value as typeof debugView)
+                }
+              >
+                <Tabs.List
+                  className="request-debug-tabs"
+                  aria-label="Debug 快照视图"
+                >
+                  {(
+                    [
                       ["inbound", "入站请求"],
                       ["upstream", "上游请求"],
                       ["response", "上游响应"],
-                    ] as const).map(([value, label]) => (
-                      <button
-                        aria-selected={debugView === value}
-                        className={debugView === value ? "active" : ""}
-                        key={value}
-                        onClick={() => setDebugView(value)}
-                        role="tab"
-                        type="button"
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
+                    ] as const
+                  ).map(([value, label]) => (
+                    <Tabs.Trigger key={value} value={value}>
+                      {label}
+                    </Tabs.Trigger>
+                  ))}
+                </Tabs.List>
+                <Tabs.Content value={debugView}>
                   <div className="request-debug-meta">
                     {"method" in activeDebug ? (
-                      <code>{activeDebug.method} {activeDebug.url}</code>
+                      <code>
+                        {activeDebug.method} {activeDebug.url}
+                      </code>
                     ) : (
                       <code>HTTP {activeDebug.status_code ?? "-"}</code>
                     )}
                     {activeDebug.body.truncated ? (
-                      <span>已截断 · {activeDebug.body.captured_bytes.toLocaleString()} / {activeDebug.body.total_bytes.toLocaleString()} bytes</span>
+                      <span>
+                        已截断 ·{" "}
+                        {activeDebug.body.captured_bytes.toLocaleString()} /{" "}
+                        {activeDebug.body.total_bytes.toLocaleString()} bytes
+                      </span>
                     ) : (
-                      <span>{activeDebug.body.total_bytes.toLocaleString()} bytes</span>
+                      <span>
+                        {activeDebug.body.total_bytes.toLocaleString()} bytes
+                      </span>
                     )}
                   </div>
                   <div className="request-debug-block">
                     <strong>Headers</strong>
-                    <pre>{activeDebug.headers.map((header) => `${header.name}: ${header.value}`).join("\n") || "-"}</pre>
+                    <pre>
+                      {activeDebug.headers
+                        .map((header) => `${header.name}: ${header.value}`)
+                        .join("\n") || "-"}
+                    </pre>
                   </div>
                   <div className="request-debug-block">
                     <strong>Body</strong>
                     <pre>{activeDebugBodyText || "-"}</pre>
                   </div>
-                </>
-              ) : null}
-            </section>
-          ) : null}
+                </Tabs.Content>
+              </Tabs.Root>
+            ) : null}
+          </section>
+        ) : null}
 
-          {log.error ? (
-            <section className="request-detail-section request-error-detail">
-              <header><h3>错误详情</h3></header>
-              <pre>{log.error}</pre>
-            </section>
-          ) : null}
-        </div>
+        {log.error ? (
+          <section className="request-detail-section request-error-detail">
+            <header>
+              <h3>错误详情</h3>
+            </header>
+            <pre>{log.error}</pre>
+          </section>
+        ) : null}
+      </div>
 
-        <footer>
-          <button className="primary" onClick={onClose} type="button">关闭</button>
-        </footer>
-      </section>
-    </div>
+      <footer>
+        <Button className="primary" onClick={onClose} type="button">
+          关闭
+        </Button>
+      </footer>
+    </DialogSurface>
   );
 }
 
@@ -4457,6 +4864,7 @@ function Dashboard(props: {
   cachedInput: number;
   modelRows: Array<{ model: string; requests: number; tokens: number }>;
   onRangeChange: (range: TimeRange) => Promise<void>;
+  onManageProviders: () => void;
   onTrendMetricChange: (metric: TrendMetric) => void;
   outputTokens: number;
   providers: ProviderSummary[];
@@ -4472,6 +4880,7 @@ function Dashboard(props: {
     cachedInput,
     modelRows,
     onRangeChange,
+    onManageProviders,
     onTrendMetricChange,
     outputTokens,
     providers,
@@ -4483,8 +4892,12 @@ function Dashboard(props: {
     trendMetric,
     uncachedInput,
   } = props;
-  const availableProviders = providers.filter((provider) => provider.enabled && provider.status === "enabled").length;
-  const successCount = stats?.success_count ?? Math.max(requestCount - (stats?.failed_count ?? 0), 0);
+  const availableProviders = providers.filter(
+    (provider) => provider.enabled && provider.status === "enabled",
+  ).length;
+  const successCount =
+    stats?.success_count ??
+    Math.max(requestCount - (stats?.failed_count ?? 0), 0);
   const activeRequests = stats?.running_count ?? 0;
   const avgFirstByte = stats?.average_first_byte_ms ?? null;
   const avgTotalMs = stats?.average_total_ms ?? null;
@@ -4500,46 +4913,73 @@ function Dashboard(props: {
   return (
     <section className="dashboard">
       <div className="section-title">
-        <h2>使用概览</h2>
-        <div className="range-tabs">
-          {(["today", "week", "month", "all"] as TimeRange[]).map((range) => (
-            <button
-              className={timeRange === range ? "active" : ""}
-              key={range}
-              onClick={() => onRangeChange(range)}
-              type="button"
-            >
-              {rangeLabel(range)}
-            </button>
-          ))}
+        <div>
+          <span className="eyebrow">WORKSPACE OVERVIEW</span>
+          <h2>使用概览</h2>
+          <p>让每一次模型调用，都清晰可见。</p>
         </div>
+        <SegmentedControl
+          className="range-tabs"
+          label="统计时间范围"
+          value={timeRange}
+          onChange={onRangeChange}
+          options={(["today", "week", "month", "all"] as TimeRange[]).map(
+            (range) => ({ value: range, label: rangeLabel(range) }),
+          )}
+        />
       </div>
 
       <div className="metric-grid">
-        <Metric title="请求数" value={String(Math.max(successCount, 0))} tone="green" />
-        <Metric title="总 Token" value={formatCompact(totalTokens)} tone="cyan" tooltip={tokenTooltip} />
-        <Metric title="成功率" value={`${successRate.toFixed(1)}%`} tone="purple" />
+        <Metric
+          title="成功请求"
+          value={Math.max(successCount, 0).toLocaleString()}
+          tone="green"
+          sub="通过本地网关完成"
+        />
+        <Metric
+          title="总 Token"
+          value={formatCompact(totalTokens)}
+          tone="cyan"
+          tooltip={tokenTooltip}
+          sub="输入与输出合计"
+        />
+        <Metric
+          title="成功率"
+          value={`${successRate.toFixed(1)}%`}
+          tone="purple"
+          sub={`${stats?.failed_count ?? 0} 次失败请求`}
+        />
+        <Metric
+          title="平均首字延迟"
+          value={formatMs(avgFirstByte)}
+          tone="amber"
+          sub="从发起请求到首次输出"
+        />
       </div>
 
       <div className="dashboard-grid">
-        <article className="card trend-card">
+        <Card className="card trend-card">
           <div className="card-head">
             <div>
               <h3>使用趋势</h3>
-              <p>{rangeLabel(timeRange)} {bucketGranularityLabel(stats?.bucket_granularity)}的{trendMetricLabel(trendMetric)}</p>
+              <p>
+                {rangeLabel(timeRange)}{" "}
+                {bucketGranularityLabel(stats?.bucket_granularity)}的
+                {trendMetricLabel(trendMetric)}
+              </p>
             </div>
-            <div className="mini-tabs">
-              {(["tokens", "requests"] as TrendMetric[]).map((metric) => (
-                <button
-                  className={trendMetric === metric ? "active" : ""}
-                  key={metric}
-                  onClick={() => onTrendMetricChange(metric)}
-                  type="button"
-                >
-                  {trendMetricLabel(metric)}
-                </button>
-              ))}
-            </div>
+            <SegmentedControl
+              className="mini-tabs"
+              label="趋势指标"
+              value={trendMetric}
+              onChange={onTrendMetricChange}
+              options={(["tokens", "requests"] as TrendMetric[]).map(
+                (metric) => ({
+                  value: metric,
+                  label: trendMetricLabel(metric),
+                }),
+              )}
+            />
           </div>
           <TrendLineChart
             buckets={trendBuckets}
@@ -4548,10 +4988,20 @@ function Dashboard(props: {
             metric={trendMetric}
             range={timeRange}
           />
-        </article>
+        </Card>
 
-        <article className="card provider-card">
-          <h3>供应商</h3>
+        <Card className="card provider-card">
+          <div className="card-head">
+            <div>
+              <h3>供应商状态</h3>
+              <p>
+                {availableProviders} 个可用，共 {providers.length} 个连接
+              </p>
+            </div>
+            <Button className="text-button" onClick={onManageProviders}>
+              管理 <ArrowUpRight size={14} aria-hidden="true" />
+            </Button>
+          </div>
           <div className="provider-health-list">
             {providers.slice(0, 4).map((provider) => {
               const status = providerStatus(provider);
@@ -4559,51 +5009,103 @@ function Dashboard(props: {
               const latency = providerLatencyMeta(provider);
               return (
                 <div className="provider-health" key={provider.id}>
-                  <span className={`dot ${status.tone}`} />
+                  <span className="provider-avatar" aria-hidden="true">
+                    {provider.name.slice(0, 1).toUpperCase()}
+                  </span>
                   <div className="provider-health-summary">
                     <strong>{provider.name}</strong>
                     <small>{status.label}</small>
                   </div>
                   <div className="provider-health-facts">
-                    <span className={`provider-health-fact ${balance.tone}`} title={provider.balance_error ?? undefined}>
-                      <small>余额</small>
-                      <b>{balance.value}</b>
-                    </span>
-                    <span className={`provider-health-fact ${latency.tone}`} title={provider.latency_error ?? undefined}>
-                      <small>延迟</small>
-                      <b>{latency.value}</b>
-                    </span>
+                    <Tooltip content={provider.balance_error ?? undefined}>
+                      <span className={`provider-health-fact ${balance.tone}`}>
+                        <small>余额</small>
+                        <b>{balance.value}</b>
+                      </span>
+                    </Tooltip>
+                    <Tooltip content={provider.latency_error ?? undefined}>
+                      <span className={`provider-health-fact ${latency.tone}`}>
+                        <small>延迟</small>
+                        <b>{latency.value}</b>
+                      </span>
+                    </Tooltip>
                   </div>
                 </div>
               );
             })}
+            {providers.length === 0 && (
+              <EmptyState
+                title="尚未连接供应商"
+                description="添加第一个供应商，开始使用本地网关。"
+                action={
+                  <Button className="primary" onClick={onManageProviders}>
+                    <Plus size={14} />
+                    添加供应商
+                  </Button>
+                }
+              />
+            )}
           </div>
           <div className="health-bar">
-            <span style={{ width: `${providers.length ? (availableProviders / providers.length) * 100 : 0}%` }} />
+            <span
+              style={{
+                width: `${providers.length ? (availableProviders / providers.length) * 100 : 0}%`,
+              }}
+            />
           </div>
           <footer>
-            <span>可用供应商 {availableProviders}/{providers.length}</span>
-            <b>{providers.length ? Math.round((availableProviders / providers.length) * 100) : 0}%</b>
+            <span>
+              可用供应商 {availableProviders}/{providers.length}
+            </span>
+            <b>
+              {providers.length
+                ? Math.round((availableProviders / providers.length) * 100)
+                : 0}
+              %
+            </b>
           </footer>
-        </article>
+        </Card>
 
-        <article className="card donut-card">
+        <Card className="card donut-card">
           <h3>Token 构成</h3>
-          <p>{rangeLabel(timeRange)}共计 {formatCompact(totalTokens)} Token</p>
+          <p>
+            {rangeLabel(timeRange)}共计 {formatCompact(totalTokens)} Token
+          </p>
           <div className="donut-area">
-            <div className="donut">
+            <div
+              className="donut"
+              role="img"
+              aria-label={`Token 构成：非缓存输入 ${uncachedInput}，缓存输入 ${cachedInput}，输出 ${outputTokens}`}
+              style={{
+                background: totalTokens
+                  ? `conic-gradient(var(--chart-primary) 0 ${(uncachedInput / totalTokens) * 100}%, var(--chart-purple) ${(uncachedInput / totalTokens) * 100}% ${((uncachedInput + cachedInput) / totalTokens) * 100}%, var(--chart-amber) ${((uncachedInput + cachedInput) / totalTokens) * 100}% 100%)`
+                  : "var(--surface-strong)",
+              }}
+            >
               <strong>{formatCompact(totalTokens)}</strong>
               <span>总 Token</span>
             </div>
             <div className="legend">
-              <Legend color="cyan" label="非缓存输入" value={formatCompact(uncachedInput)} />
-              <Legend color="blue" label="缓存输入" value={formatCompact(cachedInput)} />
-              <Legend color="amber" label="输出" value={formatCompact(outputTokens)} />
+              <Legend
+                color="cyan"
+                label="非缓存输入"
+                value={formatCompact(uncachedInput)}
+              />
+              <Legend
+                color="blue"
+                label="缓存输入"
+                value={formatCompact(cachedInput)}
+              />
+              <Legend
+                color="amber"
+                label="输出"
+                value={formatCompact(outputTokens)}
+              />
             </div>
           </div>
-        </article>
+        </Card>
 
-        <article className="card model-card">
+        <Card className="card model-card">
           <h3>模型用量</h3>
           <div className="model-table">
             <header>
@@ -4612,26 +5114,59 @@ function Dashboard(props: {
               <span>Token</span>
               <span>占比</span>
             </header>
-            {(modelRows.length ? modelRows : [{ model: "gpt-5.5", requests: 0, tokens: 0 }]).map((row, index) => (
+            {modelRows.map((row) => (
               <div className="model-row" key={row.model}>
-                <strong>{row.model}</strong>
+                <UsageName
+                  name={row.model}
+                  label={chartModelLabel(row.model, providers)}
+                />
                 <span>{row.requests}</span>
                 <span>{formatCompact(row.tokens)}</span>
-                <b>{totalTokens ? `${Math.round((row.tokens / totalTokens) * 100)}%` : "0%"}</b>
-                <i style={{ width: `${Math.max(18, 92 - index * 27)}%` }} />
+                <b>
+                  {totalTokens
+                    ? `${Math.round((row.tokens / totalTokens) * 100)}%`
+                    : "0%"}
+                </b>
+                <i
+                  style={{
+                    width: `${totalTokens ? (row.tokens / totalTokens) * 100 : 0}%`,
+                  }}
+                />
               </div>
             ))}
           </div>
-        </article>
+          {modelRows.length === 0 && (
+            <EmptyState
+              title="暂无模型用量"
+              description="经过网关的调用会显示在这里。"
+            />
+          )}
+        </Card>
 
-        <article className="card quality-card">
+        <Card className="card quality-card">
           <h3>请求质量</h3>
           <p>{rangeLabel(timeRange)}通过本地网关的请求</p>
-          <Quality label="成功率" value={`${successRate.toFixed(1)}%`} tone="green" />
-          <Quality label="平均首字延迟" value={formatMs(avgFirstByte)} tone="cyan" />
-          <Quality label="平均总耗时" value={avgTotalMs == null ? "-" : formatDuration(avgTotalMs)} tone="purple" />
-          <Quality label="当前活跃请求" value={String(activeRequests)} tone="amber" />
-        </article>
+          <Quality
+            label="成功率"
+            value={`${successRate.toFixed(1)}%`}
+            tone="green"
+          />
+          <Quality
+            label="平均首字延迟"
+            value={formatMs(avgFirstByte)}
+            tone="cyan"
+          />
+          <Quality
+            label="平均总耗时"
+            value={avgTotalMs == null ? "-" : formatDuration(avgTotalMs)}
+            tone="purple"
+          />
+          <Quality
+            label="当前活跃请求"
+            value={String(activeRequests)}
+            tone="amber"
+          />
+        </Card>
       </div>
     </section>
   );
@@ -4650,13 +5185,25 @@ function Metric({
   sub?: string;
   tooltip?: string;
 }) {
+  const Icon =
+    tone === "green"
+      ? ArrowUpRight
+      : tone === "cyan"
+        ? Zap
+        : tone === "amber"
+          ? Clock3
+          : CircleCheck;
   return (
-    <article className="metric" title={tooltip}>
-      <span className={`dot ${tone}`} />
-      <p>{title}</p>
+    <Card className="metric" title={tooltip}>
+      <div className="metric-heading">
+        <p>{title}</p>
+        <span className={`metric-icon ${tone}`}>
+          <Icon size={16} aria-hidden="true" />
+        </span>
+      </div>
       <strong>{value}</strong>
       {sub && <small>{sub}</small>}
-    </article>
+    </Card>
   );
 }
 
@@ -4673,127 +5220,28 @@ function TrendLineChart({
   metric: TrendMetric;
   range: TimeRange;
 }) {
-  const gradientId = `${useId().replace(/:/g, "")}-${metric}`;
-  const [hoveredPoint, setHoveredPoint] = useState<{
-    bucket: RouteUsageBucket;
-    x: number;
-    y: number;
-  } | null>(null);
-  const effectiveGranularity = granularity ?? (range === "all" ? "month" : range === "today" ? "hour" : "day");
-  const completedBuckets = completeTrendBuckets(buckets, range, granularity);
-  const values = completedBuckets.map((bucket) => trendBucketValue(bucket, metric));
-  const rawMax = Math.max(...values, 0);
-  const yMax = niceTrendMax(rawMax);
-  const chartWidth = 640;
-  const chartHeight = compact ? 172 : 210;
-  const padding = { top: 12, right: 16, bottom: 24, left: 72 };
-  const plotWidth = chartWidth - padding.left - padding.right;
-  const plotHeight = chartHeight - padding.top - padding.bottom;
-  const xFor = (index: number) =>
-    padding.left + (completedBuckets.length <= 1 ? plotWidth / 2 : (index / (completedBuckets.length - 1)) * plotWidth);
-  const yFor = (value: number) => padding.top + plotHeight - (yMax ? (value / yMax) * plotHeight : 0);
-  const points = completedBuckets.map((bucket, index) => ({
-    bucket,
-    value: values[index] ?? 0,
-    x: xFor(index),
-    y: yFor(values[index] ?? 0),
-  }));
-  const linePoints = points.map((point) => `${point.x},${point.y}`).join(" ");
-  const areaPoints = [
-    `${padding.left},${padding.top + plotHeight}`,
-    ...points.map((point) => `${point.x},${point.y}`),
-    `${padding.left + plotWidth},${padding.top + plotHeight}`,
-  ].join(" ");
-  const yTicks = [1, 0.75, 0.5, 0.25, 0].map((ratio) => ({
-    ratio,
-    value: yMax * ratio,
-    y: padding.top + plotHeight - ratio * plotHeight,
-  }));
-  const xTickIndexes = trendTickIndexes(completedBuckets.length);
-
   return (
-    <div className="trend-line-chart">
-      <div className="trend-y-axis">
-        {yTicks.map((tick) => (
-          <span key={tick.ratio} style={{ top: `${(tick.y / chartHeight) * 100}%` }}>
-            {formatTrendAxisValue(tick.value, metric)}
-          </span>
-        ))}
-      </div>
-      <svg className="trend-svg" viewBox={`0 0 ${chartWidth} ${chartHeight}`} role="img" aria-label={`${trendMetricLabel(metric)}趋势`}>
-        <defs>
-          <linearGradient id={gradientId} x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="#0f8f68" stopOpacity="0.22" />
-            <stop offset="100%" stopColor="#0f8f68" stopOpacity="0.02" />
-          </linearGradient>
-        </defs>
-        {yTicks.map((tick) => (
-          <line
-            className="trend-grid-line"
-            key={tick.ratio}
-            x1={padding.left}
-            x2={padding.left + plotWidth}
-            y1={tick.y}
-            y2={tick.y}
-          />
-        ))}
-        <line className="trend-axis-line" x1={padding.left} x2={padding.left} y1={padding.top} y2={padding.top + plotHeight} />
-        <line className="trend-axis-line" x1={padding.left} x2={padding.left + plotWidth} y1={padding.top + plotHeight} y2={padding.top + plotHeight} />
-        <polygon className="trend-area" fill={`url(#${gradientId})`} points={areaPoints} />
-        <polyline className="trend-line" points={linePoints} />
-        {points.map((point, index) => (
-          <circle
-            className="trend-point"
-            cx={point.x}
-            cy={point.y}
-            key={`${point.bucket.label}-${index}`}
-            onBlur={() => setHoveredPoint(null)}
-            onFocus={() => setHoveredPoint({ bucket: point.bucket, x: point.x, y: point.y })}
-            onMouseEnter={() => setHoveredPoint({ bucket: point.bucket, x: point.x, y: point.y })}
-            onMouseLeave={() => setHoveredPoint(null)}
-            r="5"
-            tabIndex={0}
-          />
-        ))}
-        {xTickIndexes.map((index) => {
-          const point = points[index];
-          const isFirst = index === 0;
-          const isLast = index === completedBuckets.length - 1;
-          return (
-            <text
-              className="trend-x-tick"
-              key={`${point.bucket.label}-${index}`}
-              textAnchor={isFirst ? "start" : isLast ? "end" : "middle"}
-              x={point.x}
-              y={chartHeight - 4}
-            >
-              {formatTrendXAxisLabel(point.bucket.label, effectiveGranularity)}
-            </text>
-          );
-        })}
-      </svg>
-      {hoveredPoint && (
-        <div
-          className="trend-tooltip"
-          style={{
-            left: `${(hoveredPoint.x / chartWidth) * 100}%`,
-            top: `${(hoveredPoint.y / chartHeight) * 100}%`,
-          }}
-        >
-          <strong>{formatTrendXAxisLabel(hoveredPoint.bucket.label, effectiveGranularity)}</strong>
-          <span>
-            {metric === "tokens"
-              ? `${formatTokenCount(hoveredPoint.bucket.total_tokens)} Token`
-              : `${hoveredPoint.bucket.request_count} 次调用`}
-          </span>
-          <small>{formatTokenCount(hoveredPoint.bucket.total_tokens)} Token · {hoveredPoint.bucket.request_count} 次</small>
-        </div>
-      )}
-    </div>
+    <UsageTrendChart
+      buckets={completeTrendBuckets(buckets, range, granularity)}
+      compact={compact}
+      granularity={
+        granularity ??
+        (range === "all" ? "month" : range === "today" ? "hour" : "day")
+      }
+      metric={metric}
+    />
   );
 }
 
-function Legend({ color, label, value }: { color: string; label: string; value: string }) {
+function Legend({
+  color,
+  label,
+  value,
+}: {
+  color: string;
+  label: string;
+  value: string;
+}) {
   return (
     <div className="legend-row">
       <span className={`dot ${color}`} />
@@ -4803,7 +5251,15 @@ function Legend({ color, label, value }: { color: string; label: string; value: 
   );
 }
 
-function Quality({ label, value, tone }: { label: string; value: string; tone: string }) {
+function Quality({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone: string;
+}) {
   return (
     <div className="quality-row">
       <span className={`dot ${tone}`} />
@@ -4828,102 +5284,143 @@ function ProviderLatencyDialog({
   onTest: () => void;
   state: ProviderLatencyDialogState;
 }) {
-  const canTest = !state.preparing && !state.testing && Boolean(state.selectedModel) && Boolean(state.prompt.trim());
+  const canTest =
+    !state.preparing &&
+    !state.testing &&
+    Boolean(state.selectedModel) &&
+    Boolean(state.prompt.trim());
   return (
-    <div
-      className="latency-dialog-backdrop"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !state.testing) onClose();
-      }}
+    <DialogSurface
+      title="模型测速"
+      onClose={onClose}
+      closeDisabled={state.testing}
     >
-      <section aria-labelledby="latency-dialog-title" aria-modal="true" className="latency-dialog" role="dialog">
-        <header>
-          <div className="latency-dialog-title">
-            <span><ToolIcon type="latency" /></span>
-            <div>
-              <h2 id="latency-dialog-title">模型测速</h2>
-              <p>{state.provider.name} · {state.provider.base_url}</p>
-            </div>
+      <header>
+        <div className="latency-dialog-title">
+          <span>
+            <ToolIcon type="latency" />
+          </span>
+          <div>
+            <h2 id="latency-dialog-title">模型测速</h2>
+            <p>
+              {state.provider.name} · {state.provider.base_url}
+            </p>
           </div>
-          <button aria-label="关闭" className="close" disabled={state.testing} onClick={onClose} title="关闭" type="button">×</button>
-        </header>
+        </div>
+        <Button
+          aria-label="关闭"
+          className="close"
+          disabled={state.testing}
+          onClick={onClose}
+          title="关闭"
+          type="button"
+        >
+          ×
+        </Button>
+      </header>
 
-        <div className="latency-dialog-body">
-          <div className="latency-mode-field">
-            <span>请求方式</span>
-            <div aria-label="请求方式" className="latency-mode-control" role="group">
-              <button
-                className={!state.streaming ? "active" : ""}
-                disabled={state.testing}
-                onClick={() => onStreamingChange(false)}
-                type="button"
-              >
-                同步
-              </button>
-              <button
-                className={state.streaming ? "active" : ""}
-                disabled={state.testing}
-                onClick={() => onStreamingChange(true)}
-                type="button"
-              >
-                流式
-              </button>
-            </div>
-          </div>
-
-          <label className="field">
-            <span>测试模型</span>
-            <select
-              disabled={state.preparing || state.testing || state.models.length === 0}
-              value={state.selectedModel}
-              onChange={(event) => onModelChange(event.currentTarget.value)}
-            >
-              {state.preparing && <option value="">正在读取模型…</option>}
-              {!state.preparing && state.models.length === 0 && <option value="">没有可用模型</option>}
-              {state.models.map((model) => <option key={model} value={model}>{model}</option>)}
-            </select>
-            {state.providerKind === "codex" && <small>已开启 WebSocket 的供应商在流式测试中使用 WS；同步测试仍使用 HTTP。</small>}
-          </label>
-
-          <label className="field">
-            <span>测试内容</span>
-            <textarea
-              disabled={state.testing}
-              maxLength={2000}
-              rows={4}
-              value={state.prompt}
-              onChange={(event) => onPromptChange(event.currentTarget.value)}
-            />
-            <small>{state.prompt.length} / 2000</small>
-          </label>
-
-          {state.result && (
-            <div aria-live="polite" className={`latency-test-result ${state.result.ok ? "ok" : "failed"}`}>
-              <div className="latency-result-summary">
-                <span className={`dot ${state.result.ok ? "green" : "danger"}`} />
-                <div>
-                  <strong>{state.result.ok ? `${state.result.latencyMs} ms` : "测速失败"}</strong>
-                  <p>{state.result.message}</p>
-                </div>
-              </div>
-              {state.result.ok && (
-                <div className="latency-reply">
-                  <span>模型回复</span>
-                  <pre>{state.result.reply?.trim() || "未返回文本内容"}</pre>
-                </div>
-              )}
-            </div>
-          )}
+      <div className="latency-dialog-body">
+        <div className="latency-mode-field">
+          <span>请求方式</span>
+          <SegmentedControl
+            label="请求方式"
+            className="latency-mode-control"
+            value={state.streaming ? "streaming" : "sync"}
+            disabled={state.testing}
+            onChange={(value) => onStreamingChange(value === "streaming")}
+            options={[
+              { value: "sync", label: "同步" },
+              { value: "streaming", label: "流式" },
+            ]}
+          />
         </div>
 
-        <footer>
-          <button className="ghost" disabled={state.testing} onClick={onClose} type="button">取消</button>
-          <button className="primary" disabled={!canTest} onClick={onTest} type="button">
-            {state.testing ? "正在测速…" : state.result ? "重新测速" : "开始测速"}
-          </button>
-        </footer>
-      </section>
-    </div>
+        <label className="field">
+          <span>测试模型</span>
+          <Select
+            disabled={
+              state.preparing || state.testing || state.models.length === 0
+            }
+            value={state.selectedModel}
+            onValueChange={(value) => onModelChange(value)}
+          >
+            {state.preparing && (
+              <SelectOption value="">正在读取模型…</SelectOption>
+            )}
+            {!state.preparing && state.models.length === 0 && (
+              <SelectOption value="">没有可用模型</SelectOption>
+            )}
+            {state.models.map((model) => (
+              <SelectOption key={model} value={model}>
+                {model}
+              </SelectOption>
+            ))}
+          </Select>
+          {state.providerKind === "codex" && (
+            <small>
+              已开启 WebSocket 的供应商在流式测试中使用 WS；同步测试仍使用
+              HTTP。
+            </small>
+          )}
+        </label>
+
+        <label className="field">
+          <span>测试内容</span>
+          <TextArea
+            disabled={state.testing}
+            maxLength={2000}
+            rows={4}
+            value={state.prompt}
+            onChange={(event) => onPromptChange(event.currentTarget.value)}
+          />
+          <small>{state.prompt.length} / 2000</small>
+        </label>
+
+        {state.result && (
+          <div
+            aria-live="polite"
+            className={`latency-test-result ${state.result.ok ? "ok" : "failed"}`}
+          >
+            <div className="latency-result-summary">
+              <span className={`dot ${state.result.ok ? "green" : "danger"}`} />
+              <div>
+                <strong>
+                  {state.result.ok
+                    ? `${state.result.latencyMs} ms`
+                    : "测速失败"}
+                </strong>
+                <p>{state.result.message}</p>
+              </div>
+            </div>
+            {state.result.ok && (
+              <div className="latency-reply">
+                <span>模型回复</span>
+                <pre>{state.result.reply?.trim() || "未返回文本内容"}</pre>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <footer>
+        <Button
+          className="ghost"
+          disabled={state.testing}
+          onClick={onClose}
+          type="button"
+        >
+          取消
+        </Button>
+        <Button
+          className="primary"
+          disabled={!canTest}
+          onClick={onTest}
+          type="button"
+        >
+          {state.testing ? "正在测速…" : state.result ? "重新测速" : "开始测速"}
+        </Button>
+      </footer>
+    </DialogSurface>
   );
 }
 
@@ -4950,8 +5447,24 @@ function ProvidersScreen({
   providerKind: ProviderKind;
   providers: ProviderSummary[];
 }) {
-  const [draggingProviderId, setDraggingProviderId] = useState<string | null>(null);
-  const [dragOverProviderId, setDragOverProviderId] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [refreshingBalances, setRefreshingBalances] = useState(false);
+  const filtered = query.trim() !== "" || statusFilter !== "all";
+  const visibleProviders = providers.filter(
+    (provider) =>
+      (!query.trim() ||
+        `${provider.name} ${provider.base_url}`
+          .toLowerCase()
+          .includes(query.trim().toLowerCase())) &&
+      (statusFilter === "all" || provider.status === statusFilter),
+  );
+  const [draggingProviderId, setDraggingProviderId] = useState<string | null>(
+    null,
+  );
+  const [dragOverProviderId, setDragOverProviderId] = useState<string | null>(
+    null,
+  );
   const draggingProviderIdRef = useRef<string | null>(null);
   const dragStartY = useRef(0);
 
@@ -4960,7 +5473,9 @@ function ProvidersScreen({
     const draggedIndex = providerIds.indexOf(draggedId);
     if (draggedIndex < 0 || providerIds.length < 2) return providerIds;
 
-    const rows = Array.from(document.querySelectorAll<HTMLElement>("[data-provider-row-id]"));
+    const rows = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-provider-row-id]"),
+    );
     let insertIndex = providerIds.length;
     for (const row of rows) {
       const rowId = row.dataset.providerRowId;
@@ -4977,7 +5492,11 @@ function ProvidersScreen({
     if (insertIndex > draggedIndex) {
       insertIndex -= 1;
     }
-    nextIds.splice(Math.max(0, Math.min(insertIndex, nextIds.length)), 0, movedId);
+    nextIds.splice(
+      Math.max(0, Math.min(insertIndex, nextIds.length)),
+      0,
+      movedId,
+    );
     return nextIds;
   }
 
@@ -4995,7 +5514,10 @@ function ProvidersScreen({
     }
   }
 
-  function handlePointerDown(event: PointerEvent<HTMLButtonElement>, providerId: string) {
+  function handlePointerDown(
+    event: PointerEvent<HTMLButtonElement>,
+    providerId: string,
+  ) {
     if (busy) return;
     event.preventDefault();
     dragStartY.current = event.clientY;
@@ -5004,7 +5526,10 @@ function ProvidersScreen({
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
-  function handlePointerUp(event: PointerEvent<HTMLButtonElement>, providerId: string) {
+  function handlePointerUp(
+    event: PointerEvent<HTMLButtonElement>,
+    providerId: string,
+  ) {
     event.preventDefault();
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
@@ -5012,7 +5537,10 @@ function ProvidersScreen({
     finishPointerReorder(providerId, event.clientY);
   }
 
-  function handlePointerMove(event: PointerEvent<HTMLButtonElement>, providerId: string) {
+  function handlePointerMove(
+    event: PointerEvent<HTMLButtonElement>,
+    providerId: string,
+  ) {
     if (draggingProviderIdRef.current !== providerId) return;
     const targetRow = Array.from(
       document.querySelectorAll<HTMLElement>("[data-provider-row-id]"),
@@ -5026,41 +5554,92 @@ function ProvidersScreen({
 
   return (
     <section className="providers-page">
+      <div className="section-title">
+        <div>
+          <span className="eyebrow">YOUR CONNECTIONS</span>
+          <h2>供应商管理</h2>
+          <p>集中管理上游连接，按优先级自动路由。</p>
+        </div>
+        <Button className="primary" onClick={onAdd} disabled={busy}>
+          <Plus size={15} aria-hidden="true" />
+          添加{providerKind === "claude" ? " Claude" : ""}供应商
+        </Button>
+      </div>
       <div className="provider-toolbar">
-        <div className="protocol-switch">
-          <button
-            className={providerKind === "codex" ? "active" : ""}
-            onClick={() => onKindChange("codex")}
-            type="button"
+        <SegmentedControl
+          className="protocol-switch"
+          label="供应商类型"
+          value={providerKind}
+          onChange={(kind) => {
+            setQuery("");
+            setStatusFilter("all");
+            onKindChange(kind);
+          }}
+          options={[
+            {
+              value: "codex",
+              label: (
+                <>
+                  <Code2 size={15} aria-hidden="true" />
+                  Codex
+                </>
+              ),
+            },
+            { value: "claude", label: "Claude" },
+          ]}
+        />
+        <div className="provider-toolbar-filters">
+          <label className="search-box">
+            <Search size={15} aria-hidden="true" />
+            <TextField
+              aria-label="搜索供应商"
+              placeholder="搜索名称或 Base URL"
+              value={query}
+              onChange={(event) => setQuery(event.currentTarget.value)}
+            />
+          </label>
+          <Select
+            aria-label="供应商状态"
+            value={statusFilter}
+            onValueChange={(value) => setStatusFilter(value)}
           >
-            Codex
-          </button>
-          <button
-            className={providerKind === "claude" ? "active" : ""}
-            onClick={() => onKindChange("claude")}
-            type="button"
-          >
-            Claude
-          </button>
+            <SelectOption value="all">全部状态</SelectOption>
+            <SelectOption value="enabled">已启用</SelectOption>
+            <SelectOption value="disabled">已停用</SelectOption>
+            <SelectOption value="auto_disabled">自动停用</SelectOption>
+          </Select>
+          {providerKind === "codex" && (
+            <Button
+              className="ghost"
+              disabled={busy || refreshingBalances || providers.length === 0}
+              onClick={async () => {
+                setRefreshingBalances(true);
+                try {
+                  for (const provider of providers)
+                    await onRefreshBalance(provider);
+                } finally {
+                  setRefreshingBalances(false);
+                }
+              }}
+            >
+              <Wallet size={14} aria-hidden="true" />
+              {refreshingBalances ? "刷新中…" : "刷新余额"}
+            </Button>
+          )}
         </div>
-        <div className="search-box">
-          <span />
-          <input placeholder="搜索名称或 Base URL" />
-        </div>
-        <button>全部状态</button>
-        <div className="auto-check">
-          <span>自动检查</span>
-          <button>每 5 分钟</button>
-        </div>
-        <small>共 {providers.length} 个</small>
+      </div>
+      <div className="list-caption">
+        <span>
+          共 {providers.length} 个供应商
+          {filtered ? `，找到 ${visibleProviders.length} 个` : ""}
+        </span>
+        <span>
+          <Network size={12} aria-hidden="true" />
+          按列表顺序路由
+        </span>
       </div>
 
-      <div className="provider-actions">
-        <button className="ghost">检查全部</button>
-        <button className="primary" onClick={onAdd}>+ 添加{providerKind === "claude" ? " Claude" : ""}供应商</button>
-      </div>
-
-      <article className="provider-table">
+      <Card className="provider-table">
         <header>
           <span />
           <span>状态</span>
@@ -5070,7 +5649,7 @@ function ProvidersScreen({
           <span>启用</span>
           <span>操作</span>
         </header>
-        {providers.map((provider) => {
+        {visibleProviders.map((provider) => {
           const status = providerStatus(provider);
           const balance = providerBalanceMeta(provider);
           const latency = providerLatencyMeta(provider);
@@ -5080,10 +5659,21 @@ function ProvidersScreen({
               data-provider-row-id={provider.id}
               key={provider.id}
             >
-              <button
-                aria-label="拖动调整优先级"
+              <Button
+                aria-label={`调整 ${provider.name} 的优先级`}
                 className="drag-handle"
-                disabled={busy}
+                disabled={busy || filtered}
+                onKeyDown={(event) => {
+                  if (event.key !== "ArrowUp" && event.key !== "ArrowDown")
+                    return;
+                  event.preventDefault();
+                  const ids = providers.map((item) => item.id);
+                  const from = ids.indexOf(provider.id),
+                    to = from + (event.key === "ArrowUp" ? -1 : 1);
+                  if (to < 0 || to >= ids.length) return;
+                  [ids[from], ids[to]] = [ids[to], ids[from]];
+                  void onReorder(ids);
+                }}
                 onPointerCancel={() => {
                   draggingProviderIdRef.current = null;
                   setDraggingProviderId(null);
@@ -5092,7 +5682,11 @@ function ProvidersScreen({
                 onPointerDown={(event) => handlePointerDown(event, provider.id)}
                 onPointerMove={(event) => handlePointerMove(event, provider.id)}
                 onPointerUp={(event) => handlePointerUp(event, provider.id)}
-                title="拖动调整优先级"
+                title={
+                  filtered
+                    ? "清除筛选后可调整优先级"
+                    : "拖动或使用上下方向键调整优先级"
+                }
                 type="button"
               >
                 <span aria-hidden="true" className="drag-grip">
@@ -5103,49 +5697,118 @@ function ProvidersScreen({
                   <i />
                   <i />
                 </span>
-              </button>
+              </Button>
               <div className={`provider-status ${status.tone}`}>
                 <span className={`dot ${status.tone}`} />
                 <b>{status.label}</b>
               </div>
               <div className="provider-name-cell">
-                <strong>{provider.name}</strong>
-                <small>{provider.base_url || "未配置 Base URL"}</small>
+                <span className="provider-avatar" aria-hidden="true">
+                  {provider.name.slice(0, 1).toUpperCase()}
+                </span>
+                <div>
+                  <strong>
+                    {provider.name}
+                    {providers.indexOf(provider) === 0 && (
+                      <Badge className="priority-badge">优先</Badge>
+                    )}
+                  </strong>
+                  <Tooltip content={provider.base_url}>
+                    <small>{provider.base_url || "未配置 Base URL"}</small>
+                  </Tooltip>
+                </div>
               </div>
-              <div
-                className={`balance-cell provider-fact ${balance.tone}`}
-                title={provider.balance_error ?? undefined}
-              >
-                <strong>{balance.value}</strong>
-                <small>{balance.detail}</small>
-              </div>
-              <div
-                className={`latency-cell provider-fact ${latency.tone}`}
-                title={provider.latency_error ?? undefined}
-              >
-                <strong>{latency.value}</strong>
-                <small>{latency.detail}</small>
-              </div>
-              <Toggle checked={provider.status === "enabled"} disabled={busy} onChange={(checked) => onToggle(provider, checked)} />
+              <Tooltip content={provider.balance_error ?? undefined}>
+                <div className={`balance-cell provider-fact ${balance.tone}`}>
+                  <strong>{balance.value}</strong>
+                  <small>{balance.detail}</small>
+                </div>
+              </Tooltip>
+              <Tooltip content={provider.latency_error ?? undefined}>
+                <div className={`latency-cell provider-fact ${latency.tone}`}>
+                  <strong>{latency.value}</strong>
+                  <small>{latency.detail}</small>
+                </div>
+              </Tooltip>
+              <Toggle
+                label={`启用 ${provider.name}`}
+                checked={provider.status === "enabled"}
+                disabled={busy}
+                onChange={(checked) => onToggle(provider, checked)}
+              />
               <div className="provider-toolbox">
-                <button aria-label="设置" className="provider-action-button main-action" disabled={busy} onClick={() => onEdit(provider, "base")} title="设置" type="button">
+                <Button
+                  aria-label="设置"
+                  className="provider-action-button main-action"
+                  disabled={busy}
+                  onClick={() => onEdit(provider, "base")}
+                  title="设置"
+                  type="button"
+                >
                   <ToolIcon type="settings" />
                   <span>设置</span>
-                </button>
-                <button aria-label="测试延迟" className="provider-action-button" disabled={busy} onClick={() => void onTestLatency(provider)} title="测试延迟" type="button">
+                </Button>
+                <Button
+                  aria-label="测试延迟"
+                  className="provider-action-button"
+                  disabled={busy}
+                  onClick={() => void onTestLatency(provider)}
+                  title="测试延迟"
+                  type="button"
+                >
                   <ToolIcon type="latency" />
                   <span>测速</span>
-                </button>
-                <button aria-label="刷新余额" className="provider-action-button" disabled={busy} onClick={() => void onRefreshBalance(provider)} title="刷新余额" type="button">
+                </Button>
+                <Button
+                  aria-label="刷新余额"
+                  className="provider-action-button"
+                  disabled={busy || providerKind === "claude"}
+                  onClick={() => void onRefreshBalance(provider)}
+                  title="刷新余额"
+                  type="button"
+                >
                   <ToolIcon type="balance" />
                   <span>余额</span>
-                </button>
+                </Button>
               </div>
             </div>
           );
         })}
-        <footer>拖动左侧图标可调整优先级；列表越靠上越优先。</footer>
-      </article>
+        {visibleProviders.length === 0 && (
+          <EmptyState
+            title={
+              providers.length ? "没有匹配的供应商" : "添加你的第一个供应商"
+            }
+            description={
+              providers.length
+                ? "试试其他名称、地址或状态。"
+                : "连接模型服务后，即可为客户端提供统一路由。"
+            }
+            action={
+              providers.length ? (
+                <Button
+                  className="ghost"
+                  onClick={() => {
+                    setQuery("");
+                    setStatusFilter("all");
+                  }}
+                >
+                  清除筛选
+                </Button>
+              ) : (
+                <Button className="primary" onClick={onAdd}>
+                  <Plus size={14} />
+                  添加供应商
+                </Button>
+              )
+            }
+          />
+        )}
+        <footer>
+          <span>拖动左侧图标调整优先级，越靠上越优先。</span>
+          <span>也可使用 ↑ ↓ 方向键</span>
+        </footer>
+      </Card>
     </section>
   );
 }
@@ -5160,41 +5823,63 @@ function AutoDisableResetFields(props: {
   setResetTime: (value: string) => void;
   setResetWeekday: (value: number) => void;
 }) {
-  const { period, resetDay, resetTime, resetWeekday, setPeriod, setResetDay, setResetTime, setResetWeekday } = props;
+  const {
+    period,
+    resetDay,
+    resetTime,
+    resetWeekday,
+    setPeriod,
+    setResetDay,
+    setResetTime,
+    setResetWeekday,
+  } = props;
   return (
     <>
       <label className="field">
         <span>额度刷新周期</span>
-        <select value={period} onChange={(event) => setPeriod(event.currentTarget.value as AutoDisableResetPeriod)}>
-          <option value="daily">每天</option>
-          <option value="weekly">每周</option>
-          <option value="monthly">每月</option>
-          <option value="never">不刷新</option>
-        </select>
+        <Select
+          value={period}
+          onValueChange={(value) => setPeriod(value as AutoDisableResetPeriod)}
+        >
+          <SelectOption value="daily">每天</SelectOption>
+          <SelectOption value="weekly">每周</SelectOption>
+          <SelectOption value="monthly">每月</SelectOption>
+          <SelectOption value="never">不刷新</SelectOption>
+        </Select>
       </label>
       {period === "weekly" && (
         <label className="field">
           <span>每周刷新日</span>
-          <select value={resetWeekday} onChange={(event) => setResetWeekday(Number(event.currentTarget.value))}>
-            <option value={1}>星期一</option>
-            <option value={2}>星期二</option>
-            <option value={3}>星期三</option>
-            <option value={4}>星期四</option>
-            <option value={5}>星期五</option>
-            <option value={6}>星期六</option>
-            <option value={7}>星期日</option>
-          </select>
+          <Select
+            value={resetWeekday}
+            onValueChange={(value) => setResetWeekday(Number(value))}
+          >
+            <SelectOption value={1}>星期一</SelectOption>
+            <SelectOption value={2}>星期二</SelectOption>
+            <SelectOption value={3}>星期三</SelectOption>
+            <SelectOption value={4}>星期四</SelectOption>
+            <SelectOption value={5}>星期五</SelectOption>
+            <SelectOption value={6}>星期六</SelectOption>
+            <SelectOption value={7}>星期日</SelectOption>
+          </Select>
         </label>
       )}
       {period === "monthly" && (
         <label className="field">
           <span>每月刷新日</span>
-          <input
+          <TextField
             max={31}
             min={1}
             type="number"
             value={resetDay}
-            onChange={(event) => setResetDay(Math.min(31, Math.max(1, Number(event.currentTarget.value) || 1)))}
+            onChange={(event) =>
+              setResetDay(
+                Math.min(
+                  31,
+                  Math.max(1, Number(event.currentTarget.value) || 1),
+                ),
+              )
+            }
           />
           <small>短月份按当月最后一天刷新</small>
         </label>
@@ -5202,7 +5887,11 @@ function AutoDisableResetFields(props: {
       {period !== "never" && (
         <label className="field">
           <span>刷新时间</span>
-          <input type="time" value={resetTime} onChange={(event) => setResetTime(event.currentTarget.value)} />
+          <TextField
+            type="time"
+            value={resetTime}
+            onChange={(event) => setResetTime(event.currentTarget.value)}
+          />
         </label>
       )}
     </>
@@ -5229,15 +5918,18 @@ function AutoDisablePolicyFields(props: {
     setEnabled,
     setThreshold,
   } = props;
-  const thresholdError = autoDisableThresholdError(override && enabled, threshold);
+  const thresholdError = autoDisableThresholdError(
+    override && enabled,
+    threshold,
+  );
   return (
     <section className="auto-disable-policy">
       <label className="field">
         <span>自动禁用策略</span>
-        <select
+        <Select
           value={override ? "custom" : "global"}
-          onChange={(event) => {
-            const custom = event.currentTarget.value === "custom";
+          onValueChange={(value) => {
+            const custom = value === "custom";
             setOverride(custom);
             if (custom && !override) {
               setEnabled(globalEnabled);
@@ -5245,11 +5937,14 @@ function AutoDisablePolicyFields(props: {
             }
           }}
         >
-          <option value="global">继承全局设置</option>
-          <option value="custom">单独设置</option>
-        </select>
+          <SelectOption value="global">继承全局设置</SelectOption>
+          <SelectOption value="custom">单独设置</SelectOption>
+        </Select>
         <small>
-          全局：{globalEnabled ? `连续失败 ${globalThreshold} 次后禁用` : "已关闭自动禁用"}
+          全局：
+          {globalEnabled
+            ? `连续失败 ${globalThreshold} 次后禁用`
+            : "已关闭自动禁用"}
         </small>
       </label>
       {override ? (
@@ -5267,7 +5962,7 @@ function AutoDisablePolicyFields(props: {
           </div>
           <label className="field">
             <span>连续失败次数</span>
-            <input
+            <TextField
               aria-invalid={Boolean(thresholdError)}
               disabled={!enabled}
               max={MAX_AUTO_DISABLE_FAILURE_THRESHOLD}
@@ -5279,7 +5974,9 @@ function AutoDisablePolicyFields(props: {
                 setThreshold(Number(event.currentTarget.value))
               }
             />
-            {thresholdError ? <small className="danger-text">{thresholdError}</small> : null}
+            {thresholdError ? (
+              <small className="danger-text">{thresholdError}</small>
+            ) : null}
           </label>
         </>
       ) : null}
@@ -5288,6 +5985,7 @@ function AutoDisablePolicyFields(props: {
 }
 
 function ProviderEditor(props: {
+  error: string;
   modelListCleared: boolean;
   onClearModels: () => void;
   fusionEnabled: boolean;
@@ -5346,6 +6044,7 @@ function ProviderEditor(props: {
   tab: EditorTab;
 }) {
   const {
+    error,
     modelListCleared,
     onClearModels,
     fusionEnabled,
@@ -5406,489 +6105,679 @@ function ProviderEditor(props: {
   const [customAllowedModel, setCustomAllowedModel] = useState("");
   const [deleteConfirming, setDeleteConfirming] = useState(false);
   const [modelSearch, setModelSearch] = useState("");
-  const allowedModelOptions = normalizeModelNames([...providerModels, ...allowedModels]);
+  const allowedModelOptions = normalizeModelNames([
+    ...providerModels,
+    ...allowedModels,
+  ]);
   const visibleModelOptions = allowedModelOptions.filter((model) =>
     model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
   );
   const allModelsAllowed = allowedModels.length === 0 && !modelListCleared;
   const selectedAiGateAccountId = balanceQuery.ai_gate_account_id ?? null;
-  const selectedAiGateAccountMissing = selectedAiGateAccountId !== null
-    && !balanceAccountOptions.some((account) => account.account_id === selectedAiGateAccountId);
-  const upstreamPath = providerWireApi === "chat_completions" ? "chat/completions" : "responses";
-  const updateAllowedModels = (models: string[]) => setAllowedModels(normalizeModelNames(models));
+  const selectedAiGateAccountMissing =
+    selectedAiGateAccountId !== null &&
+    !balanceAccountOptions.some(
+      (account) => account.account_id === selectedAiGateAccountId,
+    );
+  const upstreamPath =
+    providerWireApi === "chat_completions" ? "chat/completions" : "responses";
+  const updateAllowedModels = (models: string[]) =>
+    setAllowedModels(normalizeModelNames(models));
   const toggleAllowedModel = (model: string, checked: boolean) => {
-    const currentModels = allModelsAllowed ? allowedModelOptions : allowedModels;
+    const currentModels = allModelsAllowed
+      ? allowedModelOptions
+      : allowedModels;
     updateAllowedModels(
       checked
         ? [...currentModels, model]
-        : currentModels.filter((current) => current.toLowerCase() !== model.toLowerCase()),
+        : currentModels.filter(
+            (current) => current.toLowerCase() !== model.toLowerCase(),
+          ),
     );
   };
   const addCustomAllowedModel = () => {
     const model = customAllowedModel.trim();
     if (!model) return;
-    updateAllowedModels([...(allModelsAllowed ? allowedModelOptions : allowedModels), model]);
+    updateAllowedModels([
+      ...(allModelsAllowed ? allowedModelOptions : allowedModels),
+      model,
+    ]);
     setCustomAllowedModel("");
   };
 
   return (
-    <div className="drawer-backdrop">
-      <aside className="provider-drawer">
-        <header>
-          <div>
-            <h2>编辑供应商</h2>
-            <p>{providerName || "未命名供应商"}</p>
+    <DialogSurface
+      drawer
+      title="编辑供应商"
+      onClose={onClose}
+      closeDisabled={busy}
+    >
+      <header>
+        <div>
+          <h2>编辑供应商</h2>
+          <p>{providerName || "未命名供应商"}</p>
+        </div>
+        <Button className="close" disabled={busy} onClick={onClose}>
+          ×
+        </Button>
+      </header>
+
+      <SegmentedControl
+        className="drawer-tabs"
+        label="供应商配置分类"
+        value={tab}
+        onChange={onTab}
+        options={[
+          { value: "base", label: "基础配置" },
+          { value: "models", label: "模型配置" },
+          { value: "balance", label: "余额查询" },
+        ]}
+      />
+
+      <section className="drawer-body">
+        {error && (
+          <div className="form-error" role="alert">
+            {error}
           </div>
-          <button className="close" onClick={onClose}>×</button>
-        </header>
-
-        <nav className="drawer-tabs">
-          <button className={tab === "base" ? "active" : ""} onClick={() => onTab("base")}>基础配置</button>
-          <button className={tab === "models" ? "active" : ""} onClick={() => onTab("models")}>模型配置</button>
-          <button className={tab === "balance" ? "active" : ""} onClick={() => onTab("balance")}>余额查询</button>
-        </nav>
-
-        <section className="drawer-body">
-          {tab === "base" && (
-            <>
-              <label className="field">
-                <span>供应商名称</span>
-                <input value={providerName} onChange={(event) => setProviderName(event.currentTarget.value)} />
-              </label>
-              <label className="field">
-                <span>Base URL</span>
-                <input value={providerBaseUrl} onChange={(event) => setProviderBaseUrl(event.currentTarget.value)} />
-                <small>请求将转发至 {providerBaseUrl ? `${providerBaseUrl.replace(/\/$/, "")}/${upstreamPath}` : "-"}</small>
-              </label>
-              <label className="field">
-                <span>转发 API Key</span>
-                <div className="secret-field">
-                  <input
-                    type={secretVisible ? "text" : "password"}
-                    value={providerApiKey}
-                    onChange={(event) => {
-                      setProviderApiKey(event.currentTarget.value);
-                      setProviderApiKeyDirty(true);
-                    }}
-                    placeholder="留空保持已保存的 API Key"
-                  />
-                  <button onClick={() => setSecretVisible(!secretVisible)} type="button">
-                    {secretVisible ? "隐藏" : "显示"}
-                  </button>
-                </div>
-              </label>
-              <label className="field">
-                <span>接口协议</span>
-                <select
-                  value={providerWireApi}
-                  onChange={(event) => setProviderWireApi(event.currentTarget.value as ProviderWireApi)}
-                >
-                  <option value="responses">Responses API</option>
-                  <option value="chat_completions">Chat Completions 兼容</option>
-                </select>
-                <small>上游不支持 Responses API 时选择 Chat Completions 兼容模式</small>
-              </label>
-              <label className="field">
-                <span className="fusion-toggle"><input
-                  type="checkbox"
-                  checked={providerWireApi === "responses" && providerSupportsWebsockets}
-                  disabled={providerWireApi !== "responses"}
-                  onChange={(event) => setProviderSupportsWebsockets(event.currentTarget.checked)}
-                /> 上游支持 WebSocket</span>
-                <small>仅适用于 Responses API。Codex 开启 WebSocket 后，此供应商使用持久连接；未开启的供应商继续使用 HTTP。</small>
-              </label>
-              <label className="field">
-                <span className="fusion-toggle"><input
-                  type="checkbox"
-                  checked={providerImageDetailOriginalToAuto}
-                  onChange={(event) => setProviderImageDetailOriginalToAuto(event.currentTarget.checked)}
-                /> 图片 detail 兼容：original → auto</span>
-                <small>仅对当前供应商生效。上游不支持 original 图片精度时开启，发送前将其转换为 auto；默认关闭。</small>
-              </label>
-              <label className="field">
-                <span className="fusion-toggle"><input type="checkbox" checked={fusionEnabled} onChange={(event) => {
-                  const enabled = event.currentTarget.checked;
-                  setFusionEnabled(enabled);
-                  if (enabled && allowedModels.length === 0) setAllowedModels(providerModels);
-                }} /> 融合模式</span>
-                <small>选定的模型将显示供应商名称，并仅发往此供应商。普通模型请求不会使用此供应商。请在模型配置中选择要发布的模型；Codex 需重启以刷新列表。</small>
-              </label>
-              <AutoDisablePolicyFields
-                override={providerAutoDisableOverride}
-                enabled={providerAutoDisableEnabled}
-                threshold={providerAutoDisableFailureThreshold}
-                globalEnabled={globalAutoDisableEnabled}
-                globalThreshold={globalAutoDisableFailureThreshold}
-                setOverride={setProviderAutoDisableOverride}
-                setEnabled={setProviderAutoDisableEnabled}
-                setThreshold={setProviderAutoDisableFailureThreshold}
+        )}
+        {tab === "base" && (
+          <>
+            <label className="field">
+              <span>供应商名称</span>
+              <TextField
+                value={providerName}
+                onChange={(event) => setProviderName(event.currentTarget.value)}
               />
-              <AutoDisableResetFields
-                period={providerAutoDisableResetPeriod}
-                resetDay={providerAutoDisableResetDay}
-                resetTime={providerAutoDisableResetTime}
-                resetWeekday={providerAutoDisableResetWeekday}
-                setPeriod={setProviderAutoDisableResetPeriod}
-                setResetDay={setProviderAutoDisableResetDay}
-                setResetTime={setProviderAutoDisableResetTime}
-                setResetWeekday={setProviderAutoDisableResetWeekday}
+            </label>
+            <label className="field">
+              <span>Base URL</span>
+              <TextField
+                value={providerBaseUrl}
+                onChange={(event) =>
+                  setProviderBaseUrl(event.currentTarget.value)
+                }
               />
-              <label className="field">
-                <span>请求服务层级</span>
-                <select
-                  value={providerServiceTier}
-                  onChange={(event) => setProviderServiceTier(event.currentTarget.value as ProviderServiceTier)}
+              <small>
+                请求将转发至{" "}
+                {providerBaseUrl
+                  ? `${providerBaseUrl.replace(/\/$/, "")}/${upstreamPath}`
+                  : "-"}
+              </small>
+            </label>
+            <label className="field">
+              <span>转发 API Key</span>
+              <div className="secret-field">
+                <TextField
+                  type={secretVisible ? "text" : "password"}
+                  value={providerApiKey}
+                  onChange={(event) => {
+                    setProviderApiKey(event.currentTarget.value);
+                    setProviderApiKeyDirty(true);
+                  }}
+                  placeholder="留空保持已保存的 API Key"
+                />
+                <Button
+                  onClick={() => setSecretVisible(!secretVisible)}
+                  type="button"
                 >
-                  <option value="">不强制</option>
-                  <option value="priority">Fast</option>
-                  <option value="ultrafast">Ultrafast</option>
-                </select>
-                <small>Ultrafast 需要上游授权，目前仅适用于 GPT-5.6 Sol</small>
-              </label>
-            </>
-          )}
-
-          {tab === "models" && (
-            <>
-              <section className="model-config-intro">
-                <div>
-                  <span className="section-kicker">模型来源</span>
-                  <h3>配置可路由模型</h3>
-                  <p>{providerBaseUrl || "尚未配置 Base URL"}</p>
-                </div>
-                <button className="primary model-fetch-button" disabled={busy} onClick={onLoadProviderModels} type="button">
-                  <ToolIcon type="models" />
-                  {busy ? "正在获取" : providerModels.length ? "重新从上游获取" : "从上游获取模型"}
-                </button>
-              </section>
-
-              <div className="model-config-stats">
-                <div>
-                  <span>上游已发现</span>
-                  <strong>{providerModels.length}</strong>
-                  <small>个模型</small>
-                </div>
-                <div>
-                  <span>当前已启用</span>
-                  <strong>{allModelsAllowed ? "全部" : allowedModels.length}</strong>
-                  <small>{allModelsAllowed ? "兼容任意模型" : "个模型"}</small>
-                </div>
+                  {secretVisible ? "隐藏" : "显示"}
+                </Button>
               </div>
+            </label>
+            <label className="field">
+              <span>接口协议</span>
+              <Select
+                value={providerWireApi}
+                onValueChange={(value) =>
+                  setProviderWireApi(value as ProviderWireApi)
+                }
+              >
+                <SelectOption value="responses">Responses API</SelectOption>
+                <SelectOption value="chat_completions">
+                  Chat Completions 兼容
+                </SelectOption>
+              </Select>
+              <small>
+                上游不支持 Responses API 时选择 Chat Completions 兼容模式
+              </small>
+            </label>
+            <label className="field">
+              <span className="fusion-toggle">
+                <Checkbox
+                  checked={
+                    providerWireApi === "responses" &&
+                    providerSupportsWebsockets
+                  }
+                  disabled={providerWireApi !== "responses"}
+                  onCheckedChange={(checked) =>
+                    setProviderSupportsWebsockets(checked)
+                  }
+                />{" "}
+                上游支持 WebSocket
+              </span>
+              <small>
+                仅适用于 Responses API。Codex 开启 WebSocket
+                后，此供应商使用持久连接；未开启的供应商继续使用 HTTP。
+              </small>
+            </label>
+            <label className="field">
+              <span className="fusion-toggle">
+                <Checkbox
+                  checked={providerImageDetailOriginalToAuto}
+                  onCheckedChange={(checked) =>
+                    setProviderImageDetailOriginalToAuto(checked)
+                  }
+                />{" "}
+                图片 detail 兼容：original → auto
+              </span>
+              <small>
+                仅对当前供应商生效。上游不支持 original
+                图片精度时开启，发送前将其转换为 auto；默认关闭。
+              </small>
+            </label>
+            <label className="field">
+              <span className="fusion-toggle">
+                <Checkbox
+                  checked={fusionEnabled}
+                  onCheckedChange={(checked) => {
+                    const enabled = checked;
+                    setFusionEnabled(enabled);
+                    if (enabled && allowedModels.length === 0)
+                      setAllowedModels(providerModels);
+                  }}
+                />{" "}
+                融合模式
+              </span>
+              <small>
+                选定的模型将显示供应商名称，并仅发往此供应商。普通模型请求不会使用此供应商。请在模型配置中选择要发布的模型；Codex
+                需重启以刷新列表。
+              </small>
+            </label>
+            <AutoDisablePolicyFields
+              override={providerAutoDisableOverride}
+              enabled={providerAutoDisableEnabled}
+              threshold={providerAutoDisableFailureThreshold}
+              globalEnabled={globalAutoDisableEnabled}
+              globalThreshold={globalAutoDisableFailureThreshold}
+              setOverride={setProviderAutoDisableOverride}
+              setEnabled={setProviderAutoDisableEnabled}
+              setThreshold={setProviderAutoDisableFailureThreshold}
+            />
+            <AutoDisableResetFields
+              period={providerAutoDisableResetPeriod}
+              resetDay={providerAutoDisableResetDay}
+              resetTime={providerAutoDisableResetTime}
+              resetWeekday={providerAutoDisableResetWeekday}
+              setPeriod={setProviderAutoDisableResetPeriod}
+              setResetDay={setProviderAutoDisableResetDay}
+              setResetTime={setProviderAutoDisableResetTime}
+              setResetWeekday={setProviderAutoDisableResetWeekday}
+            />
+            <label className="field">
+              <span>请求服务层级</span>
+              <Select
+                value={providerServiceTier}
+                onValueChange={(value) =>
+                  setProviderServiceTier(value as ProviderServiceTier)
+                }
+              >
+                <SelectOption value="">不强制</SelectOption>
+                <SelectOption value="priority">Fast</SelectOption>
+                <SelectOption value="ultrafast">Ultrafast</SelectOption>
+              </Select>
+              <small>Ultrafast 需要上游授权，目前仅适用于 GPT-5.6 Sol</small>
+            </label>
+          </>
+        )}
 
-              <div className="model-filter-box model-manager">
-                <div className="mapping-box-head">
-                  <div>
-                    <strong>启用模型</strong>
-                    <p>取消不希望参与路由的模型；修改会在保存供应商后生效。</p>
-                  </div>
-              <div className="model-list-actions">
-                  <button
+        {tab === "models" && (
+          <>
+            <section className="model-config-intro">
+              <div>
+                <span className="section-kicker">模型来源</span>
+                <h3>配置可路由模型</h3>
+                <p>{providerBaseUrl || "尚未配置 Base URL"}</p>
+              </div>
+              <Button
+                className="primary model-fetch-button"
+                disabled={busy}
+                onClick={onLoadProviderModels}
+                type="button"
+              >
+                <ToolIcon type="models" />
+                {busy
+                  ? "正在获取"
+                  : providerModels.length
+                    ? "重新从上游获取"
+                    : "从上游获取模型"}
+              </Button>
+            </section>
+
+            <div className="model-config-stats">
+              <div>
+                <span>上游已发现</span>
+                <strong>{providerModels.length}</strong>
+                <small>个模型</small>
+              </div>
+              <div>
+                <span>当前已启用</span>
+                <strong>
+                  {allModelsAllowed ? "全部" : allowedModels.length}
+                </strong>
+                <small>{allModelsAllowed ? "兼容任意模型" : "个模型"}</small>
+              </div>
+            </div>
+
+            <div className="model-filter-box model-manager">
+              <div className="mapping-box-head">
+                <div>
+                  <strong>启用模型</strong>
+                  <p>取消不希望参与路由的模型；修改会在保存供应商后生效。</p>
+                </div>
+                <div className="model-list-actions">
+                  <Button
                     className="ghost small"
                     disabled={allowedModelOptions.length === 0}
                     onClick={() => updateAllowedModels(allowedModelOptions)}
                     type="button"
                   >
                     全部启用
-                  </button>
-                <button
-                  className="ghost small"
-                  disabled={busy || allowedModelOptions.length === 0}
-                  onClick={() => {
-                    onClearModels();
-                    setModelSearch("");
-                    setCustomAllowedModel("");
-                  }}
-                  type="button"
-                >
-                  一键清空
-                </button>
-              </div>
-                </div>
-                <label className="model-search-field">
-                  <span aria-hidden="true" />
-                  <input
-                    placeholder="搜索上游模型"
-                    type="search"
-                    value={modelSearch}
-                    onChange={(event) => setModelSearch(event.currentTarget.value)}
-                  />
-                </label>
-                <div className="model-option-grid">
-                  {allowedModelOptions.length === 0 && (
-                    <div className="model-empty-state">
-                      <strong>还没有上游模型</strong>
-                      <p>确认 Base URL 和 API Key 后，从上游读取可用模型。</p>
-                      <button className="ghost small" disabled={busy} onClick={onLoadProviderModels} type="button">
-                        从上游获取
-                      </button>
-                    </div>
-                  )}
-                  {allowedModelOptions.length > 0 && visibleModelOptions.length === 0 && (
-                    <p className="mapping-empty">没有匹配“{modelSearch.trim()}”的模型。</p>
-                  )}
-                  {visibleModelOptions.map((model) => {
-                    const checked = allModelsAllowed || allowedModels.some((current) => current.toLowerCase() === model.toLowerCase());
-                    return (
-                      <label className={checked ? "model-option selected" : "model-option"} key={model}>
-                        <input
-                          checked={checked}
-                          onChange={(event) => toggleAllowedModel(model, event.currentTarget.checked)}
-                          type="checkbox"
-                        />
-                        <span>{model}</span>
-                      </label>
-                    );
-                  })}
-                </div>
-                <div className="custom-model-row">
-                  <input
-                    placeholder="手动添加未出现在上游列表中的模型"
-                    value={customAllowedModel}
-                    onChange={(event) => setCustomAllowedModel(event.currentTarget.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        addCustomAllowedModel();
-                      }
-                    }}
-                  />
-                  <button className="ghost small" disabled={!customAllowedModel.trim()} onClick={addCustomAllowedModel} type="button">
-                    添加模型
-                  </button>
-                </div>
-              </div>
-
-              <div className="mapping-box">
-                <div className="mapping-box-head">
-                  <div>
-                    <strong>模型映射</strong>
-                    <p>客户端模型匹配后，转发为此供应商支持的上游模型。</p>
-                  </div>
-                  <button
+                  </Button>
+                  <Button
                     className="ghost small"
-                    onClick={() => setModelMappings([...modelMappings, { source: "", target: "" }])}
+                    disabled={busy || allowedModelOptions.length === 0}
+                    onClick={() => {
+                      onClearModels();
+                      setModelSearch("");
+                      setCustomAllowedModel("");
+                    }}
                     type="button"
                   >
-                    添加映射
-                  </button>
-                </div>
-                <div className="mapping-grid">
-                  <span>客户端模型</span>
-                  <span>上游模型</span>
-                  <span />
-                  {modelMappings.length === 0 && (
-                    <p className="mapping-empty">未配置映射时，请求模型将原样转发。</p>
-                  )}
-                  {modelMappings.map((mapping, index) => (
-                    <div className="mapping-row" key={index}>
-                      <input
-                        placeholder="gpt-5.5"
-                        value={mapping.source}
-                        onChange={(event) => {
-                          const next = [...modelMappings];
-                          next[index] = { ...mapping, source: event.currentTarget.value };
-                          setModelMappings(next);
-                        }}
-                      />
-                      <input
-                        placeholder="deepseek-v4-pro"
-                        value={mapping.target}
-                        onChange={(event) => {
-                          const next = [...modelMappings];
-                          next[index] = { ...mapping, target: event.currentTarget.value };
-                          setModelMappings(next);
-                        }}
-                      />
-                      <button
-                        aria-label="删除映射"
-                        className="icon-button"
-                        onClick={() => setModelMappings(modelMappings.filter((_, rowIndex) => rowIndex !== index))}
-                        title="删除映射"
-                        type="button"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
+                    一键清空
+                  </Button>
                 </div>
               </div>
-            </>
-          )}
-
-          {tab === "balance" && (
-            <>
-              <div className="switch-row-card">
-                <div>
-                  <strong>启用余额查询</strong>
-                  <p>定时获取上游账户余额并显示在供应商列表中</p>
-                </div>
-                <Toggle
-                  checked={balanceQuery.enabled}
-                  onChange={(checked) =>
-                    onUpdateBalance({
-                      enabled: checked,
-                      query_type: checked
-                        ? balanceQuery.query_type === "disabled"
-                          ? "new_api"
-                          : balanceQuery.query_type
-                        : "disabled",
-                    })
+              <label className="model-search-field">
+                <span aria-hidden="true" />
+                <TextField
+                  aria-label="搜索上游模型"
+                  placeholder="搜索上游模型"
+                  type="search"
+                  value={modelSearch}
+                  onChange={(event) =>
+                    setModelSearch(event.currentTarget.value)
                   }
                 />
-              </div>
-              <label className="field">
-                <span>接口类型</span>
-                <select
-                  value={balanceQuery.query_type}
-                  onChange={(event) => onUpdateBalance({ query_type: event.currentTarget.value as BalanceQueryType })}
-                >
-                  <option value="new_api">New API</option>
-                  <option value="sub2_api">Sub2API</option>
-                  <option value="ai_gate">AI Gate</option>
-                  <option value="disabled">不查询</option>
-                </select>
               </label>
-              {balanceQuery.query_type === "new_api" && (
-                <label className="field">
-                  <span>查询目标</span>
-                  <select
-                    value={balanceQuery.new_api_target}
-                    onChange={(event) =>
-                      onUpdateBalance({ new_api_target: event.currentTarget.value as NewApiBalanceTarget })
+              <div className="model-option-grid">
+                {allowedModelOptions.length === 0 && (
+                  <div className="model-empty-state">
+                    <strong>还没有上游模型</strong>
+                    <p>确认 Base URL 和 API Key 后，从上游读取可用模型。</p>
+                    <Button
+                      className="ghost small"
+                      disabled={busy}
+                      onClick={onLoadProviderModels}
+                      type="button"
+                    >
+                      从上游获取
+                    </Button>
+                  </div>
+                )}
+                {allowedModelOptions.length > 0 &&
+                  visibleModelOptions.length === 0 && (
+                    <p className="mapping-empty">
+                      没有匹配“{modelSearch.trim()}”的模型。
+                    </p>
+                  )}
+                {visibleModelOptions.map((model) => {
+                  const checked =
+                    allModelsAllowed ||
+                    allowedModels.some(
+                      (current) =>
+                        current.toLowerCase() === model.toLowerCase(),
+                    );
+                  return (
+                    <label
+                      className={
+                        checked ? "model-option selected" : "model-option"
+                      }
+                      key={model}
+                    >
+                      <Checkbox
+                        checked={checked}
+                        onCheckedChange={(checked) =>
+                          toggleAllowedModel(model, checked)
+                        }
+                      />
+                      <span>{model}</span>
+                    </label>
+                  );
+                })}
+              </div>
+              <div className="custom-model-row">
+                <TextField
+                  aria-label="手动添加模型"
+                  placeholder="手动添加未出现在上游列表中的模型"
+                  value={customAllowedModel}
+                  onChange={(event) =>
+                    setCustomAllowedModel(event.currentTarget.value)
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      addCustomAllowedModel();
                     }
-                  >
-                    <option value="token_quota">API Key 额度</option>
-                    <option value="account_balance">账户余额</option>
-                  </select>
-                </label>
-              )}
-              {balanceQuery.query_type === "ai_gate" && (
-                <label className="field">
-                  <span>查询账号</span>
-                  <select
-                    value={selectedAiGateAccountId === null ? "" : String(selectedAiGateAccountId)}
-                    onChange={(event) =>
-                      onUpdateBalance({
-                        ai_gate_account_id: event.currentTarget.value
-                          ? Number(event.currentTarget.value)
-                          : null,
-                      })
-                    }
-                  >
-                    <option value="">聚合全部账号</option>
-                    {selectedAiGateAccountMissing && (
-                      <option value={selectedAiGateAccountId ?? ""}>
-                        账号 #{selectedAiGateAccountId}（等待查询确认）
-                      </option>
-                    )}
-                    {balanceAccountOptions.map((account) => (
-                      <option key={account.account_id} value={account.account_id}>
-                        {account.account_name || `账号 #${account.account_id}`}
-                      </option>
-                    ))}
-                  </select>
-                  <small>
-                    {balanceAccountOptions.length
-                      ? "可选择单个上游账号，或聚合全部账号；账号列表来自最近一次测试查询。"
-                      : "先保持“聚合全部账号”并测试查询，成功后即可选择具体账号。"}
-                  </small>
-                </label>
-              )}
-              <label className="field">
-                <span>查询地址</span>
-                <input
-                  value={balanceQuery.endpoint}
-                  onChange={(event) => onUpdateBalance({ endpoint: event.currentTarget.value })}
-                  placeholder={endpointFromBaseUrl(providerBaseUrl)}
+                  }}
                 />
+                <Button
+                  className="ghost small"
+                  disabled={!customAllowedModel.trim()}
+                  onClick={addCustomAllowedModel}
+                  type="button"
+                >
+                  添加模型
+                </Button>
+              </div>
+            </div>
+
+            <div className="mapping-box">
+              <div className="mapping-box-head">
+                <div>
+                  <strong>模型映射</strong>
+                  <p>客户端模型匹配后，转发为此供应商支持的上游模型。</p>
+                </div>
+                <Button
+                  className="ghost small"
+                  onClick={() =>
+                    setModelMappings([
+                      ...modelMappings,
+                      { source: "", target: "" },
+                    ])
+                  }
+                  type="button"
+                >
+                  添加映射
+                </Button>
+              </div>
+              <div className="mapping-grid">
+                <span>客户端模型</span>
+                <span>上游模型</span>
+                <span />
+                {modelMappings.length === 0 && (
+                  <p className="mapping-empty">
+                    未配置映射时，请求模型将原样转发。
+                  </p>
+                )}
+                {modelMappings.map((mapping, index) => (
+                  <div className="mapping-row" key={index}>
+                    <TextField
+                      placeholder="gpt-5.5"
+                      value={mapping.source}
+                      onChange={(event) => {
+                        const next = [...modelMappings];
+                        next[index] = {
+                          ...mapping,
+                          source: event.currentTarget.value,
+                        };
+                        setModelMappings(next);
+                      }}
+                    />
+                    <TextField
+                      placeholder="deepseek-v4-pro"
+                      value={mapping.target}
+                      onChange={(event) => {
+                        const next = [...modelMappings];
+                        next[index] = {
+                          ...mapping,
+                          target: event.currentTarget.value,
+                        };
+                        setModelMappings(next);
+                      }}
+                    />
+                    <Button
+                      aria-label="删除映射"
+                      className="icon-button"
+                      onClick={() =>
+                        setModelMappings(
+                          modelMappings.filter(
+                            (_, rowIndex) => rowIndex !== index,
+                          ),
+                        )
+                      }
+                      title="删除映射"
+                      type="button"
+                    >
+                      ×
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+
+        {tab === "balance" && (
+          <>
+            <div className="switch-row-card">
+              <div>
+                <strong>启用余额查询</strong>
+                <p>定时获取上游账户余额并显示在供应商列表中</p>
+              </div>
+              <Toggle
+                checked={balanceQuery.enabled}
+                onChange={(checked) =>
+                  onUpdateBalance({
+                    enabled: checked,
+                    query_type: checked
+                      ? balanceQuery.query_type === "disabled"
+                        ? "new_api"
+                        : balanceQuery.query_type
+                      : "disabled",
+                  })
+                }
+              />
+            </div>
+            <label className="field">
+              <span>接口类型</span>
+              <Select
+                value={balanceQuery.query_type}
+                onValueChange={(value) =>
+                  onUpdateBalance({
+                    query_type: value as BalanceQueryType,
+                  })
+                }
+              >
+                <SelectOption value="new_api">New API</SelectOption>
+                <SelectOption value="sub2_api">Sub2API</SelectOption>
+                <SelectOption value="ai_gate">AI Gate</SelectOption>
+                <SelectOption value="disabled">不查询</SelectOption>
+              </Select>
+            </label>
+            {balanceQuery.query_type === "new_api" && (
+              <label className="field">
+                <span>查询目标</span>
+                <Select
+                  value={balanceQuery.new_api_target}
+                  onValueChange={(value) =>
+                    onUpdateBalance({
+                      new_api_target: value as NewApiBalanceTarget,
+                    })
+                  }
+                >
+                  <SelectOption value="token_quota">API Key 额度</SelectOption>
+                  <SelectOption value="account_balance">账户余额</SelectOption>
+                </Select>
+              </label>
+            )}
+            {balanceQuery.query_type === "ai_gate" && (
+              <label className="field">
+                <span>查询账号</span>
+                <Select
+                  value={
+                    selectedAiGateAccountId === null
+                      ? ""
+                      : String(selectedAiGateAccountId)
+                  }
+                  onValueChange={(value) =>
+                    onUpdateBalance({
+                      ai_gate_account_id: value ? Number(value) : null,
+                    })
+                  }
+                >
+                  <SelectOption value="">聚合全部账号</SelectOption>
+                  {selectedAiGateAccountMissing && (
+                    <SelectOption value={selectedAiGateAccountId ?? ""}>
+                      账号 #{selectedAiGateAccountId}（等待查询确认）
+                    </SelectOption>
+                  )}
+                  {balanceAccountOptions.map((account) => (
+                    <SelectOption
+                      key={account.account_id}
+                      value={account.account_id}
+                    >
+                      {account.account_name || `账号 #${account.account_id}`}
+                    </SelectOption>
+                  ))}
+                </Select>
                 <small>
-                  {balanceQuery.query_type === "ai_gate"
-                    ? "默认复用供应商 Base URL 和 Key；Base URL 中的服务前缀会保留，仅移除末尾的 /v1"
-                    : "默认使用供应商 Base URL，并自动移除末尾的 /v1"}
+                  {balanceAccountOptions.length
+                    ? "可选择单个上游账号，或聚合全部账号；账号列表来自最近一次测试查询。"
+                    : "先保持“聚合全部账号”并测试查询，成功后即可选择具体账号。"}
                 </small>
               </label>
-              <label className="field">
-                <span>访问令牌</span>
-                <div className="secret-field">
-                  <input
-                    type={balanceTokenVisible ? "text" : "password"}
-                    value={balanceQuery.auth_mode === "provider_token" ? savedApiKeyLabel(providerApiKey) : balanceQuery.query_token}
-                    onChange={(event) => onUpdateBalance({ query_token: event.currentTarget.value, auth_mode: "separate_token" })}
-                    readOnly={balanceQuery.auth_mode === "provider_token"}
-                  />
-                  <button onClick={() => onBalanceTokenVisible(!balanceTokenVisible)} type="button">
-                    {balanceTokenVisible ? "隐藏" : "显示"}
-                  </button>
-                </div>
-              </label>
-              {balanceQuery.query_type === "new_api" && balanceQuery.new_api_target === "account_balance" && (
+            )}
+            <label className="field">
+              <span>查询地址</span>
+              <TextField
+                value={balanceQuery.endpoint}
+                onChange={(event) =>
+                  onUpdateBalance({ endpoint: event.currentTarget.value })
+                }
+                placeholder={endpointFromBaseUrl(providerBaseUrl)}
+              />
+              <small>
+                {balanceQuery.query_type === "ai_gate"
+                  ? "默认复用供应商 Base URL 和 Key；Base URL 中的服务前缀会保留，仅移除末尾的 /v1"
+                  : "默认使用供应商 Base URL，并自动移除末尾的 /v1"}
+              </small>
+            </label>
+            <label className="field">
+              <span>访问令牌</span>
+              <div className="secret-field">
+                <TextField
+                  type={balanceTokenVisible ? "text" : "password"}
+                  value={
+                    balanceQuery.auth_mode === "provider_token"
+                      ? savedApiKeyLabel(providerApiKey)
+                      : balanceQuery.query_token
+                  }
+                  onChange={(event) =>
+                    onUpdateBalance({
+                      query_token: event.currentTarget.value,
+                      auth_mode: "separate_token",
+                    })
+                  }
+                  readOnly={balanceQuery.auth_mode === "provider_token"}
+                />
+                <Button
+                  onClick={() => onBalanceTokenVisible(!balanceTokenVisible)}
+                  type="button"
+                >
+                  {balanceTokenVisible ? "隐藏" : "显示"}
+                </Button>
+              </div>
+            </label>
+            {balanceQuery.query_type === "new_api" &&
+              balanceQuery.new_api_target === "account_balance" && (
                 <label className="field half">
                   <span>用户 ID</span>
-                  <input
+                  <TextField
                     inputMode="numeric"
                     value={balanceQuery.new_api_user_id}
                     onChange={(event) =>
-                      onUpdateBalance({ new_api_user_id: event.currentTarget.value.replace(/\D/g, "") })
+                      onUpdateBalance({
+                        new_api_user_id: event.currentTarget.value.replace(
+                          /\D/g,
+                          "",
+                        ),
+                      })
                     }
                   />
                 </label>
               )}
-              {balanceQuery.query_type === "new_api" && (
-                <div className="quota-box">
-                  <strong>余额换算</strong>
-                  <span>500000 quota</span>
-                  <em>=</em>
-                  <b>1 USD</b>
-                  <button>编辑比例</button>
-                </div>
-              )}
-              <div className={`balance-test-box ${balanceTestStatus?.error ? "failed" : balanceTestStatus ? "ok" : ""}`}>
-                <div>
-                  <strong>
-                    {balanceTestStatus?.error
-                      ? "查询失败"
-                      : balanceTestStatus
-                        ? "查询成功"
-                        : "等待测试"}
-                  </strong>
-                  <p>
-                    {balanceTestStatus?.error
-                      ? balanceTestStatus.error
-                      : balanceTestStatus
-                        ? balanceTestStatus.label
-                        : "使用当前表单配置发起一次余额查询，不会保存草稿。"}
-                  </p>
-                </div>
-                <button disabled={busy} onClick={onTestBalance} type="button">
-                  {busy ? "查询中" : "测试查询"}
-                </button>
+            {balanceQuery.query_type === "new_api" && (
+              <div className="quota-box">
+                <strong>余额换算</strong>
+                <span>500000 quota</span>
+                <em>=</em>
+                <b>1 USD</b>
+                <span className="filter-hint">默认换算比例</span>
               </div>
-            </>
-          )}
+            )}
+            <div
+              className={`balance-test-box ${balanceTestStatus?.error ? "failed" : balanceTestStatus ? "ok" : ""}`}
+            >
+              <div>
+                <strong>
+                  {balanceTestStatus?.error
+                    ? "查询失败"
+                    : balanceTestStatus
+                      ? "查询成功"
+                      : "等待测试"}
+                </strong>
+                <p>
+                  {balanceTestStatus?.error
+                    ? balanceTestStatus.error
+                    : balanceTestStatus
+                      ? balanceTestStatus.label
+                      : "使用当前表单配置发起一次余额查询，不会保存草稿。"}
+                </p>
+              </div>
+              <Button disabled={busy} onClick={onTestBalance} type="button">
+                {busy ? "查询中" : "测试查询"}
+              </Button>
+            </div>
+          </>
+        )}
+      </section>
 
-        </section>
-
-        <footer>
-          <button
-            className="danger"
-            disabled={busy}
-            onClick={() => deleteConfirming ? onDelete() : setDeleteConfirming(true)}
-            type="button"
-          >
-            {deleteConfirming ? "确认删除" : "删除"}
-          </button>
-          {deleteConfirming ? <small className="danger-text">会保留历史请求日志；再次点击确认删除。</small> : <div />}
-          <button className="ghost" onClick={deleteConfirming ? () => setDeleteConfirming(false) : onClose}>
-            {deleteConfirming ? "取消删除" : "取消"}
-          </button>
-          <button className="primary" disabled={busy} onClick={onSave}>保存修改</button>
-        </footer>
-      </aside>
-    </div>
+      <footer>
+        <Button
+          className="danger"
+          disabled={busy}
+          onClick={() =>
+            deleteConfirming ? onDelete() : setDeleteConfirming(true)
+          }
+          type="button"
+        >
+          {deleteConfirming ? "确认删除" : "删除"}
+        </Button>
+        {deleteConfirming ? (
+          <small className="danger-text">
+            会保留历史请求日志；再次点击确认删除。
+          </small>
+        ) : (
+          <div />
+        )}
+        <Button
+          className="ghost"
+          onClick={
+            deleteConfirming ? () => setDeleteConfirming(false) : onClose
+          }
+        >
+          {deleteConfirming ? "取消删除" : "取消"}
+        </Button>
+        <Button className="primary" disabled={busy} onClick={onSave}>
+          保存修改
+        </Button>
+      </footer>
+    </DialogSurface>
   );
 }
 
 function ClaudeProviderEditor(props: {
+  error: string;
   modelListCleared: boolean;
   onClearModels: () => void;
   fusionEnabled: boolean;
@@ -5930,6 +6819,7 @@ function ClaudeProviderEditor(props: {
   setSecretVisible: (value: boolean) => void;
 }) {
   const {
+    error,
     modelListCleared,
     onClearModels,
     fusionEnabled,
@@ -5973,263 +6863,369 @@ function ClaudeProviderEditor(props: {
   const [customAllowedModel, setCustomAllowedModel] = useState("");
   const [deleteConfirming, setDeleteConfirming] = useState(false);
   const [modelSearch, setModelSearch] = useState("");
-  const updateAllowedModels = (models: string[]) => setAllowedModels(normalizeModelNames(models));
-  const allowedModelOptions = normalizeModelNames([...providerModels, ...allowedModels]);
+  const updateAllowedModels = (models: string[]) =>
+    setAllowedModels(normalizeModelNames(models));
+  const allowedModelOptions = normalizeModelNames([
+    ...providerModels,
+    ...allowedModels,
+  ]);
   const visibleModelOptions = allowedModelOptions.filter((model) =>
     model.toLowerCase().includes(modelSearch.trim().toLowerCase()),
   );
   const allModelsAllowed = allowedModels.length === 0 && !modelListCleared;
   const toggleAllowedModel = (model: string, checked: boolean) => {
-    const currentModels = allModelsAllowed ? allowedModelOptions : allowedModels;
+    const currentModels = allModelsAllowed
+      ? allowedModelOptions
+      : allowedModels;
     updateAllowedModels(
       checked
         ? [...currentModels, model]
-        : currentModels.filter((current) => current.toLowerCase() !== model.toLowerCase()),
+        : currentModels.filter(
+            (current) => current.toLowerCase() !== model.toLowerCase(),
+          ),
     );
   };
   const addCustomAllowedModel = () => {
     const model = customAllowedModel.trim();
     if (!model) return;
-    updateAllowedModels([...(allModelsAllowed ? allowedModelOptions : allowedModels), model]);
+    updateAllowedModels([
+      ...(allModelsAllowed ? allowedModelOptions : allowedModels),
+      model,
+    ]);
     setCustomAllowedModel("");
   };
 
   return (
-    <div className="drawer-backdrop">
-      <aside className="provider-drawer">
-        <header>
-          <div>
-            <h2>编辑 Claude 供应商</h2>
-            <p>{providerName || "未命名 Claude 供应商"}</p>
-          </div>
-          <button className="close" onClick={onClose}>×</button>
-        </header>
+    <DialogSurface
+      drawer
+      title="编辑 Claude 供应商"
+      onClose={onClose}
+      closeDisabled={busy}
+    >
+      <header>
+        <div>
+          <h2>编辑 Claude 供应商</h2>
+          <p>{providerName || "未命名 Claude 供应商"}</p>
+        </div>
+        <Button className="close" disabled={busy} onClick={onClose}>
+          ×
+        </Button>
+      </header>
 
-        <section className="drawer-body">
-          <label className="field">
-            <span>供应商名称</span>
-            <input value={providerName} onChange={(event) => setProviderName(event.currentTarget.value)} />
-          </label>
-          <label className="field">
-            <span>Base URL</span>
-            <input
-              placeholder="https://api.anthropic.com/v1"
-              value={providerBaseUrl}
-              onChange={(event) => setProviderBaseUrl(event.currentTarget.value)}
+      <section className="drawer-body">
+        {error && (
+          <div className="form-error" role="alert">
+            {error}
+          </div>
+        )}
+        <label className="field">
+          <span>供应商名称</span>
+          <TextField
+            value={providerName}
+            onChange={(event) => setProviderName(event.currentTarget.value)}
+          />
+        </label>
+        <label className="field">
+          <span>Base URL</span>
+          <TextField
+            placeholder="https://api.anthropic.com/v1"
+            value={providerBaseUrl}
+            onChange={(event) => setProviderBaseUrl(event.currentTarget.value)}
+          />
+          <small>
+            按填写值原样拼接 /messages 与 /models；需要 /v1 的供应商请写到 Base
+            URL 中。
+          </small>
+        </label>
+        <label className="field">
+          <span>API Key</span>
+          <div className="secret-field">
+            <TextField
+              type={secretVisible ? "text" : "password"}
+              value={providerApiKey}
+              onChange={(event) => {
+                setProviderApiKey(event.currentTarget.value);
+                setProviderApiKeyDirty(true);
+              }}
+              placeholder="留空保持已保存的 API Key"
             />
-            <small>按填写值原样拼接 /messages 与 /models；需要 /v1 的供应商请写到 Base URL 中。</small>
-          </label>
-          <label className="field">
-            <span>API Key</span>
-            <div className="secret-field">
-              <input
-                type={secretVisible ? "text" : "password"}
-                value={providerApiKey}
-                onChange={(event) => {
-                  setProviderApiKey(event.currentTarget.value);
-                  setProviderApiKeyDirty(true);
-                }}
-                placeholder="留空保持已保存的 API Key"
-              />
-              <button onClick={() => setSecretVisible(!secretVisible)} type="button">
-                {secretVisible ? "隐藏" : "显示"}
-              </button>
-            </div>
-          </label>
-          <label className="field">
-            <span className="fusion-toggle"><input type="checkbox" checked={fusionEnabled} onChange={(event) => {
-              const enabled = event.currentTarget.checked;
-              setFusionEnabled(enabled);
-              if (enabled && allowedModels.length === 0) setAllowedModels(providerModels);
-            }} /> 融合模式</span>
-            <small>选定的模型将显示供应商名称，并仅发往此供应商。普通模型请求不会使用此供应商。请在模型配置中选择要发布的模型。</small>
-          </label>
-          <AutoDisablePolicyFields
-            override={providerAutoDisableOverride}
-            enabled={providerAutoDisableEnabled}
-            threshold={providerAutoDisableFailureThreshold}
-            globalEnabled={globalAutoDisableEnabled}
-            globalThreshold={globalAutoDisableFailureThreshold}
-            setOverride={setProviderAutoDisableOverride}
-            setEnabled={setProviderAutoDisableEnabled}
-            setThreshold={setProviderAutoDisableFailureThreshold}
-          />
-          <AutoDisableResetFields
-            period={providerAutoDisableResetPeriod}
-            resetDay={providerAutoDisableResetDay}
-            resetTime={providerAutoDisableResetTime}
-            resetWeekday={providerAutoDisableResetWeekday}
-            setPeriod={setProviderAutoDisableResetPeriod}
-            setResetDay={setProviderAutoDisableResetDay}
-            setResetTime={setProviderAutoDisableResetTime}
-            setResetWeekday={setProviderAutoDisableResetWeekday}
-          />
-          <section className="model-config-intro compact">
+            <Button
+              onClick={() => setSecretVisible(!secretVisible)}
+              type="button"
+            >
+              {secretVisible ? "隐藏" : "显示"}
+            </Button>
+          </div>
+        </label>
+        <label className="field">
+          <span className="fusion-toggle">
+            <Checkbox
+              checked={fusionEnabled}
+              onCheckedChange={(checked) => {
+                const enabled = checked;
+                setFusionEnabled(enabled);
+                if (enabled && allowedModels.length === 0)
+                  setAllowedModels(providerModels);
+              }}
+            />{" "}
+            融合模式
+          </span>
+          <small>
+            选定的模型将显示供应商名称，并仅发往此供应商。普通模型请求不会使用此供应商。请在模型配置中选择要发布的模型。
+          </small>
+        </label>
+        <AutoDisablePolicyFields
+          override={providerAutoDisableOverride}
+          enabled={providerAutoDisableEnabled}
+          threshold={providerAutoDisableFailureThreshold}
+          globalEnabled={globalAutoDisableEnabled}
+          globalThreshold={globalAutoDisableFailureThreshold}
+          setOverride={setProviderAutoDisableOverride}
+          setEnabled={setProviderAutoDisableEnabled}
+          setThreshold={setProviderAutoDisableFailureThreshold}
+        />
+        <AutoDisableResetFields
+          period={providerAutoDisableResetPeriod}
+          resetDay={providerAutoDisableResetDay}
+          resetTime={providerAutoDisableResetTime}
+          resetWeekday={providerAutoDisableResetWeekday}
+          setPeriod={setProviderAutoDisableResetPeriod}
+          setResetDay={setProviderAutoDisableResetDay}
+          setResetTime={setProviderAutoDisableResetTime}
+          setResetWeekday={setProviderAutoDisableResetWeekday}
+        />
+        <section className="model-config-intro compact">
+          <div>
+            <span className="section-kicker">模型来源</span>
+            <h3>模型配置</h3>
+            <p>{providerBaseUrl || "尚未配置 Base URL"}</p>
+          </div>
+          <Button
+            className="primary model-fetch-button"
+            disabled={busy}
+            onClick={onLoadProviderModels}
+            type="button"
+          >
+            <ToolIcon type="models" />
+            {busy
+              ? "正在获取"
+              : providerModels.length
+                ? "重新获取"
+                : "从上游获取模型"}
+          </Button>
+        </section>
+        <div className="model-filter-box model-manager">
+          <div className="mapping-box-head">
             <div>
-              <span className="section-kicker">模型来源</span>
-              <h3>模型配置</h3>
-              <p>{providerBaseUrl || "尚未配置 Base URL"}</p>
+              <strong>启用模型</strong>
+              <p>
+                {allowedModels.length
+                  ? `已启用 ${allowedModels.length} 个 Claude 模型`
+                  : modelListCleared
+                    ? "已清空，请重新获取或添加模型"
+                    : "当前兼容任意 Claude 模型"}
+              </p>
             </div>
-            <button className="primary model-fetch-button" disabled={busy} onClick={onLoadProviderModels} type="button">
-              <ToolIcon type="models" />
-              {busy ? "正在获取" : providerModels.length ? "重新获取" : "从上游获取模型"}
-            </button>
-          </section>
-          <div className="model-filter-box model-manager">
-            <div className="mapping-box-head">
-              <div>
-                <strong>启用模型</strong>
-                <p>{allowedModels.length ? `已启用 ${allowedModels.length} 个 Claude 模型` : modelListCleared ? "已清空，请重新获取或添加模型" : "当前兼容任意 Claude 模型"}</p>
-              </div>
-              <div className="model-list-actions">
-              <button
+            <div className="model-list-actions">
+              <Button
                 className="ghost small"
                 disabled={allowedModelOptions.length === 0}
                 onClick={() => updateAllowedModels(allowedModelOptions)}
                 type="button"
               >
                 全部启用
-              </button>
-                <button
-                  className="ghost small"
-                  disabled={busy || allowedModelOptions.length === 0}
-                  onClick={() => {
-                    onClearModels();
-                    setModelSearch("");
-                    setCustomAllowedModel("");
-                  }}
-                  type="button"
-                >
-                  一键清空
-                </button>
-              </div>
-            </div>
-            <label className="model-search-field">
-              <span aria-hidden="true" />
-              <input
-                placeholder="搜索 Claude 模型"
-                type="search"
-                value={modelSearch}
-                onChange={(event) => setModelSearch(event.currentTarget.value)}
-              />
-            </label>
-            <div className="model-option-grid">
-              {allowedModelOptions.length === 0 && (
-                <div className="model-empty-state">
-                  <strong>还没有上游模型</strong>
-                  <p>确认 Base URL 和 API Key 后，从上游读取可用模型。</p>
-                  <button className="ghost small" disabled={busy} onClick={onLoadProviderModels} type="button">
-                    从上游获取
-                  </button>
-                </div>
-              )}
-              {allowedModelOptions.length > 0 && visibleModelOptions.length === 0 && (
-                <p className="mapping-empty">没有匹配“{modelSearch.trim()}”的模型。</p>
-              )}
-              {visibleModelOptions.map((model) => {
-                const checked = allModelsAllowed || allowedModels.some((current) => current.toLowerCase() === model.toLowerCase());
-                return (
-                  <label className={checked ? "model-option selected" : "model-option"} key={model}>
-                    <input
-                      checked={checked}
-                      onChange={(event) => toggleAllowedModel(model, event.currentTarget.checked)}
-                      type="checkbox"
-                    />
-                    <span>{model}</span>
-                  </label>
-                );
-              })}
-            </div>
-            <div className="custom-model-row">
-              <input
-                placeholder="手动输入模型，例如 claude-sonnet-4-5"
-                value={customAllowedModel}
-                onChange={(event) => setCustomAllowedModel(event.currentTarget.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    addCustomAllowedModel();
-                  }
-                }}
-              />
-              <button className="ghost small" disabled={!customAllowedModel.trim()} onClick={addCustomAllowedModel} type="button">
-                添加模型
-              </button>
-            </div>
-          </div>
-          <div className="mapping-box">
-            <div className="mapping-box-head">
-              <div>
-                <strong>模型映射</strong>
-                <p>只替换 Anthropic 请求体顶层 model 字段</p>
-              </div>
-              <button
+              </Button>
+              <Button
                 className="ghost small"
-                onClick={() => setModelMappings([...modelMappings, { source: "", target: "" }])}
+                disabled={busy || allowedModelOptions.length === 0}
+                onClick={() => {
+                  onClearModels();
+                  setModelSearch("");
+                  setCustomAllowedModel("");
+                }}
                 type="button"
               >
-                添加映射
-              </button>
-            </div>
-            <div className="mapping-grid">
-              <span>客户端模型</span>
-              <span>上游模型</span>
-              <span />
-              {modelMappings.length === 0 && (
-                <p className="mapping-empty">未配置映射时，请求模型将原样转发。</p>
-              )}
-              {modelMappings.map((mapping, index) => (
-                <div className="mapping-row" key={index}>
-                  <input
-                    placeholder="claude-sonnet-4-5"
-                    value={mapping.source}
-                    onChange={(event) => {
-                      const next = [...modelMappings];
-                      next[index] = { ...mapping, source: event.currentTarget.value };
-                      setModelMappings(next);
-                    }}
-                  />
-                  <input
-                    placeholder="claude-3-5-sonnet-latest"
-                    value={mapping.target}
-                    onChange={(event) => {
-                      const next = [...modelMappings];
-                      next[index] = { ...mapping, target: event.currentTarget.value };
-                      setModelMappings(next);
-                    }}
-                  />
-                  <button
-                    aria-label="删除映射"
-                    className="icon-button"
-                    onClick={() => setModelMappings(modelMappings.filter((_, rowIndex) => rowIndex !== index))}
-                    title="删除映射"
-                    type="button"
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
+                一键清空
+              </Button>
             </div>
           </div>
-        </section>
+          <label className="model-search-field">
+            <span aria-hidden="true" />
+            <TextField
+              placeholder="搜索 Claude 模型"
+              type="search"
+              value={modelSearch}
+              onChange={(event) => setModelSearch(event.currentTarget.value)}
+            />
+          </label>
+          <div className="model-option-grid">
+            {allowedModelOptions.length === 0 && (
+              <div className="model-empty-state">
+                <strong>还没有上游模型</strong>
+                <p>确认 Base URL 和 API Key 后，从上游读取可用模型。</p>
+                <Button
+                  className="ghost small"
+                  disabled={busy}
+                  onClick={onLoadProviderModels}
+                  type="button"
+                >
+                  从上游获取
+                </Button>
+              </div>
+            )}
+            {allowedModelOptions.length > 0 &&
+              visibleModelOptions.length === 0 && (
+                <p className="mapping-empty">
+                  没有匹配“{modelSearch.trim()}”的模型。
+                </p>
+              )}
+            {visibleModelOptions.map((model) => {
+              const checked =
+                allModelsAllowed ||
+                allowedModels.some(
+                  (current) => current.toLowerCase() === model.toLowerCase(),
+                );
+              return (
+                <label
+                  className={checked ? "model-option selected" : "model-option"}
+                  key={model}
+                >
+                  <Checkbox
+                    checked={checked}
+                    onCheckedChange={(checked) =>
+                      toggleAllowedModel(model, checked)
+                    }
+                  />
+                  <span>{model}</span>
+                </label>
+              );
+            })}
+          </div>
+          <div className="custom-model-row">
+            <TextField
+              placeholder="手动输入模型，例如 claude-sonnet-4-5"
+              value={customAllowedModel}
+              onChange={(event) =>
+                setCustomAllowedModel(event.currentTarget.value)
+              }
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  addCustomAllowedModel();
+                }
+              }}
+            />
+            <Button
+              className="ghost small"
+              disabled={!customAllowedModel.trim()}
+              onClick={addCustomAllowedModel}
+              type="button"
+            >
+              添加模型
+            </Button>
+          </div>
+        </div>
+        <div className="mapping-box">
+          <div className="mapping-box-head">
+            <div>
+              <strong>模型映射</strong>
+              <p>只替换 Anthropic 请求体顶层 model 字段</p>
+            </div>
+            <Button
+              className="ghost small"
+              onClick={() =>
+                setModelMappings([...modelMappings, { source: "", target: "" }])
+              }
+              type="button"
+            >
+              添加映射
+            </Button>
+          </div>
+          <div className="mapping-grid">
+            <span>客户端模型</span>
+            <span>上游模型</span>
+            <span />
+            {modelMappings.length === 0 && (
+              <p className="mapping-empty">
+                未配置映射时，请求模型将原样转发。
+              </p>
+            )}
+            {modelMappings.map((mapping, index) => (
+              <div className="mapping-row" key={index}>
+                <TextField
+                  placeholder="claude-sonnet-4-5"
+                  value={mapping.source}
+                  onChange={(event) => {
+                    const next = [...modelMappings];
+                    next[index] = {
+                      ...mapping,
+                      source: event.currentTarget.value,
+                    };
+                    setModelMappings(next);
+                  }}
+                />
+                <TextField
+                  placeholder="claude-3-5-sonnet-latest"
+                  value={mapping.target}
+                  onChange={(event) => {
+                    const next = [...modelMappings];
+                    next[index] = {
+                      ...mapping,
+                      target: event.currentTarget.value,
+                    };
+                    setModelMappings(next);
+                  }}
+                />
+                <Button
+                  aria-label="删除映射"
+                  className="icon-button"
+                  onClick={() =>
+                    setModelMappings(
+                      modelMappings.filter((_, rowIndex) => rowIndex !== index),
+                    )
+                  }
+                  title="删除映射"
+                  type="button"
+                >
+                  ×
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
 
-        <footer>
-          <button
-            className="danger"
-            disabled={busy}
-            onClick={() => deleteConfirming ? onDelete() : setDeleteConfirming(true)}
-            type="button"
-          >
-            {deleteConfirming ? "确认删除" : "删除"}
-          </button>
-          {deleteConfirming ? <small className="danger-text">会保留历史请求日志；再次点击确认删除。</small> : <div />}
-          <button className="ghost" onClick={deleteConfirming ? () => setDeleteConfirming(false) : onClose}>
-            {deleteConfirming ? "取消删除" : "取消"}
-          </button>
-          <button className="primary" disabled={busy} onClick={onSave}>保存修改</button>
-        </footer>
-      </aside>
-    </div>
+      <footer>
+        <Button
+          className="danger"
+          disabled={busy}
+          onClick={() =>
+            deleteConfirming ? onDelete() : setDeleteConfirming(true)
+          }
+          type="button"
+        >
+          {deleteConfirming ? "确认删除" : "删除"}
+        </Button>
+        {deleteConfirming ? (
+          <small className="danger-text">
+            会保留历史请求日志；再次点击确认删除。
+          </small>
+        ) : (
+          <div />
+        )}
+        <Button
+          className="ghost"
+          onClick={
+            deleteConfirming ? () => setDeleteConfirming(false) : onClose
+          }
+        >
+          {deleteConfirming ? "取消删除" : "取消"}
+        </Button>
+        <Button className="primary" disabled={busy} onClick={onSave}>
+          保存修改
+        </Button>
+      </footer>
+    </DialogSurface>
   );
 }
 
