@@ -216,6 +216,16 @@ pnpm tauri dev
 pnpm dev
 ```
 
+独立调试界面（使用模拟数据，不连接本地网关、不读写客户端配置）：
+
+```bash
+pnpm dev:ui
+```
+
+在浏览器打开 [模拟预览](http://127.0.0.1:1422/)。业务修改仅保存在当前页面内存中，刷新后恢复；可使用 `?scenario=empty` 查看空数据、`?scenario=offline` 查看网关未运行状态，或 `?scenario=import` 验证网页导入确认。预览不会启动 Rust 服务，生产构建不包含模拟后端。
+
+执行 `pnpm test:ui` 可验证生产构建、模拟命令交互与预览隔离。界面设计与功能对应关系见 [桌面界面改造说明](docs/design/desktop-redesign.md)。
+
 验证：
 
 ```bash

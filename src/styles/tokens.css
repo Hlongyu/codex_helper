@@ -1,0 +1,104 @@
+/* Shared semantic tokens. Components never choose their own appearance palette. */
+:root {
+  color-scheme: light;
+  --canvas: #f7f8fa;
+  --surface: #ffffff;
+  --surface-subtle: #f9fafb;
+  --surface-strong: #f0f2f5;
+  --sidebar: #f0f2f5;
+  --sidebar-active: #ffffff;
+  --toolbar: rgba(255, 255, 255, 0.88);
+  --text: #20232b;
+  --text-secondary: #747b88;
+  --text-tertiary: #9ba1ad;
+  --line: #e6e8ed;
+  --line-strong: #d9dde5;
+  --accent: #0f8f68;
+  --accent-strong: #087452;
+  --accent-soft: #dff4eb;
+  --accent-line: #a9d7c6;
+  --success: #27966b;
+  --success-soft: #edf8f2;
+  --warning: #b58227;
+  --warning-soft: #fff7e8;
+  --danger: #d04b50;
+  --danger-soft: #fff0f1;
+  --info: #357edf;
+  --chart-primary: var(--accent);
+  --chart-purple: #a28af2;
+  --chart-amber: #edb75c;
+  --overlay: rgba(24, 32, 46, 0.26);
+  --shadow-sm:
+    0 1px 3px rgba(27, 39, 59, 0.04), 0 1px 2px rgba(27, 39, 59, 0.02);
+  --shadow: 0 12px 40px rgba(27, 39, 59, 0.09);
+  --shadow-dialog:
+    0 24px 80px rgba(19, 29, 47, 0.18), 0 0 0 1px rgba(19, 29, 47, 0.04);
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+  --radius-sm: 6px;
+  --radius: 12px;
+  --radius-lg: 16px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --font-ui:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC",
+    "Microsoft YaHei UI", sans-serif;
+  --font-size-meta: 11px;
+  --font-size-caption: 12px;
+  --font-size-body: 13px;
+  --font-size-section: 15px;
+  --font-size-title: 17px;
+  --font-size-page: 22px;
+  --line-height-caption: 18px;
+  --line-height-body: 20px;
+  --line-height-section: 22px;
+  --control-height: 32px;
+  --control-height-sm: 28px;
+  --field-height: 36px;
+  --button-primary: var(--accent);
+  --button-primary-hover: var(--accent-strong);
+  --button-primary-active: #065f44;
+  --button-primary-text: #ffffff;
+  --font-mono:
+    "SF Mono", SFMono-Regular, ui-monospace, Menlo, Consolas, monospace;
+  --sidebar-width: 218px;
+}
+
+:root[data-appearance="dark"] {
+  color-scheme: dark;
+  --canvas: #191b20;
+  --surface: #22252c;
+  --surface-subtle: #272a32;
+  --surface-strong: #2d313a;
+  --sidebar: #1f2228;
+  --sidebar-active: #303641;
+  --toolbar: rgba(31, 34, 41, 0.9);
+  --text: #edf0f6;
+  --text-secondary: #a0a7b5;
+  --text-tertiary: #7e8797;
+  --line: #323640;
+  --line-strong: #414754;
+  --accent: #63c79a;
+  --accent-strong: #8bdbb9;
+  --accent-soft: #223d33;
+  --accent-line: #365b4b;
+  --success: #63c79a;
+  --success-soft: #223d33;
+  --warning: #e5b866;
+  --warning-soft: #413727;
+  --danger: #fa858b;
+  --danger-soft: #472b33;
+  --info: #88b7ff;
+  --chart-purple: #b29af6;
+  --chart-amber: #e9be76;
+  --overlay: rgba(5, 9, 16, 0.52);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.1);
+  --shadow: 0 12px 40px rgba(0, 0, 0, 0.16);
+  --shadow-dialog: 0 24px 80px rgba(0, 0, 0, 0.4), 0 0 0 1px #444a56;
+  --button-primary-active: #a6e5c8;
+  --button-primary-text: #10281e;
+}
