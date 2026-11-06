@@ -1,5 +1,7 @@
 //! The tray webview has a separate presentation surface from the main window.
 use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+#[cfg(any(not(target_os = "macos"), test))]
+pub mod desktop;
 pub mod interaction;
 
 #[cfg(any(target_os = "macos", test))]
@@ -9,7 +11,7 @@ pub mod macos;
 
 pub const LABEL: &str = "tray";
 pub const WIDTH: f64 = 420.0;
-pub const HEIGHT: f64 = 570.0;
+pub const HEIGHT: f64 = 600.0;
 
 /// Production and the isolated preview use the same menu-free status icon.
 /// Only Linux attaches a fallback menu because Tauri does not emit tray clicks there.

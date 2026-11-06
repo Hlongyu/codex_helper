@@ -1,6 +1,6 @@
 # 状态栏快捷面板
 
-参考 [Magpie 的紧凑面板](https://usemagpie.ai/img/panel-light.png)，将常用状态与操作放在 420 × 570 逻辑像素的窗口中。沿用主界面的 Radix Themes、绿色强调色、13px 正文与无阴影模块；主窗口仍保留全部管理功能。
+参考 [Magpie 的紧凑面板](https://usemagpie.ai/img/panel-light.png)，将常用状态与操作放在 420 × 600 逻辑像素的窗口中。沿用主界面的 Radix Themes、绿色强调色、14px 正文与无阴影模块；主窗口仍保留全部管理功能。
 
 ## 信息与操作
 
@@ -25,7 +25,7 @@ macOS 直接从 `NSStatusBarButton` 获取屏幕矩形，使用 `NSScreen.frame`
 
 `tray_surface` 保留隐藏的 Tauri 窗口负责 IPC 生命周期，仅把原有内容视图和键盘响应视图挂到新建的 `NSPanel`。非激活属性在面板创建时设置，不修改已有系统窗口的类，不使用私有 API。面板不进入主窗口循环，也不激活整个应用或调用主窗口的显示方法；原生焦点回调负责收起与轮询生命周期。只有明确选择主窗口、路由等入口才打开完整客户端。弹出失败只报告错误，不自动唤起主窗口。
 
-Windows / Linux 延用各平台的无标题栏托盘浮层，按物理工作区、目标显示器比例和图标位置定位，覆盖四侧任务栏。Wayland 拒绝绝对定位时交给合成器处理，并保留关闭按钮与菜单入口。
+Windows / Linux 延用各平台的无标题栏托盘浮层，按物理工作区、目标显示器比例和图标位置定位，覆盖四侧任务栏。Windows 通过显示器全尺寸与工作区的差值识别任务栏边缘，隐藏图标折叠区中的图标仍按任务栏方向展开，不再回退到屏幕右上角；优先用图标矩形中心选择目标显示器，缺失矩形时使用点击点。先移动到目标屏再按其 DPI 设置尺寸，并补偿 Windows 不可见窗口边框以对齐可见内容。可用空间不足时选择空间较大的一侧并限制尺寸。Wayland 拒绝绝对定位时交给合成器处理，并保留关闭按钮与菜单入口。
 
 图标遵循 Apple 的[菜单栏设计](https://developer.apple.com/design/human-interface-guidelines/the-menu-bar)与[模板图像](https://developer.apple.com/documentation/appkit/nsimage/istemplate)规则：macOS 素材只有黑色与透明通道，不绘制彩色底块，不自行决定明暗 tint。Tauri 以 template 模式交给 AppKit。箭头表达切换语义，使用 XXSwitch 自有图形；Windows / Linux 保留绿色底块以兼容不同托盘背景。
 
@@ -44,8 +44,8 @@ Windows / Linux 延用各平台的无标题栏托盘浮层，按物理工作区�
 本地验证包括：
 
 - `pnpm test:ui`：现有 UI 命令回归、托盘单项变更、模型限制、显示偏好、导航消费、模拟退出隔离、草稿保留及生产资源隔离。
-- `cargo test --locked --manifest-path src-tauri/Cargo.toml tray`：8 项测试，覆盖左 / 右键松开时直接触发（按下不触发、中键不触发）、四边任务栏、缩放、负坐标、镜像菜单栏的第二屏锚点、上下左右多屏布局及小工作区，另验证模板图标、单项修改和模型校验。
-- macOS `cargo run --locked --manifest-path src-tauri/Cargo.toml --example tray_surface_probe`：使用真实承载代码创建隐藏面板，检查原生类为 `NSPanel`、非激活属性、键盘能力、不会成为主窗口、实际 WKWebView 的归属与 320 × 240 / 420 × 570 下的尺寸同步；使用正式版相同的图标构造器，确认原生状态栏图标没有绑定系统菜单。修复前同一检查失败于普通 `NSWindow`，修复后通过。探针不加载管理状态、接管配置、路由器或真实业务插件。
+- `cargo test --locked --manifest-path src-tauri/Cargo.toml tray`：13 项测试，覆盖左 / 右键松开时直接触发（按下不触发、中键不触发）、四边任务栏、隐藏图标折叠区、自动隐藏任务栏、100%–200% 缩放、负坐标、镜像菜单栏的第二屏锚点、上下左右多屏布局及小工作区，另验证模板图标、单项修改和模型校验。
+- macOS `cargo run --locked --manifest-path src-tauri/Cargo.toml --example tray_surface_probe`：使用真实承载代码创建隐藏面板，检查原生类为 `NSPanel`、非激活属性、键盘能力、不会成为主窗口、实际 WKWebView 的归属与 320 × 240 / 420 × 600 下的尺寸同步；使用正式版相同的图标构造器，确认原生状态栏图标没有绑定系统菜单。修复前同一检查失败于普通 `NSWindow`，修复后通过。探针不加载管理状态、接管配置、路由器或真实业务插件。
 - 浏览器预览：浅色 / 深色、正常 / 空 / 未运行状态、模型切换、客户端开关、收起与重开、菜单与面板 Escape、设置显示偏好、跨窗口外观同步；默认尺寸下内容完整展示。
 - macOS 原生编译、Apple Silicon / Intel 通用生产包、签名与 DMG 只读挂载校验。Windows 编译由分支 `windows:check` 执行，Linux 编译包含在现有 MR Clippy 检查中；Clippy 严格模式受原有代码告警影响。
 

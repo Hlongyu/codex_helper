@@ -35,12 +35,12 @@
 }
 .tray-brand strong {
   font-size: var(--font-size-section);
-  line-height: 20px;
+  line-height: var(--line-height-section);
 }
 .tray-brand small {
   font-size: var(--font-size-meta);
   color: var(--text-secondary);
-  line-height: 14px;
+  line-height: var(--line-height-meta);
 }
 .tray-header-actions {
   display: flex;
@@ -51,7 +51,7 @@
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 12px 16px;
+  padding: 8px 16px;
 }
 .tray-panel .ui-card {
   border: 1px solid var(--line);
@@ -88,7 +88,7 @@
   font-size: var(--font-size-caption);
 }
 .tray-gateway-address .ui-button {
-  --button-height: 24px;
+  --button-height: 28px;
   padding-inline: 6px;
   font-size: var(--font-size-meta);
   border-color: transparent;
@@ -108,7 +108,7 @@
   font-size: var(--font-size-caption);
 }
 .tray-section-heading .text-button {
-  --button-height: 24px;
+  --button-height: 28px;
   font-size: var(--font-size-caption);
   gap: 4px;
 }
@@ -138,17 +138,17 @@
 .tray-client-name strong {
   font-size: var(--font-size-body);
   font-weight: 500;
-  line-height: 20px;
+  line-height: var(--line-height-body);
 }
 .tray-client-name small {
   font-size: var(--font-size-meta);
   color: var(--text-secondary);
-  line-height: 14px;
+  line-height: var(--line-height-meta);
 }
 .tray-panel .tray-model-select {
   grid-column: 2 / -1;
-  height: 30px;
-  min-height: 30px;
+  height: 34px;
+  min-height: 34px;
   width: 100%;
   font-size: var(--font-size-caption);
 }
@@ -165,7 +165,7 @@
 .tray-usage small {
   color: var(--text-secondary);
   font-size: var(--font-size-meta);
-  line-height: 14px;
+  line-height: var(--line-height-meta);
 }
 .tray-usage strong {
   font-size: 18px;
@@ -229,7 +229,7 @@
 }
 .tray-preview-window {
   width: min(420px, 100%);
-  height: 570px;
+  height: 600px;
   margin: auto;
   border: 1px solid var(--line-strong);
   border-radius: 12px;

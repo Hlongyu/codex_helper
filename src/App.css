@@ -1132,6 +1132,7 @@ pre {
   text-align: right;
 }
 .model-row {
+  font-size: var(--font-size-body);
   position: relative;
   min-height: 56px;
   padding: 12px 0 18px;
@@ -1140,7 +1141,7 @@ pre {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
   font-weight: 500;
 }
 .model-row > span {
@@ -1149,7 +1150,7 @@ pre {
 }
 .model-row b {
   color: var(--text-secondary);
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
   font-weight: 400;
 }
 .model-row i {
@@ -1584,7 +1585,7 @@ pre {
   overflow: hidden;
   font-family: var(--font-mono);
   color: var(--text-secondary);
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
   font-weight: 400;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1905,7 +1906,7 @@ pre {
   justify-content: space-between;
   align-items: center;
   gap: 15px;
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
 }
 .distribution-row > div strong {
   min-width: 0;
@@ -1917,7 +1918,7 @@ pre {
 .distribution-row b {
   flex-shrink: 0;
   white-space: nowrap;
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
   color: var(--text-secondary);
   font-weight: 400;
 }
@@ -1980,20 +1981,20 @@ pre {
   align-items: center;
   gap: 12px;
   padding: 14px 22px;
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
 }
 .usage-detail-table header,
 .request-log-table header {
   background: var(--surface-subtle);
   border-bottom: 1px solid var(--line);
-  color: var(--text-tertiary);
-  font-size: var(--font-size-meta);
+  color: var(--text-secondary);
+  font-size: var(--font-size-caption);
   font-weight: 400;
 }
 .usage-detail-table > div {
-  min-height: 53px;
+  min-height: 56px;
   border-bottom: 1px solid var(--line);
-  color: var(--text-secondary);
+  color: var(--text);
   font-variant-numeric: tabular-nums;
 }
 .usage-detail-table > div:last-child {
@@ -2031,7 +2032,7 @@ pre {
   min-height: 59px;
   border-bottom: 1px solid var(--line);
   background: var(--surface);
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
   cursor: pointer;
   font-variant-numeric: tabular-nums;
 }
@@ -2047,12 +2048,12 @@ pre {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
   font-weight: 500;
 }
 .request-log-table > div > span {
-  color: var(--text-secondary);
-  font-size: var(--font-size-caption);
+  color: var(--text);
+  font-size: var(--font-size-body);
 }
 .request-debug-checkbox {
   display: grid;
@@ -2072,7 +2073,7 @@ pre {
   display: flex;
   align-items: center;
   gap: 5px;
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
 }
 .status-cell .dot {
   width: 5px;
@@ -2096,16 +2097,16 @@ pre {
   color: var(--info);
 }
 .route-result {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-start;
   width: fit-content;
   max-width: 100%;
   padding: 3px 6px;
   border-radius: 4px;
   line-height: 1.55;
-  font-size: var(--font-size-meta) !important;
-  overflow-wrap: anywhere;
+  font-size: var(--font-size-caption) !important;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .route-result.ok {
   color: var(--success) !important;
@@ -2700,7 +2701,7 @@ pre {
 .model-option span {
   min-width: 0;
   overflow: hidden;
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2887,7 +2888,7 @@ pre {
   background: var(--chart-primary);
 }
 .request-timing-row > strong {
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
   font-weight: 500;
   text-align: right;
 }
@@ -2902,7 +2903,7 @@ pre {
   gap: 15px;
 }
 .request-debug-meta code {
-  font-size: var(--font-size-caption);
+  font-size: var(--font-size-body);
   overflow-wrap: anywhere;
 }
 .request-debug-meta span {
