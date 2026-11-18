@@ -4410,11 +4410,13 @@ function RequestLogsScreen({
                 <Tooltip content={formatTimingDetails(log)}>
                   <b>{formatDuration(log.total_ms)}</b>
                 </Tooltip>
-                <span
-                  className={`route-result ${routeResultTone(log.route_result)}`}
-                >
-                  {log.route_result}
-                </span>
+                <Tooltip content={log.route_result}>
+                  <span
+                    className={`route-result ${routeResultTone(log.route_result)}`}
+                  >
+                    {log.route_result}
+                  </span>
+                </Tooltip>
               </div>
             );
           })}
